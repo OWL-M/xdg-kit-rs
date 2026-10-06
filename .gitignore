@@ -1,0 +1,8 @@
+/target/
+
+/result
+/result-*
+.direnv
+
+/docs
+*.log
