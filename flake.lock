@@ -19,7 +19,24 @@
     "root": {
       "inputs": {
         "nixpkgs": "nixpkgs",
+        "shared-mime-info": "shared-mime-info",
         "systems": "systems"
+      }
+    },
+    "shared-mime-info": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1789070972,
+        "narHash": "sha256-qxuIBRSnt728rD0QmmmkT6ex5Bl7LBhe0Twqne+azFc=",
+        "ref": "refs/heads/master",
+        "rev": "433be9a1d72c142fe85d741674a1d74b58ff3de2",
+        "revCount": 2200,
+        "type": "git",
+        "url": "https://gitlab.freedesktop.org/xdg/shared-mime-info.git"
+      },
+      "original": {
+        "type": "git",
+        "url": "https://gitlab.freedesktop.org/xdg/shared-mime-info.git"
       }
     },
     "systems": {

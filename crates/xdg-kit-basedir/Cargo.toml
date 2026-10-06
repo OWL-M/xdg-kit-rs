@@ -1,0 +1,16 @@
+[package]
+name = "xdg-kit-basedir"
+description = "The XDG Base Directory spec and XDG user folders"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+rustix.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

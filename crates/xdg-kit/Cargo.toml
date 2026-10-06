@@ -1,0 +1,18 @@
+[package]
+name = "xdg-kit"
+description = "Freedesktop.org XDG specifications for Rust"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = ["basedir"]
+## The XDG Base Directory spec and user folders.
+basedir = ["dep:xdg-kit-basedir"]
+
+[dependencies]
+xdg-kit-basedir = { workspace = true, optional = true }
+
+[lints]
+workspace = true
