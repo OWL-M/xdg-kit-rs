@@ -17,6 +17,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 xdg-kit-desktop-entry = { path = "../crates/xdg-kit-desktop-entry" }
 xdg-kit-mime = { path = "../crates/xdg-kit-mime" }
+xdg-kit-mime-apps = { path = "../crates/xdg-kit-mime-apps" }
 
 [[bin]]
 name = "mime_cache"
@@ -84,6 +85,13 @@ bench = false
 [[bin]]
 name = "desktop_entry"
 path = "fuzz_targets/desktop_entry.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mime_apps_list"
+path = "fuzz_targets/mime_apps_list.rs"
 test = false
 doc = false
 bench = false

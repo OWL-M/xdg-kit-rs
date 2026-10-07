@@ -1,0 +1,18 @@
+[package]
+name = "xdg-kit-mime-apps"
+description = "The freedesktop.org MIME Applications Associations spec: default and associated applications, mimeapps.list editing, mimeinfo.cache, opening files and URIs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+xdg-kit-basedir.workspace = true
+xdg-kit-desktop-entry.workspace = true
+xdg-kit-mime.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

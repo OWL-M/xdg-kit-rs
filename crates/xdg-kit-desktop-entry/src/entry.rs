@@ -124,9 +124,9 @@ pub(crate) fn valid_dbus_name(name: &str) -> bool {
 }
 
 /// A boolean value as `GLib` reads one: `true`/`false`, and also `1`/`0`
-/// (which `validate` reports).
+/// (which `validate` reports), with spaces or tabs after it ignored.
 fn parse_boolean(value: &str) -> Option<bool> {
-    match value {
+    match value.trim_end_matches([' ', '\t']) {
         "true" | "1" => Some(true),
         "false" | "0" => Some(false),
         _ => None,
@@ -299,6 +299,15 @@ impl DesktopEntry {
     #[must_use]
     pub fn hidden(&self) -> bool {
         self.boolean("Hidden").unwrap_or(false)
+    }
+
+    /// Whether the file is in an encoding this crate reads: no `Encoding`
+    /// key, or `UTF-8` in any case (as `GLib` takes it). The spec says to
+    /// ignore a file in an encoding not supported, such as `Legacy-Mixed`.
+    #[must_use]
+    pub fn supports_encoding(&self) -> bool {
+        self.string("Encoding")
+            .is_none_or(|encoding| encoding.eq_ignore_ascii_case("UTF-8"))
     }
 
     /// `OnlyShowIn`.
@@ -523,6 +532,22 @@ mod tests {
         \n\
         [Desktop Action Unlisted]\n\
         Name=Not in Actions\n";
+
+    #[test]
+    fn booleans_and_encodings_as_glib_reads_them() {
+        let entry = |extra: &str| {
+            DesktopEntry::from_key_file(KeyFile::parse(
+                format!("[Desktop Entry]\nType=Application\nName=A\nExec=a\n{extra}").as_bytes(),
+            ))
+        };
+        assert!(entry("Hidden=true \t\n").hidden());
+        assert!(!entry("Hidden=True\n").hidden());
+        assert!(entry("").supports_encoding());
+        assert!(entry("Encoding=UTF-8\n").supports_encoding());
+        assert!(entry("Encoding=utf-8\n").supports_encoding());
+        assert!(!entry("Encoding=UTF-8 \n").supports_encoding());
+        assert!(!entry("Encoding=Legacy-Mixed\n").supports_encoding());
+    }
 
     #[test]
     fn typed_values_from_the_spec_example() {

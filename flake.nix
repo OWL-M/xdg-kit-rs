@@ -93,6 +93,10 @@
         })
         # `dbus-daemon`, a private bus for the D-Bus activation test.
         pkgs.dbus
+        # `gio mime`, the reference the MIME applications tests compare with.
+        # GLib from the locked nixpkgs: it changes only with
+        # `nix flake update nixpkgs`.
+        pkgs.glib.bin
       ];
       # Where the tests find the pinned sources.
       sourceVars = {
@@ -189,7 +193,7 @@
                 rustfmt --check --edition 2024 fuzz/fuzz_targets/*.rs
                 # The fuzzing entry points exist only under `--cfg fuzzing`.
                 CARGO_TARGET_DIR=target/fuzzing-lint RUSTFLAGS="--cfg fuzzing" \
-                  cargo clippy -p xdg-kit-mime -p xdg-kit-desktop-entry --all-targets --all-features --offline -- -D warnings
+                  cargo clippy -p xdg-kit-mime -p xdg-kit-desktop-entry -p xdg-kit-mime-apps --all-targets --all-features --offline -- -D warnings
                 runHook postBuild
               '';
               installPhase = ''

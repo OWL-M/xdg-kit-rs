@@ -10,7 +10,7 @@ use crate::entry::{
     valid_dbus_name,
 };
 use crate::exec::{CommandLine, ExecProblem};
-use crate::key_file::{KeyFile, valid_group_name, valid_key_name};
+use crate::key_file::{KeyFile, KeyNames, valid_group_name, valid_key_name};
 use crate::keys::{self, ACTION_KEYS, Applies, DESKTOP_KEYS, KeyDef, Status, ValueType};
 use crate::registry::{ADDITIONAL_CATEGORIES, DESKTOPS, MAIN_CATEGORIES, RESERVED_CATEGORIES};
 
@@ -291,7 +291,14 @@ fn check_key(
     let line = v.file.line_of(group, key, locale);
     let shown = locale.map_or_else(|| key.to_owned(), |locale| format!("{key}[{locale}]"));
     if !valid_key_name(key) {
-        // Reported by the key-file layer.
+        // The key-file layer reports it, unless the file takes other key
+        // names.
+        if v.file.key_names() != KeyNames::DesktopEntry && v.file.key_names().allows(key) {
+            v.error(
+                line,
+                format!("key {shown:?} has characters a key name may not have"),
+            );
+        }
         return;
     }
     if let Some(locale) = locale.filter(|locale| !valid_locale(locale)) {
@@ -792,6 +799,24 @@ mod tests {
         // An unknown type is reported once, not again for each key.
         let errors = errors("[Desktop Entry]\nType=Thing\nName=Foo\nExec=foo\nURL=x\n");
         assert_eq!(errors.len(), 1, "{errors:?}");
+    }
+
+    #[test]
+    fn key_names_are_checked_in_files_that_take_any() {
+        let text = format!("{GOOD}image/png=x\na]b=y\n");
+        let errors_of = |file: &KeyFile| -> Vec<String> {
+            validate(file)
+                .into_iter()
+                .filter(|issue| issue.level == Level::Error)
+                .map(|issue| issue.message)
+                .collect()
+        };
+        let mut any = errors_of(&KeyFile::parse_with(text.as_bytes(), KeyNames::Any));
+        let mut desktop = errors_of(&KeyFile::parse(text.as_bytes()));
+        any.sort();
+        desktop.sort();
+        assert!(!any.is_empty());
+        assert_eq!(any, desktop, "the same error either way");
     }
 
     #[test]

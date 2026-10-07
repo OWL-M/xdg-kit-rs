@@ -1,0 +1,13 @@
+# Scenarios and types of tests/gio_conformance.rs on which MimeApps and
+# GLib's `gio mime` disagree on purpose: scenario, type, our answer, reason.
+# Our answer is `default=<id> recommended=<ids> registered=<ids>`, IDs
+# comma-separated, `-` for none.
+# Fields are separated by single tab characters.
+default-not-associated	text/x-xkt-plain	default=xkt-a.desktop recommended=xkt-a.desktop registered=xkt-a.desktop	the spec: the default application must be associated with the type (its algorithm checks it); GLib takes a default that is not
+removal-scoping	text/x-xkt-plain	default=xkt-a.desktop recommended=xkt-a.desktop registered=xkt-a.desktop	the spec reads a folder's Removed Associations before its desktop files, so a removal applies to applications in the same folder; GLib reads them from mimeinfo.cache as additions first, so they stay
+wildcards	image/x-xkt-png	default=xkt-images.desktop recommended=- registered=xkt-images.desktop,xkt-all.desktop	decision 2: wildcards (image/*, */*) match as the least specific types; GLib matches them only as literal type names
+implied-parents	text/x-xkt-foo	default=xkt-text.desktop recommended=- registered=xkt-text.desktop,xkt-data.desktop	decision 7: the MIME spec makes every text type a kind of text/plain and every type but inode/* a kind of application/octet-stream; GLib uses only explicit parents
+implied-parents	image/x-xkt-png	default=xkt-data.desktop recommended=- registered=xkt-data.desktop	decision 7: every type but inode/* is a kind of application/octet-stream (MIME spec); GLib uses only explicit parents
+default-removed	text/x-xkt-plain	default=xkt-b.desktop recommended=xkt-b.desktop registered=xkt-b.desktop	the spec: the default must be associated with the type; a removed association is none; GLib takes the listed default without checking removals
+default-hidden	text/x-xkt-plain	default=xkt-b.desktop recommended=xkt-b.desktop registered=xkt-b.desktop	the spec: a default must be a desktop file found by the normal rules (Hidden=true means deleted) and associated with the type; GLib takes the hidden file
+config-dirs	text/x-xkt-plain	default=xkt-b.desktop recommended=xkt-c.desktop,xkt-b.desktop registered=xkt-c.desktop,xkt-b.desktop	the spec: the default must be associated with the type; a more important config folder removed xkt-a, so the list goes on to xkt-b; GLib takes xkt-a without checking removals

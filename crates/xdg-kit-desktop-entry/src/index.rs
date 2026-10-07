@@ -1,7 +1,7 @@
 //! The installed applications by desktop file ID (Desktop Entry spec
 //! "Desktop File ID").
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
@@ -144,6 +144,13 @@ pub struct AppIndex {
     /// The winning file of each ID, as an index into `found`; `None` when
     /// it says `Hidden=true` (the application is deleted).
     by_id: BTreeMap<String, Option<usize>>,
+    /// The IDs each root holds (by index into `roots`), shadowed ones
+    /// included; files that could not be read or are ignored for their
+    /// encoding are not counted, shadowed or not.
+    held: Vec<BTreeSet<String>>,
+    /// Files a more important folder shadows, read and stamped so that
+    /// `held` stays right and a change to one is noticed.
+    shadowed: Vec<(PathBuf, Stamp, Arc<DesktopEntry>)>,
     diagnostics: Vec<Diagnostic>,
 }
 
@@ -183,15 +190,25 @@ impl AppIndex {
             found: Vec::new(),
             ignored: Vec::new(),
             by_id: BTreeMap::new(),
+            held: vec![BTreeSet::new(); roots.len()],
+            shadowed: Vec::new(),
             diagnostics: Vec::new(),
         };
-        // A root reached again under another path is scanned once.
-        let mut roots_seen: HashSet<(u64, u64)> = HashSet::new();
+        // A root reached again under another path is scanned once; it holds
+        // what it held the first time.
+        let mut roots_seen: HashMap<(u64, u64), usize> = HashMap::new();
         for (root_index, (root, _)) in roots.iter().enumerate() {
-            if let Ok(metadata) = fs::metadata(root)
-                && !roots_seen.insert((metadata.dev(), metadata.ino()))
-            {
-                continue;
+            if let Ok(metadata) = fs::metadata(root) {
+                match roots_seen.entry((metadata.dev(), metadata.ino())) {
+                    std::collections::hash_map::Entry::Occupied(first) => {
+                        let held = index.held[*first.get()].clone();
+                        index.held[root_index] = held;
+                        continue;
+                    }
+                    std::collections::hash_map::Entry::Vacant(slot) => {
+                        slot.insert(root_index);
+                    }
+                }
             }
             // Within a root, a folder reached again (a link) is scanned once.
             let mut visited: HashSet<(u64, u64)> = HashSet::new();
@@ -215,10 +232,9 @@ impl AppIndex {
                     continue;
                 }
                 ids_here.insert(id.clone(), path.clone());
-                if index.by_id.contains_key(&id) {
-                    // A more important folder has this ID.
-                    continue;
-                }
+                // A more important folder has this ID: the file is read only
+                // to know whether the folder holds it.
+                let shadowed = index.by_id.contains_key(&id);
                 let stamp = Stamp::of(&path);
                 let entry = match cache.get(&path) {
                     Some((cached, entry)) if *cached == stamp => Arc::clone(entry),
@@ -235,10 +251,13 @@ impl AppIndex {
                         }
                     },
                 };
-                index
-                    .diagnostics
-                    .extend(entry.key_file().diagnostics().iter().cloned());
-                if let Some(encoding) = entry.string("Encoding").filter(|e| e != "UTF-8") {
+                if !shadowed {
+                    index
+                        .diagnostics
+                        .extend(entry.key_file().diagnostics().iter().cloned());
+                }
+                if !entry.supports_encoding() {
+                    let encoding = entry.string("Encoding").unwrap_or_default();
                     // The spec: an implementation that does not support an
                     // encoding should ignore the file.
                     index.diagnostics.push(Diagnostic::new(
@@ -247,6 +266,11 @@ impl AppIndex {
                         format!("Encoding={encoding} is not supported; the file is ignored"),
                     ));
                     index.ignored.push((path, stamp));
+                    continue;
+                }
+                if shadowed {
+                    index.held[root_index].insert(id);
+                    index.shadowed.push((path, stamp, entry));
                     continue;
                 }
                 let hidden = entry.hidden();
@@ -258,6 +282,7 @@ impl AppIndex {
                     entry,
                 });
                 let at = index.found.len() - 1;
+                index.held[root_index].insert(id.clone());
                 index.by_id.insert(id, (!hidden).then_some(at));
             }
         }
@@ -334,19 +359,24 @@ impl AppIndex {
             || self
                 .found
                 .iter()
-                .any(|found| Stamp::of(&found.path) != found.stamp);
+                .any(|found| Stamp::of(&found.path) != found.stamp)
+            || self
+                .shadowed
+                .iter()
+                .any(|(path, stamp, _)| Stamp::of(path) != *stamp);
         if !changed {
             return None;
         }
         let cache = self
             .found
             .iter()
-            .map(|found| {
-                (
-                    found.path.clone(),
-                    (found.stamp.clone(), Arc::clone(&found.entry)),
-                )
-            })
+            .map(|found| (&found.path, &found.stamp, &found.entry))
+            .chain(
+                self.shadowed
+                    .iter()
+                    .map(|(path, stamp, entry)| (path, stamp, entry)),
+            )
+            .map(|(path, stamp, entry)| (path.clone(), (stamp.clone(), Arc::clone(entry))))
             .collect();
         let roots = self
             .roots
@@ -386,11 +416,28 @@ impl AppIndex {
         self.roots.iter().map(|(path, _)| path.as_path()).collect()
     }
 
-    /// Files that could not be read, ID clashes, and problems inside the
-    /// winning files.
+    /// Files that could not be read or are ignored for their encoding
+    /// (shadowed ones too), ID clashes, and problems inside the winning
+    /// files.
     #[must_use]
     pub fn diagnostics(&self) -> &[Diagnostic] {
         &self.diagnostics
+    }
+
+    /// Whether the folder `dir` (an index into [`AppIndex::dirs`]) holds a
+    /// desktop file with ID `id`, even one a more important folder shadows
+    /// or one that says `Hidden=true`. Files that could not be read, or that
+    /// are ignored for their encoding, do not count. The MIME Applications
+    /// spec's rules work folder by folder and need this.
+    #[must_use]
+    pub fn dir_holds(&self, dir: usize, id: &str) -> bool {
+        self.held.get(dir).is_some_and(|ids| ids.contains(id))
+    }
+
+    /// The desktop file IDs the folder `dir` holds, as for
+    /// [`AppIndex::dir_holds`], in order.
+    pub fn dir_ids(&self, dir: usize) -> impl Iterator<Item = &str> {
+        self.held.get(dir).into_iter().flatten().map(String::as_str)
     }
 
     /// The folder (index into [`AppIndex::dirs`]) the application `id` came
@@ -507,6 +554,97 @@ mod tests {
     fn empty_search_path_folders_are_the_current_folder() {
         let dirs: Vec<&Path> = search_dirs(OsStr::new(":/bin::/usr/bin:")).collect();
         assert_eq!(dirs, [".", "/bin", ".", "/usr/bin", "."].map(Path::new));
+    }
+
+    #[test]
+    fn each_folder_knows_its_ids_shadowed_ones_too() {
+        let high = tempfile::tempdir().unwrap();
+        let low = tempfile::tempdir().unwrap();
+        write(&high.path().join("a.desktop"), &app("high"));
+        write(
+            &high.path().join("gone.desktop"),
+            &format!("{}Hidden=true\n", app("gone")),
+        );
+        write(&high.path().join("legacy.desktop"), &app("high"));
+        write(&low.path().join("a.desktop"), &app("low"));
+        write(&low.path().join("sub/b.desktop"), &app("b"));
+        // Ignored for their encoding, shadowed or not: not held.
+        let legacy = format!("{}Encoding=Legacy-Mixed\n", app("legacy"));
+        write(&low.path().join("legacy.desktop"), &legacy);
+        write(&low.path().join("only-legacy.desktop"), &legacy);
+        let index = AppIndex::from_dirs([high.path(), low.path()]);
+        assert_eq!(
+            index.dir_ids(0).collect::<Vec<_>>(),
+            ["a.desktop", "gone.desktop", "legacy.desktop"]
+        );
+        assert_eq!(
+            index.dir_ids(1).collect::<Vec<_>>(),
+            ["a.desktop", "sub-b.desktop"]
+        );
+        assert!(index.refresh().is_none());
+        write(&low.path().join("legacy.desktop"), &app("fixed"));
+        let index = index.refresh().expect("a shadowed file changed");
+        assert!(index.dir_holds(1, "legacy.desktop"));
+        assert!(index.dir_holds(1, "a.desktop"), "shadowed, still held");
+        assert!(!index.dir_holds(1, "gone.desktop"));
+        assert!(!index.dir_holds(2, "a.desktop"), "no such folder");
+        assert!(index.get("gone.desktop").is_none());
+    }
+
+    #[test]
+    fn shadowed_copies_are_read_quietly_and_watched() {
+        let high = tempfile::tempdir().unwrap();
+        let low = tempfile::tempdir().unwrap();
+        write(&high.path().join("a.desktop"), &app("high"));
+        write(&high.path().join("b.desktop"), &app("high"));
+        write(
+            &low.path().join("a.desktop"),
+            &format!("{}junk line\n", app("low")),
+        );
+        write(&low.path().join("b.desktop"), &app("low"));
+        let index = AppIndex::from_dirs([high.path(), low.path()]);
+        assert!(
+            index.diagnostics().is_empty(),
+            "a shadowed file's own problems stay quiet: {:?}",
+            index.diagnostics()
+        );
+        assert!(index.dir_holds(1, "a.desktop"));
+        // An edit in place leaves the folder's time alone; the file's stamp
+        // notices it.
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(low.path().join("a.desktop"))
+            .unwrap();
+        std::io::Write::write_all(&mut file, b"Encoding=Legacy-Mixed\n").unwrap();
+        drop(file);
+        let refreshed = index.refresh().expect("a shadowed file changed");
+        assert!(!refreshed.dir_holds(1, "a.desktop"));
+        assert!(refreshed.dir_holds(1, "b.desktop"));
+        let reused = |index: &AppIndex| {
+            index
+                .shadowed
+                .iter()
+                .find(|(path, _, _)| path.ends_with("b.desktop"))
+                .map(|(_, _, entry)| Arc::clone(entry))
+                .unwrap()
+        };
+        assert!(
+            Arc::ptr_eq(&reused(&index), &reused(&refreshed)),
+            "an unchanged shadowed file is not read again"
+        );
+    }
+
+    #[test]
+    fn a_folder_reached_again_holds_the_same() {
+        let real = tempfile::tempdir().unwrap();
+        let links = tempfile::tempdir().unwrap();
+        write(&real.path().join("a.desktop"), &app("a"));
+        let alias = links.path().join("alias");
+        std::os::unix::fs::symlink(real.path(), &alias).unwrap();
+        let index = AppIndex::from_dirs([real.path(), alias.as_path()]);
+        assert_eq!(index.dirs().len(), 2);
+        assert!(index.dir_holds(1, "a.desktop"));
+        assert_eq!(index.dir_of("a.desktop"), Some(0));
     }
 
     #[test]

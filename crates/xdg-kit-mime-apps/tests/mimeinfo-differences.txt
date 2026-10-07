@@ -1,0 +1,12 @@
+# Types whose line in mimeinfo.cache differs on purpose between
+# xdg_kit_mime_apps::mimeinfo_cache and update-desktop-database: type, our
+# value, reason. Our value is the line's text after `=`, or `-` when we
+# write no line for the type.
+# Fields are separated by single tab characters.
+IMAGE/PNG	Upper.desktop;nested-deeper-Upper.desktop;	RFC 6838: type names are case-insensitive, so upper-case ones are kept as written; the tool accepts only lower-case media types
+Text/Plain	Upper.desktop;nested-deeper-Upper.desktop;	RFC 6838: type names are case-insensitive, so upper-case ones are kept as written; the tool accepts only lower-case media types
+foo/bar	nested-deeper-odd-media.desktop;odd-media.desktop;	RFC 6838 restricted names allow any media type; the tool accepts only the media types on its own list
+text/before	before-group.desktop;nested-deeper-before-group.desktop;	GLib's key file parser refuses the whole file (an entry before the first group); this crate reads what it can, as everywhere
+text/garbage	garbage.desktop;nested-deeper-garbage.desktop;	GLib's key file parser refuses the whole file (a line that is no entry, group or comment); this crate reads what it can, as everywhere
+text/encoding-twice	encoding-twice.desktop;nested-deeper-encoding-twice.desktop;	a repeated key's last value counts here, as GLib reads other keys (Encoding=UTF-8); GLib's key file parser refuses the file at the first Encoding line (Legacy-Mixed)
+text/linked	alinked-x.desktop;	a folder reached under two names is listed once, under the first name in byte order, as AppIndex gives its files IDs (user decision, 2026-10-08); the tool lists every path

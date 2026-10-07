@@ -7,18 +7,21 @@ rust-version.workspace = true
 license.workspace = true
 
 [features]
-default = ["basedir", "desktop-entry", "locale", "mime"]
+default = ["basedir", "desktop-entry", "locale", "mime", "mime-apps"]
 ## The XDG Base Directory spec and user folders.
 basedir = ["dep:xdg-kit-basedir"]
 ## Desktop entries: reading, writing, validation, installed applications,
 ## launching.
-desktop-entry = ["dep:xdg-kit-desktop-entry"]
+desktop-entry = ["dep:xdg-kit-desktop-entry", "basedir"]
 ## D-Bus activation when launching `DBusActivatable` applications.
 desktop-entry-dbus = ["desktop-entry", "xdg-kit-desktop-entry/dbus"]
 ## The user's languages, for translated values.
 locale = ["dep:xdg-kit-locale"]
 ## The Shared MIME-info database.
-mime = ["dep:xdg-kit-mime"]
+mime = ["dep:xdg-kit-mime", "basedir"]
+## Applications for MIME types: defaults, associations, `mimeapps.list`,
+## opening files and URIs.
+mime-apps = ["dep:xdg-kit-mime-apps", "desktop-entry", "mime", "basedir"]
 ## Conversions between `xdg_kit::mime::MimeType` and `mime::Mime`.
 mime-crate-conversions = ["mime", "xdg-kit-mime/mime"]
 
@@ -27,6 +30,7 @@ xdg-kit-basedir = { workspace = true, optional = true }
 xdg-kit-desktop-entry = { workspace = true, optional = true }
 xdg-kit-locale = { workspace = true, optional = true }
 xdg-kit-mime = { workspace = true, optional = true }
+xdg-kit-mime-apps = { workspace = true, optional = true }
 
 [lints]
 workspace = true

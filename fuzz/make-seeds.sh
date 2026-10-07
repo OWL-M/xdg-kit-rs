@@ -1,7 +1,8 @@
 #!/bin/sh
 # Writes fuzz/seeds/<target>/ from seed-package.xml (our own, not shared-mime-info's
 # GPL data), using update-mime-database from the default dev shell, and from
-# the desktop-entry validation corpus (also ours). The seeds
+# the desktop-entry validation corpus (also ours), and a few mimeapps.list
+# files written here. The seeds
 # are generated, not committed (fuzz/.gitignore): run
 # `nix develop -c fuzz/make-seeds.sh` before fuzzing; checks.fuzz runs it
 # itself. The old seeds are replaced only once all new ones are written.
@@ -55,5 +56,13 @@ for file in "$corpus"/*; do
     done
   }
 done
+# mimeapps.list files (each read as a plain and a desktop-specific one):
+# every group, odd keys, repeated groups and keys, escapes, an entry before
+# the first group, a header without `]`, bytes that are not UTF-8.
+mkdir -p "$out/mime_apps_list"
+printf '# user\n[Default Applications]\ntext/plain=a.desktop;b.desktop;\nimage/*=v.desktop;\n\n[Added Associations]\ntext/plain=a.desktop;\nx-scheme-handler/https=web.desktop;\n\n[Removed Associations]\nText/Plain=c.desktop;\n' > "$out/mime_apps_list/user"
+printf '[Default Applications]\r\ntext/html=w.desktop\r\n[Added Associations]\r\ntext/html=w.desktop;\r\n' > "$out/mime_apps_list/crlf"
+printf '[Default Applications]\nnot a type=x.desktop;\n*/*=all.desktop;\na/b[de]=l.desktop;\n[X-Other]\nkeep=1' > "$out/mime_apps_list/odd"
+printf 'text/x=early.desktop\n[Added Associations]\ntext/plain=a.desktop;\n[Added Associations]\ntext/plain=b.desktop;\ntext/plain=c\\;d.desktop;\\se.desktop;\nimage/png=caf\351.desktop;\n[Removed Associations\n' > "$out/mime_apps_list/repeated"
 rm -rf seeds
 mv "$out" seeds

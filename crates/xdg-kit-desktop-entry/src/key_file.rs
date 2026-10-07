@@ -89,6 +89,7 @@ pub struct KeyFile {
     /// Whether the text ended with a line feed.
     final_newline: bool,
     path: Option<PathBuf>,
+    key_names: KeyNames,
     index: Index,
     diagnostics: Vec<Diagnostic>,
 }
@@ -111,8 +112,42 @@ impl Default for KeyFile {
             lines: Vec::new(),
             final_newline: true,
             path: None,
+            key_names: KeyNames::default(),
             index: Index::default(),
             diagnostics: Vec::new(),
+        }
+    }
+}
+
+/// The key names a key file accepts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum KeyNames {
+    /// The Desktop Entry spec's: `A-Za-z0-9-`.
+    #[default]
+    DesktopEntry,
+    /// Names other key files use, such as `mimeapps.list` with its MIME
+    /// type keys: not empty, no `=`, `[`, `]` or control character, no
+    /// space or tab at either end, and not starting with `#` (a comment).
+    /// A little stricter than `GLib`'s key files, so that every name reads
+    /// back as written.
+    Any,
+}
+
+impl KeyNames {
+    /// Whether `name` may name a key.
+    #[must_use]
+    pub fn allows(self, name: &str) -> bool {
+        match self {
+            Self::DesktopEntry => valid_key_name(name),
+            Self::Any => {
+                !name.is_empty()
+                    && !name.starts_with([' ', '\t', '#'])
+                    && !name.ends_with([' ', '\t'])
+                    && !name
+                        .chars()
+                        .any(|c| matches!(c, '=' | '[' | ']') || c.is_control())
+            }
         }
     }
 }
@@ -124,7 +159,7 @@ impl Default for KeyFile {
 pub enum EditError {
     /// Not a group name: printable ASCII without `[` and `]`.
     GroupName(String),
-    /// Not a key name: `A-Za-z0-9-`.
+    /// Not a key name under the file's [`KeyNames`].
     KeyName(String),
     /// Not a locale postfix: printable ASCII without `[`, `]` and `=`.
     Locale(String),
@@ -276,26 +311,51 @@ impl KeyFile {
     ///
     /// When the file cannot be read. Problems in its text are diagnostics.
     pub fn read(path: impl AsRef<Path>) -> io::Result<Self> {
+        Self::read_with(path, KeyNames::DesktopEntry)
+    }
+
+    /// Reads the key file at `path`, whose keys follow `key_names`.
+    ///
+    /// # Errors
+    ///
+    /// When the file cannot be read. Problems in its text are diagnostics.
+    pub fn read_with(path: impl AsRef<Path>, key_names: KeyNames) -> io::Result<Self> {
         let path = path.as_ref();
         let bytes = fs::read(path)?;
-        Ok(Self::parse_from(&bytes, Some(path.to_owned())))
+        Ok(Self::parse_from(&bytes, Some(path.to_owned()), key_names))
     }
 
     /// Parses `bytes` as a key file. Problems are diagnostics; nothing fails.
     #[must_use]
     pub fn parse(bytes: &[u8]) -> Self {
-        Self::parse_from(bytes, None)
+        Self::parse_from(bytes, None, KeyNames::DesktopEntry)
     }
 
-    fn parse_from(bytes: &[u8], path: Option<PathBuf>) -> Self {
+    /// Parses `bytes` as a key file whose keys follow `key_names`.
+    #[must_use]
+    pub fn parse_with(bytes: &[u8], key_names: KeyNames) -> Self {
+        Self::parse_from(bytes, None, key_names)
+    }
+
+    /// The key names this file accepts.
+    #[must_use]
+    pub fn key_names(&self) -> KeyNames {
+        self.key_names
+    }
+
+    fn parse_from(bytes: &[u8], path: Option<PathBuf>, key_names: KeyNames) -> Self {
         let mut file = Self {
             final_newline: bytes.last() == Some(&b'\n') || bytes.is_empty(),
             path,
+            key_names,
             ..Self::default()
         };
         if !bytes.is_empty() {
             let body = bytes.strip_suffix(b"\n").unwrap_or(bytes);
-            file.lines = body.split(|&byte| byte == b'\n').map(classify).collect();
+            file.lines = body
+                .split(|&byte| byte == b'\n')
+                .map(|raw| classify(raw, key_names))
+                .collect();
         }
         file.reindex();
         file
@@ -511,7 +571,7 @@ impl KeyFile {
         if !valid_group_name(group) {
             return Err(EditError::GroupName(group.to_owned()));
         }
-        if !valid_key_name(key) {
+        if !self.key_names.allows(key) {
             return Err(EditError::KeyName(key.to_owned()));
         }
         if let Some(locale) = locale.filter(|locale| !valid_locale(locale)) {
@@ -813,7 +873,7 @@ impl KeyFile {
 
 /// Reads one line (without its line feed): what it is, and what is wrong
 /// with it.
-fn classify(raw: &[u8]) -> Line {
+fn classify(raw: &[u8], key_names: KeyNames) -> Line {
     let line = |kind, problem: Option<String>| Line {
         raw: raw.to_vec(),
         kind,
@@ -849,7 +909,7 @@ fn classify(raw: &[u8]) -> Line {
     };
     let key_text = trimmed[..eq].trim_end_matches([' ', '\t']);
     let (key, locale) = split_key(key_text);
-    let problem = (!valid_key_name(key))
+    let problem = (!key_names.allows(key))
         .then(|| format!("key {key_text:?} has characters a key name may not have"));
     let value = trimmed[eq + 1..].trim_start_matches([' ', '\t']);
     line(
@@ -1154,7 +1214,7 @@ mod tests {
 
     /// The edited file answers as a fresh parse of its text does.
     fn assert_like_reparse(file: &KeyFile) {
-        let fresh = KeyFile::parse(&file.to_bytes());
+        let fresh = KeyFile::parse_with(&file.to_bytes(), file.key_names());
         assert_eq!(file.groups(), fresh.groups());
         for group in fresh.groups() {
             assert_eq!(file.group_line(group), fresh.group_line(group), "[{group}]");
@@ -1191,6 +1251,44 @@ mod tests {
         assert_like_reparse(&file);
         file.set_string("A", "x", "back").unwrap();
         assert_like_reparse(&file);
+    }
+
+    #[test]
+    fn other_key_files_take_any_key_names() {
+        let mut file = KeyFile::parse_with(
+            b"[Default Applications]\nimage/svg+xml=a.desktop;\n",
+            KeyNames::Any,
+        );
+        assert!(file.diagnostics().is_empty(), "{:?}", file.diagnostics());
+        assert_eq!(
+            file.raw("Default Applications", "image/svg+xml", None),
+            Some("a.desktop;")
+        );
+        file.set_raw(
+            "Default Applications",
+            "x-scheme-handler/https",
+            None,
+            "b.desktop;",
+        )
+        .unwrap();
+        assert_like_reparse(&file);
+        for bad in ["", "a=b", "a[b", " a", "a\t", "#a", "a\u{7}"] {
+            assert_eq!(
+                file.set_raw("G", bad, None, "x"),
+                Err(EditError::KeyName(bad.into())),
+                "{bad:?}"
+            );
+        }
+        // Desktop entries keep their own rule.
+        assert!(
+            !KeyFile::parse(b"[A]\nimage/png=x\n")
+                .diagnostics()
+                .is_empty()
+        );
+        assert_eq!(
+            KeyFile::new().set_raw("A", "image/png", None, "x"),
+            Err(EditError::KeyName("image/png".into()))
+        );
     }
 
     #[test]

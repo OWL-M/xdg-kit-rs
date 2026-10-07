@@ -39,7 +39,7 @@ pub use entry::{
 };
 pub use error::Diagnostic;
 pub use index::{AppEntry, AppIndex};
-pub use key_file::{EditError, KeyFile};
+pub use key_file::{EditError, KeyFile, KeyNames};
 pub use launch::{
     DBusCall, DBusMethod, Launch, LaunchError, LaunchOptions, LaunchPlan, PlannedCommand, Target,
     prepare_launch,
