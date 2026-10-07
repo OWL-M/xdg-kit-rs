@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Foo
+Exec=foo %U
+Name[de]=Fuh
+Name[sr@latin]=Fu
+Comment=Views foos
+Comment[fr_CA]=Voir
+Keywords=view;image;
+Keywords[de]=ansehen;

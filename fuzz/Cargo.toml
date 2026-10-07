@@ -15,6 +15,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+xdg-kit-desktop-entry = { path = "../crates/xdg-kit-desktop-entry" }
 xdg-kit-mime = { path = "../crates/xdg-kit-mime" }
 
 [[bin]]
@@ -62,6 +63,27 @@ bench = false
 [[bin]]
 name = "fnmatch"
 path = "fuzz_targets/fnmatch.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "desktop_key_file"
+path = "fuzz_targets/desktop_key_file.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "desktop_exec"
+path = "fuzz_targets/desktop_exec.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "desktop_entry"
+path = "fuzz_targets/desktop_entry.rs"
 test = false
 doc = false
 bench = false

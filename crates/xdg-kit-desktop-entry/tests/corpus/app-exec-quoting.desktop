@@ -1,0 +1,4 @@
+[Desktop Entry]
+Type=Application
+Name=Q
+Exec="/opt/My App/bin/app" --title "a \\$b \\\\ c" %f

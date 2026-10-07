@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Foo
+Exec=foo %U
+
+[Desktop Action New]
+Name=New
+Exec=foo --new

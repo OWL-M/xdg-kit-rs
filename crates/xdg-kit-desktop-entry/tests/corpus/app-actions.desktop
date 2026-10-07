@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=Foo
+Exec=foo %U
+Actions=New;Private-Window;
+
+[Desktop Action New]
+Name=New Window
+Exec=foo --new
+
+[Desktop Action Private-Window]
+Name=Private
+Name[de]=Privat
+Exec=foo --private

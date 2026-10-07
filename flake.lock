@@ -1,5 +1,21 @@
 {
   "nodes": {
+    "desktop-file-utils": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1791029704,
+        "narHash": "sha256-xLrGROIkSOcAeTfOIMW3fwN/lj9VBvDgeArWaguKTvY=",
+        "ref": "refs/heads/master",
+        "rev": "7c55a97a0b9205eafe6fc5111a1cf49605477904",
+        "revCount": 388,
+        "type": "git",
+        "url": "https://gitlab.freedesktop.org/xdg/desktop-file-utils.git"
+      },
+      "original": {
+        "type": "git",
+        "url": "https://gitlab.freedesktop.org/xdg/desktop-file-utils.git"
+      }
+    },
     "fenix": {
       "inputs": {
         "nixpkgs": [
@@ -39,10 +55,12 @@
     },
     "root": {
       "inputs": {
+        "desktop-file-utils": "desktop-file-utils",
         "fenix": "fenix",
         "nixpkgs": "nixpkgs",
         "shared-mime-info": "shared-mime-info",
-        "systems": "systems"
+        "systems": "systems",
+        "xdg-specs": "xdg-specs"
       }
     },
     "rust-analyzer-src": {
@@ -91,6 +109,22 @@
         "owner": "nix-systems",
         "repo": "default-linux",
         "type": "github"
+      }
+    },
+    "xdg-specs": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1790954144,
+        "narHash": "sha256-21dhZyUDuNSZrCxQZZHALqW/MqMSoM8XyrzWAArI89E=",
+        "ref": "refs/heads/master",
+        "rev": "1e7f4cefd7fe02201c77c1b5c8eed284b88d4142",
+        "revCount": 559,
+        "type": "git",
+        "url": "https://gitlab.freedesktop.org/xdg/xdg-specs.git"
+      },
+      "original": {
+        "type": "git",
+        "url": "https://gitlab.freedesktop.org/xdg/xdg-specs.git"
       }
     }
   },

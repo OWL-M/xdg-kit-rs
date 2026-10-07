@@ -1,0 +1,23 @@
+# Files of tests/corpus/ on which validate and desktop-file-validate (pinned)
+# disagree on purpose: file, our verdict, the reference verdict, reason.
+# Fields are separated by single tab characters.
+action-onlyshowin.desktop	invalid	valid	the spec's action keys are Name, Icon and Exec; OnlyShowIn is not one of them (the tool calls it deprecated there)
+app-implements.desktop	valid	invalid	the tool reads the empty piece after the final ';' as an interface name; the spec lets a list end with ';'
+autostart-bogus.desktop	valid	invalid	AutostartCondition belongs to GNOME's autostart rules; the Desktop Entry spec only reserves the key, so its value is not checked
+boolean-one.desktop	invalid	valid	the spec: booleans must be true or false; the tool only warns about 1 and 0
+categories-audio-alone.desktop	invalid	valid	the menu spec: an entry with Audio must include AudioVideo as well; the tool makes it an error only in the future
+categories-deprecated.desktop	invalid	valid	Application is not a category in the menu spec 1.1 (which lists no deprecated ones); the tool still knows it as deprecated
+exec-backslash-unquoted.desktop	invalid	valid	the spec: backslash is a reserved character, and an argument with one must be quoted; the tool does not check it
+exec-code-in-quotes.desktop	invalid	valid	the spec: field codes must not be used inside a quoted argument; the tool does not check it
+exec-empty.desktop	invalid	valid	the spec: the Exec key must contain a command line, which starts with a program; the tool accepts an empty value
+exec-equals-in-program.desktop	invalid	valid	the spec: the program's name may not contain '='; the tool does not check it
+exec-files-not-standalone.desktop	invalid	valid	the spec: %F may only be used as an argument on its own; the tool does not check it
+exec-icon-not-standalone.desktop	invalid	valid	the latest spec text (xdg-specs da38d5a): %i may only be used as an argument on its own; the tool does not check it
+exec-partly-quoted.desktop	invalid	valid	the spec: arguments may be quoted in whole, and one with a reserved character (here a space) must be; the tool does not check it
+exec-urls-not-standalone.desktop	invalid	valid	the spec: %U may only be used as an argument on its own; the tool does not check it
+link-no-url.desktop	invalid	valid	the spec: URL is required for Type=Link; the tool does not require it
+locale-empty-country.desktop	invalid	valid	the spec: a locale is lang_COUNTRY.ENCODING@MODIFIER with optional parts; an empty COUNTRY after "_" is not that form; the tool checks only the characters
+old-version-comma-lists.desktop	valid	invalid	the spec (Deprecated Items): when reading a pre-1.0 desktop entry, comma-separated lists should be supported; the tool reads GNOME,KDE as one name
+showin-both.desktop	valid	invalid	the spec forbids only the same desktop name in both OnlyShowIn and NotShowIn; the tool forbids having both keys
+showin-budgie.desktop	invalid	valid	Budgie is not a registered desktop in the menu spec 1.1; the tool's own list has it
+string-not-ascii.desktop	invalid	valid	the spec: string values are ASCII; the tool accepts non-ASCII in StartupWMClass

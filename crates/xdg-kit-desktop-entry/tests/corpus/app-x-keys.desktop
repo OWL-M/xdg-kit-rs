@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Foo
+Exec=foo %U
+X-GNOME-UsesNotifications=true
+X-Custom=anything goes
+
+[X-Extra Group]
+whatever=1

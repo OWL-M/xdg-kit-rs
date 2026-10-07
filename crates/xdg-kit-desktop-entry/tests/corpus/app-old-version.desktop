@@ -1,0 +1,5 @@
+[Desktop Entry]
+Type=Application
+Name=Foo
+Exec=foo %U
+Version=0.9.4

@@ -1,0 +1,5 @@
+[Desktop Entry]
+Type=Application
+Name=Foo
+Exec=foo %U
+AutostartCondition=GNOME3 if-session gnome

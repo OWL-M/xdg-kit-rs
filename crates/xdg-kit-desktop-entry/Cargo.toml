@@ -1,0 +1,23 @@
+[package]
+name = "xdg-kit-desktop-entry"
+description = "The freedesktop.org Desktop Entry spec: reading, lossless writing, validation, the installed applications, and launching"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+## Launching applications through D-Bus activation (`DBusActivatable=true`).
+dbus = ["dep:zbus"]
+
+[dependencies]
+rustix = { workspace = true, features = ["fs"] }
+xdg-kit-basedir.workspace = true
+xdg-kit-locale.workspace = true
+zbus = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

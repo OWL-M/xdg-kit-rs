@@ -154,10 +154,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "xdg-kit-desktop-entry"
+version = "0.1.0"
+dependencies = [
+ "rustix",
+ "xdg-kit-basedir",
+ "xdg-kit-locale",
+]
+
+[[package]]
 name = "xdg-kit-fuzz"
 version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
+ "xdg-kit-desktop-entry",
  "xdg-kit-mime",
 ]
 

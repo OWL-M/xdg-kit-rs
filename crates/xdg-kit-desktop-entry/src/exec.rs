@@ -1,0 +1,488 @@
+//! The `Exec` key (Desktop Entry spec "The Exec key"): the command line,
+//! its quoting and its field codes.
+//!
+//! [`CommandLine::parse`] takes a value with string escapes already
+//! decoded, as returned by [`DesktopEntry::exec`](crate::DesktopEntry::exec).
+//! An unknown field code or an unclosed quote makes the command unusable
+//! under the spec and returns an [`ExecError`]. Other violations, such as
+//! an unquoted reserved character or a field code inside quotes, produce
+//! an [`ExecProblem`]. [`validate`](crate::validate) reports these, but they
+//! do not prevent launching.
+
+use std::ffi::{OsStr, OsString};
+use std::fmt;
+
+/// Characters that need quoting ("Reserved characters"), besides space.
+const RESERVED: &[char] = &[
+    '\t', '\n', '"', '\'', '\\', '>', '<', '~', '|', '&', ';', '$', '*', '?', '#', '(', ')', '`',
+];
+
+/// One part of an unquoted argument.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Piece {
+    Text(String),
+    /// A field code: one of `f F u U i c k`.
+    Code(char),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Arg {
+    pieces: Vec<Piece>,
+    /// Quoted in whole: no field codes are expanded.
+    quoted: bool,
+}
+
+/// Why a command line cannot be used.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ExecError {
+    /// No program.
+    Empty,
+    /// A `"` with no closing one.
+    UnclosedQuote,
+    /// A `\` at the very end inside a quote.
+    IncompleteEscape,
+    /// A `%` at the very end.
+    IncompleteFieldCode,
+    /// A field code the spec does not list (`%x`).
+    UnknownFieldCode(char),
+}
+
+impl fmt::Display for ExecError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => write!(f, "the command line has no program"),
+            Self::UnclosedQuote => write!(f, "a quote is not closed"),
+            Self::IncompleteEscape => write!(f, "the command line ends in an incomplete escape"),
+            Self::IncompleteFieldCode => {
+                write!(f, "the command line ends in an incomplete field code")
+            }
+            Self::UnknownFieldCode(code) => write!(f, "%{code} is not a field code the spec lists"),
+        }
+    }
+}
+
+impl std::error::Error for ExecError {}
+
+/// Something in a usable command line that breaks the spec's rules.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ExecProblem {
+    /// A reserved character outside quotes.
+    ReservedOutsideQuotes(char),
+    /// `` ` `` or `$` inside quotes without a backslash before it.
+    UnescapedInQuotes(char),
+    /// A quote that does not cover its whole argument.
+    PartlyQuoted,
+    /// A field code inside a quoted argument (its expansion is undefined;
+    /// it is left as written).
+    FieldCodeInQuotes,
+    /// More than one of `%f %F %u %U`.
+    SeveralFileCodes,
+    /// `%F`, `%U` or `%i` not as an argument on its own.
+    NotStandalone(char),
+    /// A deprecated field code (`%d %D %n %N %v %m`), which is dropped.
+    Deprecated(char),
+    /// `=` in the program's name.
+    EqualsInProgram,
+}
+
+impl fmt::Display for ExecProblem {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ReservedOutsideQuotes(c) => {
+                write!(f, "reserved character {c:?} outside quotes")
+            }
+            Self::UnescapedInQuotes(c) => {
+                write!(f, "{c:?} inside quotes must be escaped with a backslash")
+            }
+            Self::PartlyQuoted => write!(f, "a quote must enclose a whole argument"),
+            Self::FieldCodeInQuotes => write!(f, "a field code inside quotes is not expanded"),
+            Self::SeveralFileCodes => write!(
+                f,
+                "a command line may contain at most one of %f, %F, %u and %U"
+            ),
+            Self::NotStandalone(code) => {
+                write!(f, "%{code} may only be used as an argument on its own")
+            }
+            Self::Deprecated(code) => write!(f, "%{code} is deprecated and is dropped"),
+            Self::EqualsInProgram => write!(f, "the program's name may not contain '='"),
+        }
+    }
+}
+
+/// Which file field code a command line has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileCode {
+    /// `%f`: one local path per command.
+    File,
+    /// `%F`: all local paths in one command.
+    Files,
+    /// `%u`: one URL per command.
+    Url,
+    /// `%U`: all URLs in one command.
+    Urls,
+}
+
+impl FileCode {
+    /// Whether the program takes several targets in one run.
+    #[must_use]
+    pub fn takes_several(self) -> bool {
+        matches!(self, Self::Files | Self::Urls)
+    }
+
+    /// Whether the program takes URLs rather than local paths.
+    #[must_use]
+    pub fn takes_urls(self) -> bool {
+        matches!(self, Self::Url | Self::Urls)
+    }
+}
+
+/// A parsed `Exec` command line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandLine {
+    args: Vec<Arg>,
+    problems: Vec<ExecProblem>,
+}
+
+/// What field codes expand to, for [`CommandLine::expand`].
+pub(crate) struct Values<'a> {
+    /// The targets for `%f %F %u %U`, already paths or URLs as the code
+    /// needs; at most one for `%f` and `%u`.
+    pub(crate) files: &'a [OsString],
+    pub(crate) icon: Option<&'a str>,
+    pub(crate) name: &'a str,
+    pub(crate) location: &'a OsStr,
+}
+
+impl CommandLine {
+    /// Parses `exec`, the `Exec` value with string escapes undone.
+    ///
+    /// # Errors
+    ///
+    /// When the spec says the command line must not be used.
+    pub fn parse(exec: &str) -> Result<Self, ExecError> {
+        let mut problems = Vec::new();
+        let mut args = Vec::new();
+        let mut chars = exec.chars().peekable();
+        loop {
+            while chars.peek() == Some(&' ') {
+                chars.next();
+            }
+            if chars.peek().is_none() {
+                break;
+            }
+            let mut arg = Arg {
+                pieces: Vec::new(),
+                quoted: false,
+            };
+            let mut text = String::new();
+            let mut started_quoted = false;
+            let mut had_deprecated = false;
+            while let Some(&c) = chars.peek() {
+                if c == ' ' {
+                    break;
+                }
+                chars.next();
+                if c == '"' {
+                    if !arg.pieces.is_empty() || !text.is_empty() {
+                        problems.push(ExecProblem::PartlyQuoted);
+                    } else {
+                        started_quoted = true;
+                    }
+                    read_quoted(&mut chars, &mut text, &mut problems)?;
+                    if chars.peek().is_some_and(|&next| next != ' ') {
+                        problems.push(ExecProblem::PartlyQuoted);
+                        started_quoted = false;
+                    }
+                    continue;
+                }
+                if c == '%' {
+                    match chars.next() {
+                        None => return Err(ExecError::IncompleteFieldCode),
+                        Some('%') => text.push('%'),
+                        Some(code @ ('f' | 'F' | 'u' | 'U' | 'i' | 'c' | 'k')) => {
+                            if !text.is_empty() {
+                                arg.pieces.push(Piece::Text(std::mem::take(&mut text)));
+                            }
+                            arg.pieces.push(Piece::Code(code));
+                        }
+                        Some(code @ ('d' | 'D' | 'n' | 'N' | 'v' | 'm')) => {
+                            problems.push(ExecProblem::Deprecated(code));
+                            had_deprecated = true;
+                            continue;
+                        }
+                        Some(code) => return Err(ExecError::UnknownFieldCode(code)),
+                    }
+                    continue;
+                }
+                if RESERVED.contains(&c) {
+                    problems.push(ExecProblem::ReservedOutsideQuotes(c));
+                }
+                text.push(c);
+            }
+            if had_deprecated && !started_quoted && arg.pieces.is_empty() && text.is_empty() {
+                // An argument that was only deprecated codes is removed.
+                continue;
+            }
+            if !text.is_empty() || arg.pieces.is_empty() {
+                arg.pieces.push(Piece::Text(text));
+            }
+            arg.quoted = started_quoted;
+            args.push(arg);
+        }
+        let Some(program) = args.first() else {
+            return Err(ExecError::Empty);
+        };
+        if program
+            .pieces
+            .iter()
+            .any(|piece| matches!(piece, Piece::Text(text) if text.contains('=')))
+        {
+            problems.push(ExecProblem::EqualsInProgram);
+        }
+        let mut file_codes = 0;
+        for arg in &args {
+            for piece in &arg.pieces {
+                if let Piece::Code(code) = piece {
+                    if matches!(code, 'f' | 'F' | 'u' | 'U') {
+                        file_codes += 1;
+                    }
+                    if matches!(code, 'F' | 'U' | 'i') && arg.pieces.len() > 1 {
+                        problems.push(ExecProblem::NotStandalone(*code));
+                    }
+                }
+            }
+        }
+        if file_codes > 1 {
+            problems.push(ExecProblem::SeveralFileCodes);
+        }
+        Ok(Self { args, problems })
+    }
+
+    /// What breaks the spec's rules but still lets the command run.
+    #[must_use]
+    pub fn problems(&self) -> &[ExecProblem] {
+        &self.problems
+    }
+
+    /// The file field code, if any (the first, when there are several).
+    #[must_use]
+    pub fn file_code(&self) -> Option<FileCode> {
+        self.args
+            .iter()
+            .filter(|arg| !arg.quoted)
+            .flat_map(|arg| &arg.pieces)
+            .find_map(|piece| match piece {
+                Piece::Code('f') => Some(FileCode::File),
+                Piece::Code('F') => Some(FileCode::Files),
+                Piece::Code('u') => Some(FileCode::Url),
+                Piece::Code('U') => Some(FileCode::Urls),
+                _ => None,
+            })
+    }
+
+    /// The arguments with the field codes expanded. Each replacement is one
+    /// argument (or, for `%F`, `%U` and `%i`, several) and is not expanded
+    /// again; an argument made only of field codes that expand to nothing
+    /// is dropped.
+    pub(crate) fn expand(&self, values: &Values<'_>) -> Vec<OsString> {
+        let mut out = Vec::new();
+        for arg in &self.args {
+            if let [Piece::Code(code)] = arg.pieces.as_slice()
+                && !arg.quoted
+            {
+                match code {
+                    'F' | 'U' => out.extend(values.files.iter().cloned()),
+                    'f' | 'u' => out.extend(values.files.first().cloned()),
+                    'i' => {
+                        if let Some(icon) = values.icon.filter(|icon| !icon.is_empty()) {
+                            out.push("--icon".into());
+                            out.push(icon.into());
+                        }
+                    }
+                    'c' if !values.name.is_empty() => out.push(values.name.into()),
+                    'k' if !values.location.is_empty() => out.push(values.location.into()),
+                    _ => {}
+                }
+                continue;
+            }
+            let mut text = OsString::new();
+            for piece in &arg.pieces {
+                match piece {
+                    Piece::Text(part) => text.push(part),
+                    Piece::Code(code) => match code {
+                        'f' | 'u' | 'F' | 'U' => {
+                            if let Some(first) = values.files.first() {
+                                text.push(first);
+                            }
+                        }
+                        'c' => text.push(values.name),
+                        'k' => text.push(values.location),
+                        _ => {}
+                    },
+                }
+            }
+            out.push(text);
+        }
+        out
+    }
+}
+
+/// Reads a quoted argument after its opening `"` up to the closing one.
+fn read_quoted(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    text: &mut String,
+    problems: &mut Vec<ExecProblem>,
+) -> Result<(), ExecError> {
+    loop {
+        let Some(c) = chars.next() else {
+            return Err(ExecError::UnclosedQuote);
+        };
+        match c {
+            '"' => return Ok(()),
+            '\\' => match chars.next() {
+                Some(escaped @ ('"' | '`' | '$' | '\\')) => text.push(escaped),
+                Some(other) => {
+                    text.push('\\');
+                    text.push(other);
+                }
+                None => return Err(ExecError::IncompleteEscape),
+            },
+            '`' | '$' => {
+                problems.push(ExecProblem::UnescapedInQuotes(c));
+                text.push(c);
+            }
+            '%' => {
+                if chars.peek() == Some(&'%') {
+                    chars.next();
+                    text.push('%');
+                } else {
+                    problems.push(ExecProblem::FieldCodeInQuotes);
+                    text.push('%');
+                }
+            }
+            _ => text.push(c),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn expand(exec: &str, files: &[&str]) -> Vec<String> {
+        let line = CommandLine::parse(exec).unwrap();
+        let files: Vec<OsString> = files.iter().map(OsString::from).collect();
+        line.expand(&Values {
+            files: &files,
+            icon: Some("fooview"),
+            name: "Foo Viewer",
+            location: OsStr::new("/usr/share/applications/foo.desktop"),
+        })
+        .into_iter()
+        .map(|arg| arg.into_string().unwrap())
+        .collect()
+    }
+
+    #[test]
+    fn field_codes_expand_into_whole_arguments() {
+        assert_eq!(
+            expand("fooview %F", &["/a b", "/c"]),
+            ["fooview", "/a b", "/c"]
+        );
+        assert_eq!(expand("fooview %f", &["/a b"]), ["fooview", "/a b"]);
+        assert_eq!(expand("fooview %f", &[]), ["fooview"]);
+        assert_eq!(
+            expand("fooview %i --name=%c %k", &[]),
+            [
+                "fooview",
+                "--icon",
+                "fooview",
+                "--name=Foo Viewer",
+                "/usr/share/applications/foo.desktop"
+            ]
+        );
+        assert_eq!(
+            expand("fooview --file=%u", &["file:///x"]),
+            ["fooview", "--file=file:///x"]
+        );
+        assert_eq!(expand("echo 100%%", &[]), ["echo", "100%"]);
+        assert_eq!(
+            expand("app %d %U", &["u"]),
+            ["app", "u"],
+            "deprecated codes dropped"
+        );
+        assert_eq!(expand("app %d%f x%m", &["/f"]), ["app", "/f", "x"]);
+    }
+
+    #[test]
+    fn quoting_is_undone_before_expansion() {
+        assert_eq!(
+            expand(
+                r#""/opt/My App/bin/app" "a \"q\" \$HOME \\ \`x\`" %f"#,
+                &["/f"]
+            ),
+            ["/opt/My App/bin/app", "a \"q\" $HOME \\ `x`", "/f"]
+        );
+        assert_eq!(
+            expand(r#"sh -c "echo %f""#, &["/f"]),
+            ["sh", "-c", "echo %f"]
+        );
+        assert_eq!(expand("app  spaced   out", &[]), ["app", "spaced", "out"]);
+    }
+
+    #[test]
+    fn what_makes_a_command_line_unusable() {
+        assert_eq!(CommandLine::parse(""), Err(ExecError::Empty));
+        assert_eq!(CommandLine::parse("   "), Err(ExecError::Empty));
+        assert_eq!(
+            CommandLine::parse("app %x"),
+            Err(ExecError::UnknownFieldCode('x'))
+        );
+        assert_eq!(
+            CommandLine::parse("app %"),
+            Err(ExecError::IncompleteFieldCode)
+        );
+        assert_eq!(
+            CommandLine::parse("app \"open"),
+            Err(ExecError::UnclosedQuote)
+        );
+        assert_eq!(
+            CommandLine::parse("app \"a\\"),
+            Err(ExecError::IncompleteEscape)
+        );
+    }
+
+    #[test]
+    fn rule_breaking_that_still_runs() {
+        let problems = |exec: &str| CommandLine::parse(exec).unwrap().problems().to_vec();
+        assert_eq!(
+            problems("app ~/x"),
+            [ExecProblem::ReservedOutsideQuotes('~')]
+        );
+        assert_eq!(
+            problems("app \"$X\""),
+            [ExecProblem::UnescapedInQuotes('$')]
+        );
+        assert_eq!(problems("app \"%f\""), [ExecProblem::FieldCodeInQuotes]);
+        assert_eq!(problems("app %f %U"), [ExecProblem::SeveralFileCodes]);
+        assert_eq!(problems("app --x=%U"), [ExecProblem::NotStandalone('U')]);
+        assert_eq!(problems("app --icon=%i"), [ExecProblem::NotStandalone('i')]);
+        assert_eq!(problems("a=b %f"), [ExecProblem::EqualsInProgram]);
+        assert_eq!(problems("app pre\"q\""), [ExecProblem::PartlyQuoted]);
+        assert_eq!(problems("app %m"), [ExecProblem::Deprecated('m')]);
+        assert!(problems("env A=b app --x=%c %U").is_empty());
+    }
+
+    #[test]
+    fn the_file_code_decides_how_targets_are_passed() {
+        let code = |exec: &str| CommandLine::parse(exec).unwrap().file_code();
+        assert_eq!(code("app"), None);
+        assert_eq!(code("app %f"), Some(FileCode::File));
+        assert_eq!(code("app %U"), Some(FileCode::Urls));
+        assert_eq!(code("sh -c \"x %f\""), None, "not in quotes");
+        assert!(FileCode::Files.takes_several() && !FileCode::Url.takes_several());
+        assert!(FileCode::Urls.takes_urls() && !FileCode::File.takes_urls());
+    }
+}

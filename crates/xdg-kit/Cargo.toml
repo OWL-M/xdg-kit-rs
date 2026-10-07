@@ -7,9 +7,14 @@ rust-version.workspace = true
 license.workspace = true
 
 [features]
-default = ["basedir", "locale", "mime"]
+default = ["basedir", "desktop-entry", "locale", "mime"]
 ## The XDG Base Directory spec and user folders.
 basedir = ["dep:xdg-kit-basedir"]
+## Desktop entries: reading, writing, validation, installed applications,
+## launching.
+desktop-entry = ["dep:xdg-kit-desktop-entry"]
+## D-Bus activation when launching `DBusActivatable` applications.
+desktop-entry-dbus = ["desktop-entry", "xdg-kit-desktop-entry/dbus"]
 ## The user's languages, for translated values.
 locale = ["dep:xdg-kit-locale"]
 ## The Shared MIME-info database.
@@ -19,6 +24,7 @@ mime-crate-conversions = ["mime", "xdg-kit-mime/mime"]
 
 [dependencies]
 xdg-kit-basedir = { workspace = true, optional = true }
+xdg-kit-desktop-entry = { workspace = true, optional = true }
 xdg-kit-locale = { workspace = true, optional = true }
 xdg-kit-mime = { workspace = true, optional = true }
 

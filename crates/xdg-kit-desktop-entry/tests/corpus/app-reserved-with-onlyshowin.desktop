@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=Foo
+Exec=foo %U
+Categories=Utility;TrayIcon;
+OnlyShowIn=GNOME;

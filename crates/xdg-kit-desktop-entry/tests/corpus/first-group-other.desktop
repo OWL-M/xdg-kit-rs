@@ -1,0 +1,7 @@
+[X-First]
+a=b
+
+[Desktop Entry]
+Type=Application
+Name=Foo
+Exec=foo %U

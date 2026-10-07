@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=Foo
+Exec=foo %U
+OnlyShowIn=GNOME;KDE;
+NotShowIn=KDE;

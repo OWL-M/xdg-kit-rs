@@ -1,6 +1,7 @@
 #!/bin/sh
 # Writes fuzz/seeds/<target>/ from seed-package.xml (our own, not shared-mime-info's
-# GPL data), using update-mime-database from the default dev shell. The seeds
+# GPL data), using update-mime-database from the default dev shell, and from
+# the desktop-entry validation corpus (also ours). The seeds
 # are generated, not committed (fuzz/.gitignore): run
 # `nix develop -c fuzz/make-seeds.sh` before fuzzing; checks.fuzz runs it
 # itself. The old seeds are replaced only once all new ones are written.
@@ -38,5 +39,21 @@ printf '\357\273\277<?pi data?><u:x/>' > "$out/xml_root/unbound"
 printf '*.tar.gz\000a.tar.gz' > "$out/fnmatch/star"
 printf 'seed-[0-9]?.*\000seed-4x.txt' > "$out/fnmatch/set"
 printf '[!a-c]\\*\000d*' > "$out/fnmatch/escape"
+# Desktop entries: the validation corpus (written for this repository), and
+# Exec values from it.
+corpus=../crates/xdg-kit-desktop-entry/tests/corpus
+mkdir -p "$out/desktop_key_file" "$out/desktop_entry" "$out/desktop_exec"
+cp "$corpus"/* "$out/desktop_key_file/"
+cp "$corpus"/* "$out/desktop_entry/"
+for file in "$corpus"/*; do
+  # Numbered per file; the loop runs in the pipeline's subshell.
+  grep '^Exec=' "$file" | {
+    count=0
+    while IFS= read -r line; do
+      count=$((count + 1))
+      printf '%s' "${line#Exec=}" > "$out/desktop_exec/$(basename "$file").$count"
+    done
+  }
+done
 rm -rf seeds
 mv "$out" seeds

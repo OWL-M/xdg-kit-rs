@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=I
+Exec=i
+Implements=org.example.Iface
+
+[org.example.Iface]
+Detail=1
