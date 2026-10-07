@@ -1,0 +1,24 @@
+[package]
+name = "xdg-kit-mime"
+description = "The freedesktop.org Shared MIME-info database: file types, their relationships, icons and descriptions"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+## Conversions to and from `mime::Mime`.
+mime = ["dep:mime"]
+
+[dependencies]
+mime = { workspace = true, optional = true }
+quick-xml.workspace = true
+rustix = { workspace = true, features = ["fs"] }
+xdg-kit-basedir.workspace = true
+xdg-kit-locale.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

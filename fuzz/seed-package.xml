@@ -1,0 +1,47 @@
+<?xml version="1.0"?>
+<!-- Written for this repository; the fuzz seeds are generated from it by
+     make-seeds.sh. Exercises every element the parsers read. -->
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="text/x-seed">
+    <comment>Seed text</comment>
+    <comment xml:lang="de">Saattext &amp; mehr</comment>
+    <acronym>SEED</acronym>
+    <expanded-acronym>Some Example Entry Data</expanded-acronym>
+    <alias type="text/x-old-seed"/>
+    <sub-class-of type="text/plain"/>
+    <icon name="seed-icon"/>
+    <generic-icon name="text-x-generic"/>
+    <glob pattern="*.seed"/>
+    <glob pattern="*.SEED" case-sensitive="true" weight="60"/>
+    <glob pattern="Seedfile"/>
+    <glob pattern="seed-[0-9]?.*" weight="20"/>
+    <magic priority="80">
+      <match type="string" offset="0:16" value="SEED\x00\t\n">
+        <match type="big16" offset="8" value="0x1234" mask="0xff00"/>
+        <match type="host32" offset="10" value="0x01020304"/>
+      </match>
+      <match type="little32" offset="2" value="0xcafe" mask="0xffff"/>
+    </magic>
+    <magic priority="20">
+      <match type="byte" offset="0" value="0x53"/>
+    </magic>
+  </mime-type>
+  <mime-type type="application/x-seed+xml">
+    <sub-class-of type="application/xml"/>
+    <root-XML namespaceURI="urn:seed" localName="seed"/>
+    <root-XML namespaceURI="urn:any" localName=""/>
+  </mime-type>
+  <mime-type type="x-content/seed-volume">
+    <treemagic priority="60">
+      <treematch path="SEED" type="directory" non-empty="true">
+        <treematch path="SEED/run" type="file" executable="true" match-case="true"/>
+        <treematch path="SEED/data.seed" mimetype="text/x-seed"/>
+      </treematch>
+      <treematch path="seed.link" type="link"/>
+    </treemagic>
+  </mime-type>
+  <mime-type type="text/x-gone">
+    <glob-deleteall/>
+    <magic-deleteall/>
+  </mime-type>
+</mime-info>

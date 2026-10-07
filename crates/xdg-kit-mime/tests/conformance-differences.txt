@@ -1,0 +1,8 @@
+# Cases shared-mime-info's suite marks as expected failures (x) that this
+# crate gets right, each with the reason. One line per case, tab-separated:
+# lookup (name, data, file or tree), case, our answer, reason.
+# The conformance test fails on any such success missing here, and on any
+# line here that is no longer a success.
+data	test.cdx.xml	application/vnd.cyclonedx+xml	XML root element matched in XMLnamespaces (spec "root-XML"); xdgmime does no root-element detection
+data	test.gpx	application/gpx+xml	XML root element matched in XMLnamespaces (spec "root-XML"); xdgmime does no root-element detection
+data	test10.gpx	application/gpx+xml	XML root element matched in XMLnamespaces (spec "root-XML"); xdgmime does no root-element detection

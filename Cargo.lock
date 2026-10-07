@@ -54,10 +54,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
+name = "memchr"
+version = "2.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
+
+[[package]]
+name = "mime"
+version = "0.3.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
+
+[[package]]
+name = "quick-xml"
+version = "0.42.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "41b1177fdf999d2321d3fb46ff47159d9c1fb9ad66a4879f8c50a0b504615e9b"
+dependencies = [
+ "memchr",
+]
 
 [[package]]
 name = "r-efi"
@@ -111,6 +132,8 @@ name = "xdg-kit"
 version = "0.1.0"
 dependencies = [
  "xdg-kit-basedir",
+ "xdg-kit-locale",
+ "xdg-kit-mime",
 ]
 
 [[package]]
@@ -119,4 +142,20 @@ version = "0.1.0"
 dependencies = [
  "rustix",
  "tempfile",
+]
+
+[[package]]
+name = "xdg-kit-locale"
+version = "0.1.0"
+
+[[package]]
+name = "xdg-kit-mime"
+version = "0.1.0"
+dependencies = [
+ "mime",
+ "quick-xml",
+ "rustix",
+ "tempfile",
+ "xdg-kit-basedir",
+ "xdg-kit-locale",
 ]

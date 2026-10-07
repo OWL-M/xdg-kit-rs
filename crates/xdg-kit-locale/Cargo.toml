@@ -1,0 +1,10 @@
+[package]
+name = "xdg-kit-locale"
+description = "The user's languages, as the freedesktop.org specs look up translations"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true

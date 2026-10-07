@@ -7,12 +7,20 @@ rust-version.workspace = true
 license.workspace = true
 
 [features]
-default = ["basedir"]
+default = ["basedir", "locale", "mime"]
 ## The XDG Base Directory spec and user folders.
 basedir = ["dep:xdg-kit-basedir"]
+## The user's languages, for translated values.
+locale = ["dep:xdg-kit-locale"]
+## The Shared MIME-info database.
+mime = ["dep:xdg-kit-mime"]
+## Conversions between `xdg_kit::mime::MimeType` and `mime::Mime`.
+mime-crate-conversions = ["mime", "xdg-kit-mime/mime"]
 
 [dependencies]
 xdg-kit-basedir = { workspace = true, optional = true }
+xdg-kit-locale = { workspace = true, optional = true }
+xdg-kit-mime = { workspace = true, optional = true }
 
 [lints]
 workspace = true

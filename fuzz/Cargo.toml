@@ -1,0 +1,67 @@
+[package]
+name = "xdg-kit-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Fuzz targets for the xdg-kit parsers (cargo fuzz)"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Kept out of the main workspace: built only by cargo fuzz, on a nightly.
+# Its own Cargo.lock: after `cargo update` in the workspace, run it here too,
+# so the fuzzers test the dependency versions that ship.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+xdg-kit-mime = { path = "../crates/xdg-kit-mime" }
+
+[[bin]]
+name = "mime_cache"
+path = "fuzz_targets/mime_cache.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "magic"
+path = "fuzz_targets/magic.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "treemagic"
+path = "fuzz_targets/treemagic.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "globs2"
+path = "fuzz_targets/globs2.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "type_xml"
+path = "fuzz_targets/type_xml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "xml_root"
+path = "fuzz_targets/xml_root.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fnmatch"
+path = "fuzz_targets/fnmatch.rs"
+test = false
+doc = false
+bench = false
