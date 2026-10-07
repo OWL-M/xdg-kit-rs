@@ -333,6 +333,13 @@ impl MimeDatabase {
             .map(|mime| self.canonical(mime))
     }
 
+    /// Resolves a built-in type such as `text/plain` or `inode/directory`
+    /// through the database. The database may define it as an alias;
+    /// detection results use the canonical type.
+    fn fixed(&self, text: &'static str) -> MimeType {
+        self.canonical(&known(text))
+    }
+
     /// The type of content: magic, then (for XML) the root element, then
     /// text-or-binary from the first 128 bytes. Empty data is
     /// `application/x-zerosize`. No I/O; the first
@@ -341,13 +348,17 @@ impl MimeDatabase {
     pub fn type_for_data(&self, data: &[u8]) -> Detection {
         if data.is_empty() {
             return Detection::new(
-                known("application/x-zerosize"),
+                self.fixed("application/x-zerosize"),
                 Certainty::Certain,
                 DecidedBy::Content,
             );
         }
         self.magic_type(data).unwrap_or_else(|| {
-            Detection::new(text_or_binary(data), Certainty::Guess, DecidedBy::Fallback)
+            Detection::new(
+                self.canonical(&text_or_binary(data)),
+                Certainty::Guess,
+                DecidedBy::Fallback,
+            )
         })
     }
 
@@ -367,7 +378,7 @@ impl MimeDatabase {
         }
         if data.is_empty() {
             return Detection::new(
-                known("application/x-zerosize"),
+                self.fixed("application/x-zerosize"),
                 Certainty::Certain,
                 DecidedBy::Content,
             );
@@ -384,7 +395,7 @@ impl MimeDatabase {
         let content = self.magic_type(data);
         let (sniffed, certainty) = match &content {
             Some(found) => (found.mime.clone(), Certainty::Certain),
-            None => (text_or_binary(data), Certainty::Guess),
+            None => (self.canonical(&text_or_binary(data)), Certainty::Guess),
         };
         let fitting = names
             .matches()
@@ -424,7 +435,7 @@ impl MimeDatabase {
         let path = path.as_ref();
         let kind = |text| {
             Ok(Detection::new(
-                known(text),
+                self.fixed(text),
                 Certainty::Certain,
                 DecidedBy::FileKind,
             ))
@@ -483,7 +494,7 @@ impl MimeDatabase {
         }
         if metadata.len() == 0 {
             return Ok(Detection::new(
-                known("application/x-zerosize"),
+                self.fixed("application/x-zerosize"),
                 Certainty::Certain,
                 DecidedBy::Content,
             ));

@@ -8,38 +8,13 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::SystemTime;
 
-use xdg_kit_basedir::BaseDirs;
+use xdg_kit_basedir::{BaseDirs, FileStamp};
 
 use crate::{DesktopEntry, Desktops, Diagnostic};
 
 /// Deepest folder nesting followed below an `applications` folder.
 const MAX_DEPTH: usize = 32;
-
-/// What a path looked like when it was read: modification and status
-/// change times (a `chmod` changes only the latter), size, device and
-/// inode; `None` when it did not exist.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Stamp(Option<StampParts>);
-
-/// Modification time, status change time (seconds, nanoseconds), size,
-/// device, inode.
-type StampParts = (Option<SystemTime>, (i64, i64), u64, u64, u64);
-
-impl Stamp {
-    fn of(path: &Path) -> Self {
-        Self(fs::metadata(path).ok().map(|metadata| {
-            (
-                metadata.modified().ok(),
-                (metadata.ctime(), metadata.ctime_nsec()),
-                metadata.len(),
-                metadata.dev(),
-                metadata.ino(),
-            )
-        }))
-    }
-}
 
 /// An installed application: a desktop entry with its desktop file ID.
 #[derive(Debug, Clone)]
@@ -123,7 +98,7 @@ struct Found {
     root: usize,
     id: String,
     path: PathBuf,
-    stamp: Stamp,
+    stamp: FileStamp,
     entry: Arc<DesktopEntry>,
 }
 
@@ -134,13 +109,13 @@ struct Found {
 #[derive(Debug)]
 pub struct AppIndex {
     /// The `applications` folders, most important first, with stamps.
-    roots: Vec<(PathBuf, Stamp)>,
+    roots: Vec<(PathBuf, FileStamp)>,
     /// Every folder scanned, with its stamp, so added files are noticed.
-    folders: Vec<(PathBuf, Stamp)>,
+    folders: Vec<(PathBuf, FileStamp)>,
     found: Vec<Found>,
     /// Files skipped as unreadable or in an unsupported encoding, with their
     /// stamps, so a fix to one is noticed.
-    ignored: Vec<(PathBuf, Stamp)>,
+    ignored: Vec<(PathBuf, FileStamp)>,
     /// The winning file of each ID, as an index into `found`; `None` when
     /// it says `Hidden=true` (the application is deleted).
     by_id: BTreeMap<String, Option<usize>>,
@@ -150,7 +125,7 @@ pub struct AppIndex {
     held: Vec<BTreeSet<String>>,
     /// Files a more important folder shadows, read and stamped so that
     /// `held` stays right and a change to one is noticed.
-    shadowed: Vec<(PathBuf, Stamp, Arc<DesktopEntry>)>,
+    shadowed: Vec<(PathBuf, FileStamp, Arc<DesktopEntry>)>,
     diagnostics: Vec<Diagnostic>,
 }
 
@@ -169,11 +144,11 @@ impl AppIndex {
     /// important first.
     #[must_use]
     pub fn from_dirs(dirs: impl IntoIterator<Item = impl Into<PathBuf>>) -> Self {
-        let mut roots: Vec<(PathBuf, Stamp)> = Vec::new();
+        let mut roots: Vec<(PathBuf, FileStamp)> = Vec::new();
         for dir in dirs {
             let dir = dir.into();
             if !roots.iter().any(|(known, _)| *known == dir) {
-                let stamp = Stamp::of(&dir);
+                let stamp = FileStamp::of(&dir);
                 roots.push((dir, stamp));
             }
         }
@@ -181,8 +156,8 @@ impl AppIndex {
     }
 
     fn scan(
-        roots: Vec<(PathBuf, Stamp)>,
-        cache: &HashMap<PathBuf, (Stamp, Arc<DesktopEntry>)>,
+        roots: Vec<(PathBuf, FileStamp)>,
+        cache: &HashMap<PathBuf, (FileStamp, Arc<DesktopEntry>)>,
     ) -> Self {
         let mut index = Self {
             roots: Vec::new(),
@@ -235,7 +210,7 @@ impl AppIndex {
                 // A more important folder has this ID: the file is read only
                 // to know whether the folder holds it.
                 let shadowed = index.by_id.contains_key(&id);
-                let stamp = Stamp::of(&path);
+                let stamp = FileStamp::of(&path);
                 let entry = match cache.get(&path) {
                     Some((cached, entry)) if *cached == stamp => Arc::clone(entry),
                     _ => match DesktopEntry::read(&path) {
@@ -306,7 +281,7 @@ impl AppIndex {
         if !metadata.is_dir() || !visited.insert((metadata.dev(), metadata.ino())) {
             return;
         }
-        self.folders.push((dir.to_owned(), Stamp::of(dir)));
+        self.folders.push((dir.to_owned(), FileStamp::of(dir)));
         if depth > MAX_DEPTH {
             self.diagnostics.push(Diagnostic::new(
                 Some(dir.to_owned()),
@@ -336,7 +311,7 @@ impl AppIndex {
                 // A link to nothing (yet): its stamp changes when the target
                 // appears, so `refresh` notices.
                 Err(_) if entry.file_type().is_ok_and(|kind| kind.is_symlink()) => {
-                    let stamp = Stamp::of(&path);
+                    let stamp = FileStamp::of(&path);
                     self.ignored.push((path, stamp));
                 }
                 _ => {}
@@ -344,10 +319,10 @@ impl AppIndex {
         }
     }
 
-    /// A new snapshot if any `applications` folder, sub-folder or entry
-    /// changed since this one was read (modification time, size, inode),
-    /// `None` if nothing did. Entries whose files did not change are
-    /// reused.
+    /// Returns a new snapshot if any `applications` folder, sub-folder or
+    /// entry changed since this one was read, as detected by its
+    /// [`FileStamp`](xdg_kit_basedir::FileStamp). Returns `None` if nothing
+    /// changed. Reuses entries whose files are unchanged.
     #[must_use]
     pub fn refresh(&self) -> Option<Self> {
         let changed = self
@@ -355,15 +330,15 @@ impl AppIndex {
             .iter()
             .chain(&self.folders)
             .chain(&self.ignored)
-            .any(|(path, stamp)| Stamp::of(path) != *stamp)
+            .any(|(path, stamp)| FileStamp::of(path) != *stamp)
             || self
                 .found
                 .iter()
-                .any(|found| Stamp::of(&found.path) != found.stamp)
+                .any(|found| FileStamp::of(&found.path) != found.stamp)
             || self
                 .shadowed
                 .iter()
-                .any(|(path, stamp, _)| Stamp::of(path) != *stamp);
+                .any(|(path, stamp, _)| FileStamp::of(path) != *stamp);
         if !changed {
             return None;
         }
@@ -381,7 +356,7 @@ impl AppIndex {
         let roots = self
             .roots
             .iter()
-            .map(|(path, _)| (path.clone(), Stamp::of(path)))
+            .map(|(path, _)| (path.clone(), FileStamp::of(path)))
             .collect();
         Some(Self::scan(roots, &cache))
     }

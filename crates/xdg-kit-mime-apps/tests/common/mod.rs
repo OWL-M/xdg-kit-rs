@@ -45,11 +45,21 @@ pub struct Fixture {
 
 impl Fixture {
     pub fn new() -> Self {
-        let root = tempfile::tempdir().unwrap();
-        let mime = root.path().join("mime-data/mime");
+        let fixture = Self {
+            root: tempfile::tempdir().unwrap(),
+            desktops: Vec::new(),
+        };
+        fixture.add_types("test", TYPES);
+        fixture
+    }
+
+    /// Adds the package `name` (a `mime-info` document) to the MIME
+    /// database and rebuilds it.
+    pub fn add_types(&self, name: &str, xml: &str) {
+        let data = self.path("mime-data");
+        let mime = data.join("mime");
         fs::create_dir_all(mime.join("packages")).unwrap();
-        fs::write(mime.join("packages/test.xml"), TYPES).unwrap();
-        let data = root.path().join("mime-data");
+        fs::write(mime.join(format!("packages/{name}.xml")), xml).unwrap();
         let status = Command::new("update-mime-database")
             .arg(&mime)
             .env("XDG_DATA_DIRS", &data)
@@ -59,10 +69,6 @@ impl Fixture {
                 "update-mime-database is not on PATH: run the tests in the dev shell (nix develop)",
             );
         assert!(status.success(), "update-mime-database failed");
-        Self {
-            root,
-            desktops: Vec::new(),
-        }
     }
 
     pub fn path(&self, relative: &str) -> PathBuf {

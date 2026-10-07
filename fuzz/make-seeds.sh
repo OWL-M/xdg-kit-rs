@@ -40,6 +40,32 @@ printf '\357\273\277<?pi data?><u:x/>' > "$out/xml_root/unbound"
 printf '*.tar.gz\000a.tar.gz' > "$out/fnmatch/star"
 printf 'seed-[0-9]?.*\000seed-4x.txt' > "$out/fnmatch/set"
 printf '[!a-c]\\*\000d*' > "$out/fnmatch/escape"
+# Whole databases (mime_database): two folders' globs2, aliases, subclasses,
+# magic and XMLnamespaces, then a name and data, joined by
+# xdg_kit_mime::fuzzing::SEPARATOR (in the order of its FILES). The seed
+# folder above: alone; under a second folder that deletes a glob and adds a
+# parent loop; and under one whose magic finds XML, for the root element.
+sep() { printf '\000--xkt--\000'; }
+mkdir -p "$out/mime_database"
+seed_folder() {
+  cat "$db/globs2"; sep; cat "$db/aliases"; sep; cat "$db/subclasses"; sep
+  cat "$db/magic"; sep; cat "$db/XMLnamespaces"
+}
+{
+  seed_folder; sep; sep; sep; sep; sep; sep; printf 'notes.seed'; sep
+  printf 'SEED\000\t\n\022\064'
+} > "$out/mime_database/one-folder"
+{
+  printf '0:text/x-seed:__NOGLOBS__\n50:text/x-seed:*.later\n'; sep; sep
+  printf 'text/x-seed application/x-loop\napplication/x-loop text/x-seed\n'; sep
+  sep; sep
+  seed_folder; sep; printf 'x.later'; sep; printf 'S plain text'
+} > "$out/mime_database/two-folders"
+{
+  sep; sep; sep; printf '[50:application/xml]\n>0=\000\005<?xml\n'; sep; sep
+  seed_folder; sep; printf 'doc.unknown'; sep
+  printf '<?xml version="1.0"?>\n<seed xmlns="urn:seed"/>\n'
+} > "$out/mime_database/xml-root"
 # Desktop entries: the validation corpus (written for this repository), and
 # Exec values from it.
 corpus=../crates/xdg-kit-desktop-entry/tests/corpus

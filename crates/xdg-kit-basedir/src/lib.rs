@@ -21,16 +21,19 @@ mod base_dirs;
 mod error;
 mod paths;
 mod runtime;
+mod stamp;
 pub mod user_dirs;
 
 pub use base_dirs::BaseDirs;
 pub use error::{Diagnostic, DiagnosticSource, Error};
 pub use runtime::RuntimeDirProblem;
+pub use stamp::FileStamp;
 pub use user_dirs::{UserDirKind, UserDirs};
 
 // Values are shared between threads; keep them that way.
 const _: fn() = || {
     fn shareable<T: Send + Sync>() {}
     shareable::<BaseDirs>();
+    shareable::<FileStamp>();
     shareable::<UserDirs>();
 };

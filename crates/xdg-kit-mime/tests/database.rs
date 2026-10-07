@@ -626,6 +626,77 @@ fn a_folder_reached_through_a_link_is_read_once() {
     assert!(shown.len() < 500, "a summary, not every rule: {shown}");
 }
 
+/// A database that defines the built-in detection types as aliases of
+/// other types.
+const ALIASED: &str = r#"
+  <mime-type type="x-test/plain"><alias type="text/plain"/></mime-type>
+  <mime-type type="x-test/empty"><alias type="application/x-zerosize"/></mime-type>
+  <mime-type type="x-test/folder"><alias type="inode/directory"/></mime-type>
+  <mime-type type="text/x-note"><glob pattern="*.note"/></mime-type>
+"#;
+
+#[test]
+fn results_are_canonical_even_for_aliased_built_in_types() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = MimeDatabase::from_dirs([build(dir.path(), ALIASED)]);
+    assert_eq!(db.type_for_data(b"hello").mime, m("x-test/plain"));
+    assert_eq!(db.type_for_data(b"").mime, m("x-test/empty"));
+    assert_eq!(
+        db.type_for_name_and_data("a.unknown", b"").mime,
+        m("x-test/empty")
+    );
+    assert_eq!(
+        db.type_for_name_and_data("a.unknown", b"hello").mime,
+        m("x-test/plain")
+    );
+    let options = PathOptions::default();
+    assert_eq!(
+        db.type_for_path(dir.path(), &options).unwrap().mime,
+        m("x-test/folder")
+    );
+    let empty = dir.path().join("empty.unknown");
+    fs::write(&empty, "").unwrap();
+    assert_eq!(
+        db.type_for_path(&empty, &options).unwrap().mime,
+        m("x-test/empty")
+    );
+    let ancestors = db.ancestors(&m("text/x-note"));
+    assert!(ancestors.contains(&m("x-test/plain")), "{ancestors:?}");
+    assert!(!ancestors.contains(&m("text/plain")), "{ancestors:?}");
+    assert!(db.is_a(&m("text/x-note"), &m("text/plain")));
+    assert!(
+        !db.ancestors(&m("x-test/plain"))
+            .contains(&m("x-test/plain"))
+    );
+}
+
+#[test]
+fn refresh_notices_a_changed_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let mime = build(dir.path(), SYSTEM);
+    let db = MimeDatabase::from_dirs([mime.clone()]);
+    assert!(db.refresh().is_none(), "nothing changed");
+    // Only the status change time moves. Flip a permission bit until `stat`
+    // shows it moved: on a filesystem with coarse timestamps that takes
+    // until the next tick.
+    let cache = mime.join("mime.cache");
+    let before = fs::metadata(&cache).unwrap();
+    let mut mode = before.permissions().mode();
+    for _ in 0..200 {
+        mode ^= 0o004;
+        fs::set_permissions(&cache, fs::Permissions::from_mode(mode)).unwrap();
+        let now = fs::metadata(&cache).unwrap();
+        if (now.ctime(), now.ctime_nsec()) != (before.ctime(), before.ctime_nsec()) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        db.refresh().is_some(),
+        "a chmod can make a file readable or not"
+    );
+}
+
 #[test]
 fn refresh_notices_changed_added_and_removed_files() {
     let dir = tempfile::tempdir().unwrap();

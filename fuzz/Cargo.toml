@@ -95,3 +95,10 @@ path = "fuzz_targets/mime_apps_list.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "mime_database"
+path = "fuzz_targets/mime_database.rs"
+test = false
+doc = false
+bench = false

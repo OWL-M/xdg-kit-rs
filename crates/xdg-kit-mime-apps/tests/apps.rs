@@ -214,6 +214,51 @@ fn matches_say_how_they_matched() {
 }
 
 #[test]
+fn any_data_stays_below_the_media_wildcard_when_aliased() {
+    // A database may make application/octet-stream an alias; handlers for
+    // any data still rank below the media wildcard.
+    let fixture = Fixture::new();
+    fixture.add_types(
+        "aliased",
+        r#"<?xml version="1.0"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-xkt-data"><alias type="application/octet-stream"/></mime-type>
+</mime-info>
+"#,
+    );
+    fixture.app(
+        "share1/applications",
+        "xkt-data.desktop",
+        "application/octet-stream;",
+        "",
+    );
+    fixture.app("share1/applications", "xkt-image.desktop", "image/*;", "");
+    let apps = fixture.mime_apps();
+    let found: Vec<(String, Matched)> = apps
+        .apps_for(&m("image/x-xkt-png"))
+        .into_iter()
+        .map(|found| (found.app.id().to_owned(), found.matched))
+        .collect();
+    assert_eq!(
+        found,
+        [
+            (
+                "xkt-image.desktop".into(),
+                Matched::Wildcard(TypePattern::Media("image".into()))
+            ),
+            (
+                "xkt-data.desktop".into(),
+                Matched::Parent(m("application/x-xkt-data"))
+            ),
+        ]
+    );
+    assert_eq!(
+        apps.default_for(&m("image/x-xkt-png")).unwrap().id(),
+        "xkt-image.desktop"
+    );
+}
+
+#[test]
 fn try_exec_counts_when_asked() {
     let fixture = Fixture::new();
     fixture.app(

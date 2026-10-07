@@ -4,9 +4,8 @@ use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
 
-use xdg_kit_basedir::BaseDirs;
+use xdg_kit_basedir::{BaseDirs, FileStamp};
 
 use crate::fnmatch::Pattern;
 use crate::merge::{self, Merged, Ranked};
@@ -34,25 +33,11 @@ const SOURCE_FILES: &[&str] = &[
     "types",
 ];
 
-/// What a path looked like when it was read; `None` when it did not exist.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Stamp(Option<(Option<SystemTime>, u64, u64)>);
-
-impl Stamp {
-    fn of(path: &Path) -> Self {
-        Self(
-            fs::metadata(path)
-                .ok()
-                .map(|metadata| (metadata.modified().ok(), metadata.len(), metadata.ino())),
-        )
-    }
-}
-
 /// One database folder as read.
 #[derive(Debug)]
 struct Loaded {
     dir: PathBuf,
-    stamps: Vec<(PathBuf, Stamp)>,
+    stamps: Vec<(PathBuf, FileStamp)>,
     folder: Arc<Folder>,
     diagnostics: Vec<Diagnostic>,
 }
@@ -63,7 +48,7 @@ impl Loaded {
         let stamps = std::iter::once(dir.to_owned())
             .chain(SOURCE_FILES.iter().map(|name| dir.join(name)))
             .map(|path| {
-                let stamp = Stamp::of(&path);
+                let stamp = FileStamp::of(&path);
                 (path, stamp)
             })
             .collect();
@@ -105,7 +90,7 @@ impl Loaded {
     fn unchanged(&self) -> bool {
         self.stamps
             .iter()
-            .all(|(path, stamp)| Stamp::of(path) == *stamp)
+            .all(|(path, stamp)| FileStamp::of(path) == *stamp)
     }
 }
 
@@ -257,7 +242,7 @@ pub(crate) fn to_host(matchlets: &[crate::model::Matchlet]) -> Vec<crate::model:
 /// The candidates that are folders, least important first. A folder reached
 /// again under another path (a symbolic link, a bind mount) is read once,
 /// at its most important place.
-fn present(candidates: &[(PathBuf, Stamp)]) -> Vec<&Path> {
+fn present(candidates: &[(PathBuf, FileStamp)]) -> Vec<&Path> {
     let mut seen = HashSet::new();
     let mut dirs: Vec<&Path> = candidates
         .iter()
@@ -272,7 +257,7 @@ fn present(candidates: &[(PathBuf, Stamp)]) -> Vec<&Path> {
 }
 
 /// A type's per-type XML, with the stamps of every place its file may be.
-type Described = (Arc<TypeInfo>, Vec<(PathBuf, Stamp)>);
+type Described = (Arc<TypeInfo>, Vec<(PathBuf, FileStamp)>);
 
 /// The Shared MIME-info database: an immutable snapshot of every database
 /// folder, merged by the spec's rules.
@@ -282,7 +267,7 @@ type Described = (Arc<TypeInfo>, Vec<(PathBuf, Stamp)>);
 pub struct MimeDatabase {
     /// Every folder that was or may be a database folder, with its stamp,
     /// so that one appearing or disappearing is noticed.
-    candidates: Vec<(PathBuf, Stamp)>,
+    candidates: Vec<(PathBuf, FileStamp)>,
     /// The folders read, least important first.
     folders: Vec<Loaded>,
     pub(crate) merged: Merged,
@@ -334,11 +319,46 @@ impl MimeDatabase {
         Self::from_candidates(dirs.into_iter().map(Into::into).collect())
     }
 
+    /// Builds a database from folders held in memory, most important first.
+    /// Each folder is a list of (file name, contents) pairs for text files.
+    /// Parses and merges them as [`MimeDatabase::from_dirs`] does, but reads
+    /// every supplied file without the `globs` fallback. Lookups do not read
+    /// from disk; descriptions still look for per-type XML files under
+    /// made-up `/fuzz/…` folders. For fuzz targets and tests only.
+    #[cfg(any(test, fuzzing))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn from_files(folders: &[Vec<(&str, &[u8])>]) -> Self {
+        let mut loaded: Vec<Loaded> = folders
+            .iter()
+            .enumerate()
+            .map(|(at, files)| {
+                let dir = PathBuf::from(format!("/fuzz/{at}/mime"));
+                let mut folder = Folder::default();
+                let mut diagnostics = Vec::new();
+                for (name, bytes) in files {
+                    text::parse(name, &dir.join(name), bytes, &mut folder, &mut diagnostics);
+                }
+                // As `text::read` finishes a folder.
+                folder.max_extent = folder.magic_extent();
+                Loaded {
+                    dir,
+                    stamps: Vec::new(),
+                    folder: Arc::new(folder),
+                    diagnostics,
+                }
+            })
+            .collect();
+        // `assemble` takes the least important first.
+        loaded.reverse();
+        Self::assemble(Vec::new(), loaded)
+    }
+
     fn from_candidates(candidates: Vec<PathBuf>) -> Self {
-        let stamped: Vec<(PathBuf, Stamp)> = candidates
+        let stamped: Vec<(PathBuf, FileStamp)> = candidates
             .into_iter()
             .map(|dir| {
-                let stamp = Stamp::of(&dir);
+                let stamp = FileStamp::of(&dir);
                 (dir, stamp)
             })
             .collect();
@@ -346,7 +366,7 @@ impl MimeDatabase {
         Self::assemble(stamped, folders)
     }
 
-    fn assemble(candidates: Vec<(PathBuf, Stamp)>, folders: Vec<Loaded>) -> Self {
+    fn assemble(candidates: Vec<(PathBuf, FileStamp)>, folders: Vec<Loaded>) -> Self {
         let merged = merge::merge(folders.iter().map(|loaded| &*loaded.folder));
         let globs = GlobIndex::new(&merged.globs, &merged);
         let magic = merged
@@ -373,9 +393,10 @@ impl MimeDatabase {
     }
 
     /// Returns a new snapshot if any database file changed since this one
-    /// was read, or `None` if nothing changed. Uses `stat` to check each
-    /// file's modification time, size and inode, then re-reads the changed
-    /// folders. Also checks per-type XML files for cached descriptions.
+    /// was read, or `None` if nothing changed. Compares each file's
+    /// [`FileStamp`] (modification and status change times, size, device
+    /// and inode, so a `chmod` counts), then re-reads the changed folders.
+    /// Also checks per-type XML files for cached descriptions.
     /// The new snapshot reads descriptions afresh.
     ///
     /// Two changes within the filesystem's time resolution that keep the
@@ -385,7 +406,7 @@ impl MimeDatabase {
         let candidates_changed = self
             .candidates
             .iter()
-            .any(|(dir, stamp)| Stamp::of(dir) != *stamp);
+            .any(|(dir, stamp)| FileStamp::of(dir) != *stamp);
         let folders_changed = self.folders.iter().any(|loaded| !loaded.unchanged());
         let descriptions_changed = self
             .descriptions
@@ -393,14 +414,14 @@ impl MimeDatabase {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .values()
             .flat_map(|(_, stamps)| stamps)
-            .any(|(path, stamp)| Stamp::of(path) != *stamp);
+            .any(|(path, stamp)| FileStamp::of(path) != *stamp);
         if !candidates_changed && !folders_changed && !descriptions_changed {
             return None;
         }
-        let stamped: Vec<(PathBuf, Stamp)> = self
+        let stamped: Vec<(PathBuf, FileStamp)> = self
             .candidates
             .iter()
-            .map(|(dir, _)| (dir.clone(), Stamp::of(dir)))
+            .map(|(dir, _)| (dir.clone(), FileStamp::of(dir)))
             .collect();
         let folders = present(&stamped)
             .into_iter()
@@ -500,13 +521,14 @@ impl MimeDatabase {
             }
         }
         // Subclassing is transitive: a type with a `text/*` ancestor is
-        // `text/plain` too.
+        // `text/plain` too. Resolve the implicit types through the database,
+        // which may define them as aliases of other types.
         let mut implicit = Vec::new();
         if start.is_media("text") || found.iter().any(|mime| mime.is_media("text")) {
-            implicit.push(MimeType::known("text/plain"));
+            implicit.push(self.canonical(&MimeType::known("text/plain")));
         }
         if !start.is_media("inode") {
-            implicit.push(MimeType::known("application/octet-stream"));
+            implicit.push(self.canonical(&MimeType::known("application/octet-stream")));
         }
         for mime in implicit {
             if seen.insert(mime.clone()) {
@@ -610,7 +632,7 @@ impl MimeDatabase {
             .folder_dirs()
             .flat_map(|dir| crate::xml::type_file_paths(dir, &canonical))
             .map(|path| {
-                let stamp = Stamp::of(&path);
+                let stamp = FileStamp::of(&path);
                 (path, stamp)
             })
             .collect();
@@ -624,6 +646,118 @@ impl MimeDatabase {
 
 #[cfg(test)]
 mod tests {
+    /// Files of two folders: globs, aliases, parents (with a loop),
+    /// magic and XML namespaces, the second folder deleting a glob of the
+    /// first.
+    fn two_folders() -> [Vec<(&'static str, &'static [u8])>; 2] {
+        [
+            vec![
+                (
+                    "globs2",
+                    b"0:text/x-a:__NOGLOBS__\n50:text/x-a:*.top\n".as_slice(),
+                ),
+                ("aliases", b"text/x-old text/x-a\n"),
+                ("subclasses", b"text/x-a text/x-b\ntext/x-b text/x-a\n"),
+                (
+                    "magic",
+                    b"MIME-Magic\0\n[50:application/xml]\n>0=\0\x05<?xml\n",
+                ),
+                ("XMLnamespaces", b""),
+            ],
+            vec![
+                ("globs2", b"50:text/x-a:*.a\n50:text/x-b:*.b\n".as_slice()),
+                ("aliases", b""),
+                ("subclasses", b"application/x-a+xml application/xml\n"),
+                ("magic", b"MIME-Magic\0\n[60:text/x-b]\n>0=\0\x01B\n"),
+                ("XMLnamespaces", b"urn:a a application/x-a+xml\n"),
+            ],
+        ]
+    }
+
+    #[test]
+    fn files_in_memory_build_what_folders_build() {
+        let root = tempfile::tempdir().unwrap();
+        let folders = two_folders();
+        let dirs: Vec<PathBuf> = folders
+            .iter()
+            .enumerate()
+            .map(|(at, files)| {
+                let dir = root.path().join(format!("{at}/mime"));
+                fs::create_dir_all(&dir).unwrap();
+                for (name, bytes) in files {
+                    fs::write(dir.join(name), bytes).unwrap();
+                }
+                dir
+            })
+            .collect();
+        let read = MimeDatabase::from_dirs(&dirs);
+        let given = MimeDatabase::from_files(&folders);
+        for (a, b) in read.folders.iter().zip(&given.folders) {
+            assert_eq!(a.folder, b.folder);
+            assert_eq!(a.diagnostics.len(), b.diagnostics.len());
+        }
+        // Lists compare by their printed form (in order); maps by value,
+        // since a map prints in no fixed order.
+        let (merged_read, merged_given) = (&read.merged, &given.merged);
+        assert_eq!(
+            format!("{:?}", merged_read.globs),
+            format!("{:?}", merged_given.globs)
+        );
+        assert_eq!(
+            format!("{:?}", merged_read.magic),
+            format!("{:?}", merged_given.magic)
+        );
+        assert_eq!(
+            format!("{:?}", merged_read.tree),
+            format!("{:?}", merged_given.tree)
+        );
+        assert_eq!(merged_read.aliases, merged_given.aliases);
+        assert_eq!(merged_read.parents, merged_given.parents);
+        assert_eq!(merged_read.icons, merged_given.icons);
+        assert_eq!(merged_read.generic_icons, merged_given.generic_icons);
+        assert_eq!(merged_read.namespaces, merged_given.namespaces);
+        assert_eq!(merged_read.max_extent, merged_given.max_extent);
+        let (globs_read, globs_given) = (&read.globs, &given.globs);
+        assert_eq!(
+            format!("{:?}", globs_read.all),
+            format!("{:?}", globs_given.all)
+        );
+        assert_eq!(
+            format!("{:?}", globs_read.full),
+            format!("{:?}", globs_given.full)
+        );
+        assert_eq!(globs_read.literal, globs_given.literal);
+        assert_eq!(globs_read.suffix, globs_given.suffix);
+        assert_eq!(globs_read.by_type, globs_given.by_type);
+        let name = |db: &MimeDatabase, name: &str| -> Vec<String> {
+            db.type_for_name(name)
+                .matches()
+                .iter()
+                .map(|found| found.mime.to_string())
+                .collect()
+        };
+        for file in ["x.top", "x.a", "x.b", "x.none"] {
+            assert_eq!(name(&read, file), name(&given, file), "{file}");
+        }
+        for data in [
+            b"B data".as_slice(),
+            b"<?xml version=\"1.0\"?><a xmlns=\"urn:a\"/>",
+            b"text",
+            b"",
+        ] {
+            assert_eq!(read.type_for_data(data), given.type_for_data(data));
+        }
+        let a = MimeType::new("text/x-a").unwrap();
+        assert_eq!(read.ancestors(&a), given.ancestors(&a));
+        assert_eq!(
+            given
+                .type_for_data(b"<?xml version=\"1.0\"?><a xmlns=\"urn:a\"/>")
+                .mime
+                .as_str(),
+            "application/x-a+xml"
+        );
+    }
+
     use super::*;
 
     #[test]

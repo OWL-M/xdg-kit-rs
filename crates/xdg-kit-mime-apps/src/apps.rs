@@ -4,13 +4,10 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
-use std::fs;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::SystemTime;
 
-use xdg_kit_basedir::BaseDirs;
+use xdg_kit_basedir::{BaseDirs, FileStamp};
 use xdg_kit_desktop_entry::{AppEntry, AppIndex, Desktops, EntryType};
 use xdg_kit_mime::{MimeDatabase, MimeType};
 
@@ -39,28 +36,6 @@ pub struct AppMatch {
     pub matched: Matched,
 }
 
-/// Modification time, status change time (seconds, nanoseconds), size,
-/// device, inode.
-type StampParts = (Option<SystemTime>, (i64, i64), u64, u64, u64);
-
-/// What a file looked like when it was read; `None` when it did not exist.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Stamp(Option<StampParts>);
-
-impl Stamp {
-    fn of(path: &Path) -> Self {
-        Self(fs::metadata(path).ok().map(|metadata| {
-            (
-                metadata.modified().ok(),
-                (metadata.ctime(), metadata.ctime_nsec()),
-                metadata.len(),
-                metadata.dev(),
-                metadata.ino(),
-            )
-        }))
-    }
-}
-
 /// Where one `mimeapps.list` is in the search order.
 #[derive(Debug, Clone)]
 struct LevelPlace {
@@ -74,7 +49,7 @@ struct LevelPlace {
 #[derive(Debug, Clone)]
 struct Level {
     place: LevelPlace,
-    stamp: Stamp,
+    stamp: FileStamp,
     /// The `AppIndex` folder whose desktop files count at this level: set
     /// for the `mimeapps.list` of an `applications` folder.
     folder: Option<usize>,
@@ -210,7 +185,7 @@ impl MimeApps {
                 ));
             }
             let associations = !place.desktop_specific;
-            let stamp = Stamp::of(&place.path);
+            let stamp = FileStamp::of(&place.path);
             let list = match MimeAppsList::open(&place.path) {
                 Ok(list) => list,
                 Err(err) => {
@@ -394,10 +369,10 @@ impl MimeApps {
     }
 
     /// Returns a new snapshot if a `mimeapps.list` changed, appeared or
-    /// disappeared (by modification time, status change time, size and
-    /// inode), or if `apps` or `mime` is a different snapshot from the one
-    /// used to build this one. Returns `None` if nothing changed. The caller must
-    /// refresh `apps` and `mime` separately.
+    /// disappeared (by its [`FileStamp`]), or if `apps` or `mime` is a
+    /// different snapshot from the one used to build this one. Returns
+    /// `None` if nothing changed. The caller must refresh `apps` and `mime`
+    /// separately.
     ///
     /// Checks the same files as [`MimeApps::load`]. Changes to the base
     /// directories or desktop names need a new `load`. This does not detect
@@ -409,7 +384,7 @@ impl MimeApps {
             && self
                 .levels
                 .iter()
-                .all(|level| Stamp::of(&level.place.path) == level.stamp);
+                .all(|level| FileStamp::of(&level.place.path) == level.stamp);
         if unchanged {
             return None;
         }
@@ -437,7 +412,10 @@ impl MimeApps {
             steps.push((media.clone(), Matched::Wildcard(media)));
             return steps;
         }
-        let any_data = MimeType::new("application/octet-stream").expect("a valid type");
+        // As `ancestors` names it: the database may make it an alias.
+        let any_data = self
+            .mime
+            .canonical(&MimeType::new("application/octet-stream").expect("a valid type"));
         let ancestors = self.mime.ancestors(&canonical);
         for ancestor in ancestors.iter().filter(|ancestor| **ancestor != any_data) {
             steps.push((
