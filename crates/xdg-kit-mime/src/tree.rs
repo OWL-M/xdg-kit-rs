@@ -247,22 +247,27 @@ struct Identity {
 }
 
 impl Identity {
-    /// Whether the folder opened again as `self` may be the one first
-    /// opened as `first`: the same device, the same inode where the file
-    /// system keeps inode numbers (`numbers`), and the same birth time and
-    /// mount ID where both tell them. That it is a folder is sure, as it is
-    /// opened as one. Best effort: a folder removed and made again with the
-    /// same inode, where no birth time is reported, is taken for the first;
-    /// where inode numbers are made up, so is any folder of the same mount
-    /// with the same birth time, or with none reported.
+    /// Checks whether the reopened folder `self` may be the original
+    /// `first`. Compares the device and, when both report it, the mount ID.
+    /// If the file system keeps inode numbers (`numbers`), also compares
+    /// the inode and, when both report it, the birth time. Opening it as a
+    /// folder already guarantees its type.
+    ///
+    /// On file systems that make up inode numbers, skips the birth time
+    /// too. exFAT keeps a new folder's birth time at nanosecond precision
+    /// until its inode is released, but stores it at 10 ms precision on
+    /// disk. Comparing those values would reject an unchanged folder.
+    /// These checks are best effort: without a birth time, a folder removed
+    /// and recreated with the same inode is accepted as the original. Where
+    /// inode numbers are made up, any folder on the same mount is accepted.
     fn may_be(&self, first: &Self, numbers: InodeNumbers) -> bool {
         fn agree<T: PartialEq>(one: Option<T>, other: Option<T>) -> bool {
             one.zip(other).is_none_or(|(one, other)| one == other)
         }
         self.device == first.device
-            && (numbers == InodeNumbers::MadeUp || self.inode == first.inode)
-            && agree(self.born, first.born)
             && agree(self.mount, first.mount)
+            && (numbers == InodeNumbers::MadeUp
+                || (self.inode == first.inode && agree(self.born, first.born)))
     }
 
     /// Where the folder is, to remember it by, if its mount is known. The
@@ -615,12 +620,12 @@ impl<'a, F: FnMut(BorrowedFd<'_>, &OsStr) -> bool> Walk<'a, F> {
     /// can be told; the birth time and mount ID are compared too where
     /// they are known, and otherwise matter only to remember failures
     /// across different ways ([`Identity::place`]). On a file system that
-    /// makes up inode numbers ([`InodeNumbers`]), the inode is not
-    /// compared, and the device, mount ID and birth time tell what they
-    /// can. If one is another
-    /// folder, the volume changed during the search; then, or if a name is
-    /// gone, the rule path does not match: keeping such folders' handles
-    /// open instead would leave their number unbounded.
+    /// makes up inode numbers ([`InodeNumbers`]), compares only the device
+    /// and mount ID, skipping both the inode and birth time. If a reopened
+    /// folder differs from the original, the volume changed during the
+    /// search. This or a missing name makes the rule path fail to match.
+    /// Keeping these folders' handles open instead would require an
+    /// unbounded number of handles.
     fn from(&mut self, folder: BorrowedFd<'_>, index: usize) -> bool {
         let (place, left) = match self.enter(folder, index) {
             Entered::Listed(place, _, left) => (place, left),
@@ -1730,25 +1735,35 @@ mod tests {
     }
 
     #[test]
-    fn a_folder_with_a_made_up_inode_number_is_told_by_the_rest() {
+    fn a_folder_with_a_made_up_inode_number_is_told_by_device_and_mount() {
         let first = Identity {
             device: 1,
             inode: 10,
-            born: Some((1, 0)),
+            born: Some((1, 123_456_789)),
             mount: Some(7),
         };
         let renumbered = Identity { inode: 11, ..first };
         assert!(renumbered.may_be(&first, InodeNumbers::MadeUp));
         assert!(!renumbered.may_be(&first, InodeNumbers::Kept));
         assert!(first.may_be(&first, InodeNumbers::Kept));
-        // The device, birth time and mount ID are still compared.
+        // exFAT keeps a new folder's birth time at nanosecond precision
+        // until its inode is released, but stores it at 10 ms precision on
+        // disk. Skip the comparison so this rounding does not cause a mismatch.
+        let reread = Identity {
+            born: Some((1, 120_000_000)),
+            ..renumbered
+        };
+        assert!(reread.may_be(&first, InodeNumbers::MadeUp));
+        // Where inode numbers are kept, the birth time is still compared.
+        let same_inode = Identity {
+            inode: 10,
+            ..reread
+        };
+        assert!(!same_inode.may_be(&first, InodeNumbers::Kept));
+        // The device and mount ID are still compared.
         for other in [
             Identity {
                 device: 2,
-                ..renumbered
-            },
-            Identity {
-                born: Some((2, 0)),
                 ..renumbered
             },
             Identity {
