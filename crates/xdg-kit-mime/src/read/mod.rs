@@ -3,6 +3,48 @@
 pub(crate) mod cache;
 pub(crate) mod text;
 
+use std::path::Path;
+
+use crate::{Diagnostic, Location};
+
+/// Problems listed per file before the rest are summed up in one line.
+pub(crate) const MAX_DIAGNOSTICS: usize = 100;
+
+/// The problems found in one file: the first [`MAX_DIAGNOSTICS`] are
+/// listed, then one line says there are more.
+pub(crate) struct Problems<'a> {
+    path: &'a Path,
+    diagnostics: &'a mut Vec<Diagnostic>,
+    /// Problems reported so far.
+    reported: usize,
+}
+
+impl<'a> Problems<'a> {
+    pub(crate) fn new(path: &'a Path, diagnostics: &'a mut Vec<Diagnostic>) -> Self {
+        Self {
+            path,
+            diagnostics,
+            reported: 0,
+        }
+    }
+
+    pub(crate) fn report(&mut self, location: Option<Location>, message: impl Into<String>) {
+        self.reported += 1;
+        match self.reported.cmp(&(MAX_DIAGNOSTICS + 1)) {
+            std::cmp::Ordering::Less => {
+                self.diagnostics
+                    .push(Diagnostic::new(self.path, location, message));
+            }
+            std::cmp::Ordering::Equal => self.diagnostics.push(Diagnostic::new(
+                self.path,
+                None,
+                format!("more than {MAX_DIAGNOSTICS} problems; the rest are not listed"),
+            )),
+            std::cmp::Ordering::Greater => {}
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod testing {
     //! Databases built by `update-mime-database` for tests.

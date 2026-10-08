@@ -16,6 +16,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use xdg_kit_locale::Locales;
@@ -64,20 +65,91 @@ impl Line {
     }
 }
 
-/// A line holding a key, with the key's locale.
-type LocaleLine = (Option<String>, usize);
+/// A line's block and position within that block.
+type Place = (usize, usize);
 
-/// Where things are in the lines, rebuilt after every change.
+/// A group header and the lines up to the next header, or the lines
+/// before the first header.
+///
+/// Only the first block, which holds lines before any header, may be empty.
+/// Every other block starts with a header and contains no other headers.
+/// Trailing comments, blank lines and invalid lines are stored separately
+/// so an entry can be inserted before them without moving existing lines.
+#[derive(Debug, Clone, Default)]
+struct Block {
+    /// The lines up to the last entry, or the header when there is none.
+    lines: Vec<Line>,
+    /// The lines after them.
+    tail: Vec<Line>,
+    /// Problems in `lines`, with their positions, in line order.
+    problems: Vec<(usize, String)>,
+    /// Problems in `tail`, with their positions within it, in line order.
+    tail_problems: Vec<(usize, String)>,
+}
+
+impl Block {
+    fn len(&self) -> usize {
+        self.lines.len() + self.tail.len()
+    }
+
+    /// The line at `at`, counted over `lines` and then `tail`.
+    fn line_mut(&mut self, at: usize) -> &mut Line {
+        match at.checked_sub(self.lines.len()) {
+            Some(in_tail) => &mut self.tail[in_tail],
+            None => &mut self.lines[at],
+        }
+    }
+
+    fn last_line(&self) -> Option<&Line> {
+        self.tail.last().or_else(|| self.lines.last())
+    }
+}
+
+/// Where a group's lines are.
+#[derive(Debug, Clone, Copy)]
+struct GroupBlocks {
+    /// The block of the group's first header.
+    first: usize,
+    /// The block of its last header, where a new entry goes: at the end of
+    /// its `lines`.
+    last: usize,
+}
+
+/// The lines of one key in a group, found by locale.
+#[derive(Debug, Clone, Default)]
+struct KeyLines {
+    /// The last line of each locale (`None`: untranslated), as a repeated
+    /// key's last value counts.
+    last: HashMap<Option<String>, Place>,
+    /// The last line of each locale postfix with an `.ENCODING` part, under
+    /// the postfix without it.
+    encoded: HashMap<String, Place>,
+}
+
+impl KeyLines {
+    /// Adds the line at `place` for `locale`; it comes after the key's
+    /// other lines.
+    fn add(&mut self, locale: Option<&str>, place: Place) {
+        if let Some(locale) = locale.filter(|locale| locale.contains('.')) {
+            self.encoded
+                .insert(strip_encoding(locale).into_owned(), place);
+        }
+        self.last.insert(locale.map(str::to_owned), place);
+    }
+}
+
+/// An index of positions within the blocks, rebuilt after removals and
+/// updated as entries are added.
 #[derive(Debug, Clone, Default)]
 struct Index {
     /// Group names, each once, in the order they first appear.
     groups: Vec<String>,
-    /// Each group's first and last header line.
-    headers: HashMap<String, (usize, usize)>,
+    /// Where each group's lines are.
+    headers: HashMap<String, GroupBlocks>,
     /// Each group's keys with their locales, each once, in order.
     keys: HashMap<String, Vec<(String, Option<String>)>>,
-    /// The lines of each (group, key), with their locales, in file order.
-    entries: HashMap<(String, String), Vec<LocaleLine>>,
+    /// The lines of each (group, key), by locale.
+    entries: HashMap<(String, String), KeyLines>,
 }
 
 /// A key file: groups of `key=value` entries, with comments.
@@ -85,22 +157,33 @@ struct Index {
 /// Two key files are equal when their text is.
 #[derive(Debug, Clone)]
 pub struct KeyFile {
-    lines: Vec<Line>,
+    /// The lines before the first group header, then one block per header,
+    /// in file order. Positions are kept within a block, counted over its
+    /// `lines` and then its `tail`, so that adding an entry moves no line.
+    blocks: Vec<Block>,
     /// Whether the text ended with a line feed.
     final_newline: bool,
     path: Option<PathBuf>,
     key_names: KeyNames,
     index: Index,
-    diagnostics: Vec<Diagnostic>,
+    /// Each block's starting line, counted from 0 and cached on first
+    /// access after a change.
+    starts: OnceLock<Vec<usize>>,
+    /// Problems with line numbers, cached on first access after a change.
+    diagnostics: OnceLock<Vec<Diagnostic>>,
 }
 
 impl PartialEq for KeyFile {
     fn eq(&self, other: &Self) -> bool {
-        let (lines, final_newline) = self.canonical();
-        let (other_lines, other_final_newline) = other.canonical();
+        let (count, final_newline) = self.canonical();
+        let (other_count, other_final_newline) = other.canonical();
         final_newline == other_final_newline
-            && lines.len() == other_lines.len()
-            && lines.iter().zip(other_lines).all(|(a, b)| a.raw == b.raw)
+            && count == other_count
+            && self
+                .lines()
+                .zip(other.lines())
+                .take(count)
+                .all(|(a, b)| a.raw == b.raw)
     }
 }
 
@@ -109,12 +192,13 @@ impl Eq for KeyFile {}
 impl Default for KeyFile {
     fn default() -> Self {
         Self {
-            lines: Vec::new(),
+            blocks: vec![Block::default()],
             final_newline: true,
             path: None,
             key_names: KeyNames::default(),
             index: Index::default(),
-            diagnostics: Vec::new(),
+            starts: OnceLock::new(),
+            diagnostics: OnceLock::new(),
         }
     }
 }
@@ -277,6 +361,7 @@ pub(crate) fn split_list(raw: &str) -> Vec<String> {
     if !current.is_empty() {
         items.push(unescape(&current));
     }
+    work::count(items.len());
     items
 }
 
@@ -309,7 +394,9 @@ impl KeyFile {
     ///
     /// # Errors
     ///
-    /// When the file cannot be read. Problems in its text are diagnostics.
+    /// When the file cannot be read, is not a regular file or is larger
+    /// than [`xdg_kit_basedir::MAX_FILE_LEN`]. Problems in its text are
+    /// diagnostics.
     pub fn read(path: impl AsRef<Path>) -> io::Result<Self> {
         Self::read_with(path, KeyNames::DesktopEntry)
     }
@@ -318,10 +405,12 @@ impl KeyFile {
     ///
     /// # Errors
     ///
-    /// When the file cannot be read. Problems in its text are diagnostics.
+    /// When the file cannot be read, is not a regular file or is larger
+    /// than [`xdg_kit_basedir::MAX_FILE_LEN`]. Problems in its text are
+    /// diagnostics.
     pub fn read_with(path: impl AsRef<Path>, key_names: KeyNames) -> io::Result<Self> {
         let path = path.as_ref();
-        let bytes = fs::read(path)?;
+        let bytes = xdg_kit_basedir::read_regular_file(path)?;
         Ok(Self::parse_from(&bytes, Some(path.to_owned()), key_names))
     }
 
@@ -352,76 +441,176 @@ impl KeyFile {
         };
         if !bytes.is_empty() {
             let body = bytes.strip_suffix(b"\n").unwrap_or(bytes);
-            file.lines = body
-                .split(|&byte| byte == b'\n')
-                .map(|raw| classify(raw, key_names))
-                .collect();
+            for raw in body.split(|&byte| byte == b'\n') {
+                work::count(1);
+                let line = classify(raw, key_names);
+                if matches!(line.kind, Kind::Group(_)) {
+                    file.blocks.push(Block::default());
+                }
+                let (block, _) = file.end();
+                file.blocks[block].lines.push(line);
+            }
         }
         file.reindex();
         file
     }
 
-    /// Rebuilds the index and the diagnostics from the lines.
+    /// Rebuilds the blocks' tails, their problems and the index from the
+    /// lines.
     fn reindex(&mut self) {
         let mut index = Index::default();
-        let mut diagnostics = Vec::new();
-        let mut report = |line: usize, message: String| {
-            diagnostics.push(Diagnostic::new(self.path.clone(), Some(line + 1), message));
-        };
         let mut seen_keys: HashSet<(String, String, Option<String>)> = HashSet::new();
-        let mut group: Option<&str> = None;
-        for (at, line) in self.lines.iter().enumerate() {
-            if let Some(problem) = &line.problem {
-                report(at, problem.clone());
+        for (number, block) in self.blocks.iter_mut().enumerate() {
+            let Block {
+                lines,
+                tail,
+                problems,
+                tail_problems,
+            } = block;
+            // The tail starts after the last entry, or after the header.
+            let split = lines
+                .iter()
+                .inspect(|_| work::count(1))
+                .rposition(|line| matches!(line.kind, Kind::Entry { .. }))
+                .map_or(usize::from(number > 0), |last| last + 1);
+            if split < lines.len() {
+                tail.splice(0..0, lines.drain(split..));
             }
-            match &line.kind {
-                Kind::Group(name) => {
-                    if let Some((_, last)) = index.headers.get_mut(name) {
-                        *last = at;
-                        report(
-                            at,
-                            format!("group [{name}] appears again; its entries join the first one"),
-                        );
-                    } else {
-                        index.headers.insert(name.clone(), (at, at));
-                        index.groups.push(name.clone());
-                    }
-                    group = Some(name);
+            problems.clear();
+            tail_problems.clear();
+            for (at, line) in tail.iter().enumerate() {
+                work::count(1);
+                if let Some(problem) = &line.problem {
+                    tail_problems.push((at, problem.clone()));
                 }
-                Kind::Entry { key, locale, .. } => {
-                    let Some(group) = group else {
-                        report(at, "entry before the first group; ignored".to_owned());
-                        continue;
-                    };
-                    let id = (group.to_owned(), key.clone(), locale.clone());
-                    if seen_keys.insert(id) {
+            }
+            let mut group: Option<&str> = None;
+            for (at, line) in lines.iter().enumerate() {
+                work::count(1);
+                if let Some(problem) = &line.problem {
+                    problems.push((at, problem.clone()));
+                }
+                match &line.kind {
+                    Kind::Group(name) => {
+                        if let Some(found) = index.headers.get_mut(name) {
+                            found.last = number;
+                            problems.push((
+                                at,
+                                format!(
+                                    "group [{name}] appears again; its entries join the first one"
+                                ),
+                            ));
+                        } else {
+                            index.headers.insert(
+                                name.clone(),
+                                GroupBlocks {
+                                    first: number,
+                                    last: number,
+                                },
+                            );
+                            index.groups.push(name.clone());
+                        }
+                        group = Some(name);
+                    }
+                    Kind::Entry { key, locale, .. } => {
+                        let Some(group) = group else {
+                            problems.push((at, "entry before the first group; ignored".to_owned()));
+                            continue;
+                        };
+                        let id = (group.to_owned(), key.clone(), locale.clone());
+                        if seen_keys.insert(id) {
+                            index
+                                .keys
+                                .entry(group.to_owned())
+                                .or_default()
+                                .push((key.clone(), locale.clone()));
+                        } else {
+                            let shown = locale
+                                .as_ref()
+                                .map_or_else(|| key.clone(), |locale| format!("{key}[{locale}]"));
+                            problems.push((
+                                at,
+                                format!(
+                                    "key {shown} appears again in [{group}]; the last value counts"
+                                ),
+                            ));
+                        }
                         index
-                            .keys
-                            .entry(group.to_owned())
+                            .entries
+                            .entry((group.to_owned(), key.clone()))
                             .or_default()
-                            .push((key.clone(), locale.clone()));
-                    } else {
-                        let shown = locale
-                            .as_ref()
-                            .map_or_else(|| key.clone(), |locale| format!("{key}[{locale}]"));
-                        report(
-                            at,
-                            format!(
-                                "key {shown} appears again in [{group}]; the last value counts"
-                            ),
-                        );
+                            .add(locale.as_deref(), (number, at));
                     }
-                    index
-                        .entries
-                        .entry((group.to_owned(), key.clone()))
-                        .or_default()
-                        .push((locale.clone(), at));
+                    Kind::Blank | Kind::Comment | Kind::Invalid => {}
                 }
-                Kind::Blank | Kind::Comment | Kind::Invalid => {}
             }
         }
         self.index = index;
-        self.diagnostics = diagnostics;
+        self.changed();
+    }
+
+    /// Clears cached line numbers and diagnostics after a change.
+    fn changed(&mut self) {
+        self.starts.take();
+        self.diagnostics.take();
+    }
+
+    /// The line each block starts on, counted from 0.
+    fn starts(&self) -> &[usize] {
+        self.starts.get_or_init(|| {
+            work::count(self.blocks.len());
+            let mut next = 0;
+            self.blocks
+                .iter()
+                .map(|block| {
+                    let start = next;
+                    next += block.len();
+                    start
+                })
+                .collect()
+        })
+    }
+
+    /// The line number of `place`, counted from 1.
+    fn line_number(&self, (block, at): Place) -> usize {
+        self.starts()[block] + at + 1
+    }
+
+    fn line(&self, (block, at): Place) -> &Line {
+        let block = &self.blocks[block];
+        match at.checked_sub(block.lines.len()) {
+            Some(in_tail) => &block.tail[in_tail],
+            None => &block.lines[at],
+        }
+    }
+
+    /// Every line, in file order.
+    fn lines(&self) -> impl Iterator<Item = &Line> {
+        self.blocks
+            .iter()
+            .flat_map(|block| block.lines.iter().chain(&block.tail))
+    }
+
+    fn last_line(&self) -> Option<&Line> {
+        self.blocks.iter().rev().find_map(Block::last_line)
+    }
+
+    /// The place after the last line.
+    fn end(&self) -> Place {
+        let last = self.blocks.len() - 1;
+        (last, self.blocks[last].len())
+    }
+
+    /// The place of the line before `place`, if there is one.
+    fn before(&self, (block, at): Place) -> Option<Place> {
+        if at > 0 {
+            return Some((block, at - 1));
+        }
+        // Only the lines before the first group can be an empty block.
+        (0..block).rev().find_map(|earlier| {
+            let len = self.blocks[earlier].len();
+            len.checked_sub(1).map(|last| (earlier, last))
+        })
     }
 
     /// The file this was read from, if any.
@@ -434,12 +623,34 @@ impl KeyFile {
     /// edits), with line numbers counted from 1.
     #[must_use]
     pub fn diagnostics(&self) -> &[Diagnostic] {
-        &self.diagnostics
+        self.diagnostics.get_or_init(|| {
+            let starts = self.starts();
+            self.blocks
+                .iter()
+                .zip(starts)
+                .flat_map(|(block, start)| {
+                    work::count(1 + block.problems.len() + block.tail_problems.len());
+                    let tail_start = start + block.lines.len();
+                    let problems = block
+                        .problems
+                        .iter()
+                        .map(move |(at, message)| (start + at, message));
+                    let tail_problems = block
+                        .tail_problems
+                        .iter()
+                        .map(move |(at, message)| (tail_start + at, message));
+                    problems.chain(tail_problems).map(|(at, message)| {
+                        Diagnostic::new(self.path.clone(), Some(at + 1), message.clone())
+                    })
+                })
+                .collect()
+        })
     }
 
     /// The group names, each once, in the order they first appear.
     #[must_use]
     pub fn groups(&self) -> Vec<&str> {
+        work::count(self.index.groups.len());
         self.index.groups.iter().map(String::as_str).collect()
     }
 
@@ -457,6 +668,7 @@ impl KeyFile {
             .keys
             .get(group)
             .map(|keys| {
+                work::count(keys.len());
                 keys.iter()
                     .map(|(key, locale)| (key.as_str(), locale.as_deref()))
                     .collect()
@@ -464,56 +676,60 @@ impl KeyFile {
             .unwrap_or_default()
     }
 
-    /// The lines of `key` in `group`, with their locales, in file order.
-    fn entry_lines(&self, group: &str, key: &str) -> &[LocaleLine] {
-        self.index
-            .entries
-            .get(&(group.to_owned(), key.to_owned()))
-            .map_or(&[], Vec::as_slice)
+    /// The lines of `key` in `group`, by locale.
+    fn key_lines(&self, group: &str, key: &str) -> Option<&KeyLines> {
+        self.index.entries.get(&(group.to_owned(), key.to_owned()))
     }
 
-    /// The index of the line holding the value of `key[locale]` in `group`:
+    /// The place of the line holding the value of `key[locale]` in `group`:
     /// the last one, as a repeated key's last value counts.
-    fn find(&self, group: &str, key: &str, locale: Option<&str>) -> Option<usize> {
-        self.entry_lines(group, key)
-            .iter()
-            .rev()
-            .find(|(l, _)| l.as_deref() == locale)
-            .map(|&(_, at)| at)
+    fn find(&self, group: &str, key: &str, locale: Option<&str>) -> Option<Place> {
+        self.key_lines(group, key)?
+            .last
+            .get(&locale.map(str::to_owned))
+            .inspect(|_| work::count(1))
+            .copied()
     }
 
     /// The value of `key[locale]` in `group` as written, escapes included.
     #[must_use]
     pub fn raw(&self, group: &str, key: &str, locale: Option<&str>) -> Option<&str> {
         self.find(group, key, locale)
-            .and_then(|index| self.lines[index].value())
+            .and_then(|place| self.line(place).value())
     }
 
     /// The line (counted from 1) that holds `key[locale]` in `group`.
     #[must_use]
     pub fn line_of(&self, group: &str, key: &str, locale: Option<&str>) -> Option<usize> {
-        self.find(group, key, locale).map(|index| index + 1)
+        self.find(group, key, locale)
+            .map(|place| self.line_number(place))
     }
 
     /// The line (counted from 1) of `group`'s first header.
     #[must_use]
     pub fn group_line(&self, group: &str) -> Option<usize> {
-        self.index.headers.get(group).map(|&(first, _)| first + 1)
+        self.index
+            .headers
+            .get(group)
+            .map(|found| self.line_number((found.first, 0)))
     }
 
     /// The value of `key` in `group` translated for `wanted` (a locale key
     /// such as `de_AT@euro`), comparing postfixes with their `.ENCODING`
     /// part stripped, as the spec says; the last such line counts.
     fn translated(&self, group: &str, key: &str, wanted: &str) -> Option<&str> {
-        self.entry_lines(group, key)
-            .iter()
-            .rev()
-            .find(|(locale, _)| {
-                locale
-                    .as_deref()
-                    .is_some_and(|l| strip_encoding(l) == wanted)
-            })
-            .and_then(|&(_, at)| self.lines[at].value())
+        let lines = self.key_lines(group, key)?;
+        // A postfix without a `.` is its own stripped form.
+        let plain = if wanted.contains('.') {
+            None
+        } else {
+            lines.last.get(&Some(wanted.to_owned()))
+        };
+        // Places order as lines do: the later one counts.
+        plain
+            .max(lines.encoded.get(wanted))
+            .inspect(|_| work::count(1))
+            .and_then(|&place| self.line(place).value())
     }
 
     /// The untranslated value of `key` in `group`, unescaped.
@@ -580,8 +796,11 @@ impl KeyFile {
         if raw.contains(['\n', '\r']) || raw.starts_with([' ', '\t']) {
             return Err(EditError::Value);
         }
-        if let Some(index) = self.find(group, key, locale) {
-            let line = &mut self.lines[index];
+        if let Some((block, at)) = self.find(group, key, locale) {
+            // Only the value changes: the line count and the line's problem
+            // stay, so the line numbers and diagnostics worked out stay
+            // right and `changed` is not needed.
+            let line = &mut self.blocks[block].lines[at];
             if let Kind::Entry { value_start, .. } = line.kind {
                 let carriage_return = line.raw.ends_with(b"\r");
                 line.raw.truncate(value_start);
@@ -596,79 +815,45 @@ impl KeyFile {
             Some(locale) => format!("{key}[{locale}]={raw}"),
             None => format!("{key}={raw}"),
         };
-        let mut new = Line::entry(&text, key, locale);
-        if let Some(at) = self.insertion_point(group) {
-            self.match_line_end(at, &mut new);
-            self.insert_entry(at, group, key, locale, new);
-        } else {
+        if !self.has_group(group) {
             self.push_group(group);
-            self.push_line(new);
-            self.reindex();
         }
+        self.insert_entry(group, key, locale, Line::entry(&text, key, locale));
         Ok(())
     }
 
-    /// Inserts the new entry line `line` for `key[locale]` (not yet in the
-    /// group) at `at` and updates the index in place: the line numbers after
-    /// it move down by one. Cheaper than [`KeyFile::reindex`], so building a
-    /// file key by key stays fast.
-    fn insert_entry(
-        &mut self,
-        at: usize,
-        group: &str,
-        key: &str,
-        locale: Option<&str>,
-        line: Line,
-    ) {
-        self.lines.insert(at, line);
-        let shift = |index: &mut usize| {
-            if *index >= at {
-                *index += 1;
-            }
+    /// Inserts `line` for a new `key[locale]` after the last entry in an
+    /// existing `group` and updates the index. Insertion takes constant
+    /// time regardless of file length.
+    ///
+    /// The group's last entry (or header) ends the `lines` of its last
+    /// block. Appending there puts the new entry before the tail without
+    /// moving existing lines or changing positions in the index or problem
+    /// lists. It also puts the entry after every other line for `key`, as
+    /// [`KeyLines::add`] requires.
+    fn insert_entry(&mut self, group: &str, key: &str, locale: Option<&str>, mut line: Line) {
+        let found = self.index.headers.get(group);
+        debug_assert!(found.is_some(), "insert_entry into missing group [{group}]");
+        let Some(found) = found else {
+            return;
         };
-        for (first, last) in self.index.headers.values_mut() {
-            shift(first);
-            shift(last);
-        }
-        for lines in self.index.entries.values_mut() {
-            for (_, index) in lines {
-                shift(index);
-            }
-        }
-        for diagnostic in &mut self.diagnostics {
-            // Diagnostics count lines from 1.
-            if let Some(number) = diagnostic.line.as_mut()
-                && *number > at
-            {
-                *number += 1;
-            }
-        }
-        let locale = locale.map(str::to_owned);
+        let number = found.last;
+        let place = (number, self.blocks[number].lines.len());
+        self.match_line_end(place, &mut line);
+        // A step for the line added, at a place known without looking.
+        work::count(1);
+        self.blocks[number].lines.push(line);
         self.index
             .entries
             .entry((group.to_owned(), key.to_owned()))
             .or_default()
-            .push((locale.clone(), at));
+            .add(locale, place);
         self.index
             .keys
             .entry(group.to_owned())
             .or_default()
-            .push((key.to_owned(), locale));
-    }
-
-    /// After the last entry of `group`'s last occurrence, or after its
-    /// header; `None` when there is no such group.
-    fn insertion_point(&self, group: &str) -> Option<usize> {
-        let &(_, header) = self.index.headers.get(group)?;
-        let mut at = header + 1;
-        for (index, line) in self.lines.iter().enumerate().skip(header + 1) {
-            match line.kind {
-                Kind::Group(_) => break,
-                Kind::Entry { .. } => at = index + 1,
-                _ => {}
-            }
-        }
-        Some(at)
+            .push((key.to_owned(), locale.map(str::to_owned)));
+        self.changed();
     }
 
     /// Sets `key` in `group` to the string `value`, escaped.
@@ -725,19 +910,26 @@ impl KeyFile {
 
     /// Removes every `key[locale]` entry from `group`; whether there was one.
     pub fn remove(&mut self, group: &str, key: &str, locale: Option<&str>) -> bool {
-        let doomed: Vec<usize> = self
-            .entry_lines(group, key)
-            .iter()
-            .filter(|(l, _)| l.as_deref() == locale)
-            .map(|&(_, at)| at)
-            .collect();
-        for &index in doomed.iter().rev() {
-            self.lines.remove(index);
+        if self.find(group, key, locale).is_none() {
+            return false;
         }
-        if !doomed.is_empty() {
-            self.reindex();
+        // The lines before the first group, the first block, are in none;
+        // a block's entries are all in its `lines`.
+        for block in self.blocks.iter_mut().skip(1) {
+            work::count(1);
+            if !matches!(&block.lines[0].kind, Kind::Group(name) if name == group) {
+                continue;
+            }
+            block.lines.retain(|line| {
+                work::count(1);
+                !matches!(
+                    &line.kind,
+                    Kind::Entry { key: k, locale: l, .. } if k == key && l.as_deref() == locale
+                )
+            });
         }
-        !doomed.is_empty()
+        self.reindex();
+        true
     }
 
     /// Adds an empty group at the end, after a blank line, unless it exists.
@@ -751,88 +943,100 @@ impl KeyFile {
         }
         if !self.has_group(group) {
             self.push_group(group);
-            self.reindex();
         }
         Ok(())
     }
 
-    /// Appends a header for `group`, after a blank line.
+    /// Appends a header for `group`, which the file does not have, after a
+    /// blank line, and adds the group to the index.
     fn push_group(&mut self, group: &str) {
         if self
-            .lines
-            .last()
+            .last_line()
             .is_some_and(|line| line.kind != Kind::Blank)
         {
-            self.push_line(Line {
+            let mut blank = Line {
                 raw: Vec::new(),
                 kind: Kind::Blank,
                 problem: None,
-            });
+            };
+            let (block, at) = self.end();
+            self.match_line_end((block, at), &mut blank);
+            self.blocks[block].tail.push(blank);
         }
-        self.push_line(Line {
+        let mut header = Line {
             raw: format!("[{group}]").into_bytes(),
             kind: Kind::Group(group.to_owned()),
             problem: None,
-        });
-    }
-
-    /// Appends `line` with the file's line end; the index is not updated.
-    fn push_line(&mut self, mut line: Line) {
-        self.match_line_end(self.lines.len(), &mut line);
-        self.lines.push(line);
-    }
-
-    /// Gives `line`, about to go in at `at`, the file's line end: a file
-    /// with CRLF line ends (judged by the nearest line before `at` that has
-    /// a line end) gets them on new lines too. A last line without a line
-    /// end gets one when a line goes after it, and the new line is then the
-    /// one without.
-    fn match_line_end(&mut self, at: usize, line: &mut Line) {
-        let len = self.lines.len();
-        let ended = if self.final_newline {
-            at
-        } else {
-            at.min(len.saturating_sub(1))
         };
-        if !self.lines[..ended]
-            .last()
-            .is_some_and(|line| line.raw.ends_with(b"\r"))
-        {
+        self.match_line_end(self.end(), &mut header);
+        self.blocks.push(Block {
+            lines: vec![header],
+            ..Block::default()
+        });
+        let number = self.blocks.len() - 1;
+        self.index.headers.insert(
+            group.to_owned(),
+            GroupBlocks {
+                first: number,
+                last: number,
+            },
+        );
+        self.index.groups.push(group.to_owned());
+        self.changed();
+    }
+
+    /// Gives `line`, about to go in at `place`, the file's line end: a file
+    /// with CRLF line ends (judged by the nearest line before `place` that
+    /// has a line end) gets them on new lines too. A last line without a
+    /// line end gets one when a line goes after it, and the new line is
+    /// then the one without.
+    fn match_line_end(&mut self, place: Place, line: &mut Line) {
+        let at_end = place == self.end();
+        let before = self.before(place);
+        let judged = if self.final_newline || !at_end {
+            before
+        } else {
+            // The line before has no line end.
+            before.and_then(|before| self.before(before))
+        };
+        if !judged.is_some_and(|judged| self.line(judged).raw.ends_with(b"\r")) {
             return;
         }
-        if at < len || self.final_newline {
+        if !at_end || self.final_newline {
             line.raw.push(b'\r');
-        } else if at > 0 && !self.lines[at - 1].raw.ends_with(b"\r") {
-            self.lines[at - 1].raw.push(b'\r');
+        } else if let Some((block, at)) = before {
+            let last = &mut self.blocks[block].line_mut(at).raw;
+            if !last.ends_with(b"\r") {
+                last.push(b'\r');
+            }
         }
     }
 
-    /// The lines and whether the text ends in a line feed, in the one form
-    /// each text has: a last empty line without a line feed is the line
-    /// feed of the line before it, and no lines at all are the empty text.
-    fn canonical(&self) -> (&[Line], bool) {
-        match self.lines.split_last() {
-            Some((last, rest)) if !self.final_newline && last.raw.is_empty() => (rest, true),
-            _ => (&self.lines, self.final_newline || self.lines.is_empty()),
+    /// How many lines there are and whether the text ends in a line feed,
+    /// in the one form each text has: a last empty line without a line
+    /// feed is the line feed of the line before it, and no lines at all
+    /// are the empty text.
+    fn canonical(&self) -> (usize, bool) {
+        let count = self.blocks.iter().map(Block::len).sum();
+        match self.last_line() {
+            Some(last) if !self.final_newline && last.raw.is_empty() => (count - 1, true),
+            _ => (count, self.final_newline || count == 0),
         }
     }
 
     /// Removes every occurrence of `group` with its lines, up to the next
     /// group; whether there was one.
     pub fn remove_group(&mut self, group: &str) -> bool {
-        let mut kept = Vec::with_capacity(self.lines.len());
-        let mut dropping = false;
-        let mut removed = false;
-        for line in self.lines.drain(..) {
-            if let Kind::Group(name) = &line.kind {
-                dropping = name == group;
-                removed |= dropping;
-            }
-            if !dropping {
-                kept.push(line);
-            }
-        }
-        self.lines = kept;
+        let before = self.blocks.len();
+        // The lines before the first group, the first block, have no header.
+        self.blocks.retain(|block| {
+            work::count(1);
+            !matches!(
+                block.lines.first().map(|line| &line.kind),
+                Some(Kind::Group(name)) if name == group
+            )
+        });
+        let removed = self.blocks.len() < before;
         if removed {
             self.reindex();
         }
@@ -843,13 +1047,14 @@ impl KeyFile {
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        for (index, line) in self.lines.iter().enumerate() {
+        for (index, line) in self.lines().enumerate() {
+            work::count(1);
             if index > 0 {
                 out.push(b'\n');
             }
             out.extend_from_slice(&line.raw);
         }
-        if self.final_newline && !self.lines.is_empty() {
+        if self.final_newline && self.last_line().is_some() {
             out.push(b'\n');
         }
         out
@@ -1013,6 +1218,39 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     }
     // The rename itself is made durable by syncing the folder.
     fs::File::open(dir)?.sync_all()
+}
+
+/// Steps of work (lines, entries or blocks visited), counted in tests so
+/// that they can show the work grows linearly with the input. Outside tests
+/// counting does nothing.
+///
+/// The counts can only show what they are told: on a path a counted test
+/// runs, every step that grows with the input counts, each item a loop
+/// visits included (each repeat check, each line a lookup visits, each
+/// line looked at to find where a new one goes). A new loop over input on
+/// such a path must count its steps too.
+pub(crate) mod work {
+    #[cfg(test)]
+    thread_local! {
+        static STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Counts `steps` steps on this thread.
+    #[inline]
+    pub(crate) fn count(steps: usize) {
+        #[cfg(test)]
+        STEPS.with(|done| done.set(done.get() + steps));
+        #[cfg(not(test))]
+        let _ = steps;
+    }
+
+    /// What `f` returns, and the steps it counted on this thread.
+    #[cfg(test)]
+    pub(crate) fn steps<T>(f: impl FnOnce() -> T) -> (T, usize) {
+        let before = STEPS.with(std::cell::Cell::get);
+        let value = f();
+        (value, STEPS.with(std::cell::Cell::get) - before)
+    }
 }
 
 #[cfg(test)]
@@ -1332,18 +1570,65 @@ mod tests {
 
     #[test]
     fn a_file_built_key_by_key_stays_fast() {
-        let started = std::time::Instant::now();
-        let mut file = KeyFile::new();
-        for at in 0..10_000 {
-            file.set_string("Desktop Entry", &format!("X-K{at}"), "v")
-                .unwrap();
-        }
+        // The group is followed by another, so new lines go in the middle.
+        let mut file = KeyFile::parse(b"[Desktop Entry]\n\n[Other]\nk=v\n");
+        let ((), steps) = work::steps(|| {
+            for at in 0..10_000 {
+                file.set_string("Desktop Entry", &format!("X-K{at}"), "v")
+                    .unwrap();
+            }
+        });
         assert_eq!(file.keys("Desktop Entry").len(), 10_000);
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(10),
-            "{:?}",
-            started.elapsed()
-        );
+        // A step per line added; the blank line after the group stays.
+        assert!(steps <= 2 * 10_000, "{steps} steps for 10,000 keys");
+        assert_like_reparse(&file);
+    }
+
+    #[test]
+    fn many_translations_of_a_key_stay_fast() {
+        let mut file = KeyFile::parse(b"[Desktop Entry]\nName=n\n");
+        let ((), steps) = work::steps(|| {
+            for at in 0..10_000 {
+                file.set_locale_string("Desktop Entry", "Name", &format!("l{at}.UTF-8"), "v")
+                    .unwrap();
+            }
+            for at in 0..10_000 {
+                let locale = format!("l{at}");
+                assert_eq!(
+                    file.raw("Desktop Entry", "Name", Some(&format!("{locale}.UTF-8"))),
+                    Some("v")
+                );
+                assert_eq!(
+                    file.locale_string("Desktop Entry", "Name", &Locales::new([locale]))
+                        .as_deref(),
+                    Some("v")
+                );
+            }
+        });
+        assert_eq!(file.keys("Desktop Entry").len(), 10_001);
+        // A step per line added and per line a lookup visits.
+        assert!(steps <= 4 * 10_000, "{steps} steps for 10,000 translations");
+        assert_like_reparse(&file);
+    }
+
+    #[test]
+    fn adding_keys_never_moves_a_groups_trailing_lines() {
+        use std::fmt::Write as _;
+        let mut text = String::from("[Desktop Entry]\nk=v\n");
+        for at in 0..10_000 {
+            let _ = writeln!(text, "# comment {at}\n\njunk {at}");
+        }
+        text.push_str("[Other]\nk=v\n");
+        let mut file = KeyFile::parse(text.as_bytes());
+        let ((), steps) = work::steps(|| {
+            for at in 0..10_000 {
+                file.set_string("Desktop Entry", &format!("X-K{at}"), "v")
+                    .unwrap();
+            }
+        });
+        assert_eq!(file.keys("Desktop Entry").len(), 10_001);
+        // A step per line added.
+        assert!(steps <= 2 * 10_000, "{steps} steps for 10,000 keys");
         assert_like_reparse(&file);
     }
 
@@ -1354,19 +1639,19 @@ mod tests {
         for at in 0..40_000 {
             let _ = writeln!(text, "X-Key{at}=v");
         }
-        let started = std::time::Instant::now();
-        let file = KeyFile::parse(text.as_bytes());
-        let keys = file.keys("Desktop Entry").len();
-        let found = (0..40_000).filter(|at| {
-            file.raw("Desktop Entry", &format!("X-Key{at}"), None)
-                .is_some()
+        let ((keys, found), steps) = work::steps(|| {
+            let file = KeyFile::parse(text.as_bytes());
+            let keys = file.keys("Desktop Entry").len();
+            let found = (0..40_000).filter(|at| {
+                file.raw("Desktop Entry", &format!("X-Key{at}"), None)
+                    .is_some()
+            });
+            (keys, found.count())
         });
-        assert_eq!((keys, found.count()), (40_000, 40_000));
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
-            "{:?}",
-            started.elapsed()
-        );
+        assert_eq!((keys, found), (40_000, 40_000));
+        // A step per line split off, read and indexed, per key listed and
+        // per line a lookup visits.
+        assert!(steps <= 5 * 40_000, "{steps} steps for 40,000 keys");
     }
 
     #[test]
@@ -1426,5 +1711,43 @@ mod tests {
         let fresh = dir.path().join("new.desktop");
         KeyFile::new().write(&fresh).unwrap();
         assert_eq!(fs::read(&fresh).unwrap(), b"");
+    }
+
+    /// Makes a FIFO at `path`.
+    #[cfg(not(target_vendor = "apple"))]
+    fn fifo(path: &Path) {
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            path,
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+            0,
+        )
+        .unwrap();
+    }
+
+    /// Runs `f` in a thread and returns its result. If a FIFO blocks the
+    /// read, the test fails after `timeout`.
+    #[cfg(not(target_vendor = "apple"))]
+    fn within<T: Send + 'static>(
+        timeout: std::time::Duration,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let (send, receive) = std::sync::mpsc::channel();
+        std::thread::spawn(move || send.send(f()));
+        receive.recv_timeout(timeout).expect("it returns in time")
+    }
+
+    // `mknodat` is not in rustix on Apple systems.
+    #[cfg(not(target_vendor = "apple"))]
+    #[test]
+    fn a_fifo_is_refused_not_waited_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.desktop");
+        fifo(&path);
+        let read = within(std::time::Duration::from_secs(10), move || {
+            KeyFile::read(&path).map(|_| ())
+        });
+        assert_eq!(read.unwrap_err().kind(), io::ErrorKind::InvalidInput);
     }
 }

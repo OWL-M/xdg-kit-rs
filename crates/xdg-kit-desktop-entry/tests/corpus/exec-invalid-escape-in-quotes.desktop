@@ -1,0 +1,7 @@
+# desktop-file-validate agrees only by accident: it takes the \\ as
+# escaping the closing quote, and reports a quote which is not closed,
+# not the \q.
+[Desktop Entry]
+Type=Application
+Name=Foo
+Exec=echo "abc\\q"

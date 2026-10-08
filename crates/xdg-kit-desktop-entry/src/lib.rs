@@ -1,8 +1,8 @@
 //! The freedesktop.org Desktop Entry spec (version 1.5, with the latest
 //! text of xdg-specs). Reads and writes `.desktop` and `.directory` files
 //! without losing their contents or formatting. Provides typed keys,
-//! translations, actions, validation, and application lookup by desktop
-//! file ID, plus support for launching applications.
+//! translations, actions, validation, and lookup of installed entries by
+//! desktop file ID, plus support for launching applications.
 //!
 //! ```no_run
 //! use xdg_kit_basedir::BaseDirs;

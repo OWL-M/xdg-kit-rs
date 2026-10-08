@@ -10,8 +10,8 @@ license.workspace = true
 default = ["basedir", "desktop-entry", "locale", "mime", "mime-apps"]
 ## The XDG Base Directory spec and user folders.
 basedir = ["dep:xdg-kit-basedir"]
-## Desktop entries: reading, writing, validation, installed applications,
-## launching.
+## Desktop entries: reading, writing, validation, installed entries by
+## desktop file ID, launching.
 desktop-entry = ["dep:xdg-kit-desktop-entry", "basedir"]
 ## D-Bus activation when launching `DBusActivatable` applications.
 desktop-entry-dbus = ["desktop-entry", "xdg-kit-desktop-entry/dbus"]

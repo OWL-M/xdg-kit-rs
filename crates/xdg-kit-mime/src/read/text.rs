@@ -4,6 +4,7 @@
 
 use std::path::Path;
 
+use super::{MAX_DIAGNOSTICS, Problems};
 use crate::model::{
     Folder, Glob, MAX_DEPTH, MagicRule, Matchlet, NO_GLOBS, NO_MAGIC, TreeKind, TreeMatchlet,
     TreeRule,
@@ -29,7 +30,7 @@ pub(crate) fn read(
 ) {
     let mut file = |name: &str| -> Option<Vec<u8>> {
         let path = dir.join(name);
-        match std::fs::read(&path) {
+        match xdg_kit_basedir::read_regular_file(&path) {
             Ok(bytes) => Some(bytes),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
             Err(err) => {
@@ -95,7 +96,8 @@ pub(crate) fn read(
 /// Parses the contents of the file called `name` (`globs2`, `globs`,
 /// `magic`, `aliases`, `subclasses`, `icons`, `generic-icons`,
 /// `XMLnamespaces`, `treemagic` or `types`) into `folder`; other names are
-/// ignored.
+/// ignored. Lists at most [`MAX_DIAGNOSTICS`](super::MAX_DIAGNOSTICS)
+/// problems, as the cache reader does.
 pub(crate) fn parse(
     name: &str,
     path: &Path,
@@ -103,58 +105,74 @@ pub(crate) fn parse(
     folder: &mut Folder,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    let problems = &mut Problems::new(path, diagnostics);
     match name {
-        "globs2" => parse_globs(path, bytes, true, folder, diagnostics),
-        "globs" => parse_globs(path, bytes, false, folder, diagnostics),
-        "magic" => parse_magic(path, bytes, folder, diagnostics),
-        "aliases" => folder.aliases = parse_pairs(path, bytes, ' ', diagnostics),
-        "subclasses" => folder.parents = parse_pairs(path, bytes, ' ', diagnostics),
-        "icons" => folder.icons = parse_icons(path, bytes, diagnostics),
-        "generic-icons" => folder.generic_icons = parse_icons(path, bytes, diagnostics),
-        "XMLnamespaces" => folder.namespaces = parse_namespaces(path, bytes, diagnostics),
-        "treemagic" => parse_treemagic(path, bytes, folder, diagnostics),
-        "types" => folder.types = Some(parse_types(path, bytes, diagnostics)),
+        "globs2" => parse_globs(bytes, true, folder, problems),
+        "globs" => parse_globs(bytes, false, folder, problems),
+        "magic" => parse_magic(bytes, folder, problems),
+        "aliases" => folder.aliases = parse_pairs(bytes, ' ', problems),
+        "subclasses" => folder.parents = parse_pairs(bytes, ' ', problems),
+        "icons" => folder.icons = parse_icons(bytes, problems),
+        "generic-icons" => folder.generic_icons = parse_icons(bytes, problems),
+        "XMLnamespaces" => folder.namespaces = parse_namespaces(bytes, problems),
+        "treemagic" => parse_treemagic(bytes, folder, problems),
+        "types" => folder.types = Some(parse_types(bytes, problems)),
         _ => {}
     }
 }
 
-/// The non-empty, non-comment lines of a text file, numbered from 1.
-/// Lines that are not UTF-8 are reported and skipped.
+/// The non-empty, non-comment lines of a text file, numbered from 1, one at
+/// a time. Lines that are not UTF-8 are reported when reached, and skipped.
 fn lines<'a>(
-    path: &Path,
     bytes: &'a [u8],
-    diagnostics: &mut Vec<Diagnostic>,
-) -> Vec<(usize, &'a str)> {
-    let mut found = Vec::new();
-    for (index, line) in bytes.split(|&byte| byte == b'\n').enumerate() {
-        let number = index + 1;
-        match std::str::from_utf8(line) {
-            Ok(line) if line.is_empty() || line.starts_with('#') => {}
-            Ok(line) => found.push((number, line)),
-            Err(_) => diagnostics.push(Diagnostic::new(
-                path,
-                Some(Location::Line(number)),
-                "not UTF-8, skipped",
-            )),
-        }
-    }
-    found
+    problems: &mut Problems<'_>,
+) -> impl Iterator<Item = (usize, &'a str)> {
+    bytes
+        .split(|&byte| byte == b'\n')
+        .enumerate()
+        .filter_map(move |(index, line)| {
+            let number = index + 1;
+            match std::str::from_utf8(line) {
+                Ok(line) if line.is_empty() || line.starts_with('#') => None,
+                Ok(line) => Some((number, line)),
+                Err(_) => {
+                    problems.report(Some(Location::Line(number)), "not UTF-8, skipped");
+                    None
+                }
+            }
+        })
 }
 
-fn mime(
-    text: &str,
-    path: &Path,
-    line: usize,
-    diagnostics: &mut Vec<Diagnostic>,
-) -> Option<MimeType> {
+/// Collects text file problems during parsing so they can be reported
+/// after all invalid UTF-8 lines. Keeps at most one more problem than the
+/// reporting limit so the summary line still appears.
+struct Held(Vec<(usize, String)>);
+
+impl Held {
+    fn new() -> Self {
+        Self(Vec::new())
+    }
+
+    fn report(&mut self, line: usize, message: impl Into<String>) {
+        // One past the limit brings the summary; more are never listed.
+        if self.0.len() <= MAX_DIAGNOSTICS {
+            self.0.push((line, message.into()));
+        }
+    }
+
+    /// Lists the held problems, in the order they were found.
+    fn list(self, problems: &mut Problems<'_>) {
+        for (line, message) in self.0 {
+            problems.report(Some(Location::Line(line)), message);
+        }
+    }
+}
+
+fn mime(text: &str, line: usize, held: &mut Held) -> Option<MimeType> {
     match MimeType::new(text) {
         Ok(mime) => Some(mime),
         Err(err) => {
-            diagnostics.push(Diagnostic::new(
-                path,
-                Some(Location::Line(line)),
-                format!("{err}, line skipped"),
-            ));
+            held.report(line, format!("{err}, line skipped"));
             None
         }
     }
@@ -167,26 +185,23 @@ fn mime(
 /// time without them, "for older parsers". That copy is dropped: honouring it
 /// would make a case-sensitive pattern such as `*.C` also match
 /// case-insensitively, which the source XML and `mime.cache` do not say.
-fn parse_globs(
-    path: &Path,
-    bytes: &[u8],
-    version_two: bool,
-    folder: &mut Folder,
-    diagnostics: &mut Vec<Diagnostic>,
-) {
-    let mut found = Vec::new();
-    let mut bad = Vec::new();
+///
+/// The problems with lines' fields are listed before those with their
+/// types and patterns.
+fn parse_globs(bytes: &[u8], version_two: bool, folder: &mut Folder, problems: &mut Problems<'_>) {
+    let mut bad_fields = Held::new();
+    let mut bad_values = Held::new();
     // The (weight, type, pattern) of the previous line, when it had flags.
     let mut flagged: Option<(&str, &str, &str)> = None;
-    for (number, line) in lines(path, bytes, diagnostics) {
+    for (number, line) in lines(bytes, problems) {
         // Only the line right before counts.
         let previous = flagged.take();
-        let parsed = if version_two {
+        let (weight, mime_text, pattern, case_sensitive) = if version_two {
             let mut fields = line.splitn(4, ':');
             let (Some(weight), Some(mime), Some(pattern)) =
                 (fields.next(), fields.next(), fields.next())
             else {
-                bad.push((number, "fewer than three fields"));
+                bad_fields.report(number, "fewer than three fields, line skipped");
                 continue;
             };
             // Further fields after the flags are for future use and ignored.
@@ -201,39 +216,25 @@ fn parse_globs(
             }
             let flags = flags.unwrap_or("");
             let Ok(weight) = weight.parse::<u32>() else {
-                bad.push((number, "weight is not a number"));
+                bad_fields.report(number, "weight is not a number, line skipped");
                 continue;
             };
             let case_sensitive = flags.split(',').any(|flag| flag == "cs");
             (weight, mime, pattern, case_sensitive)
         } else {
             let Some((mime, pattern)) = line.split_once(':') else {
-                bad.push((number, "no ':'"));
+                bad_fields.report(number, "no ':', line skipped");
                 continue;
             };
             (50, mime, pattern, false)
         };
-        found.push((number, parsed));
-    }
-    for (number, message) in bad {
-        diagnostics.push(Diagnostic::new(
-            path,
-            Some(Location::Line(number)),
-            format!("{message}, line skipped"),
-        ));
-    }
-    for (number, (weight, mime_text, pattern, case_sensitive)) in found {
-        let Some(mime) = mime(mime_text, path, number, diagnostics) else {
+        let Some(mime) = mime(mime_text, number, &mut bad_values) else {
             continue;
         };
         if pattern == NO_GLOBS {
             folder.no_globs.push(mime);
         } else if pattern.is_empty() {
-            diagnostics.push(Diagnostic::new(
-                path,
-                Some(Location::Line(number)),
-                "empty pattern, line skipped",
-            ));
+            bad_values.report(number, "empty pattern, line skipped");
         } else {
             folder.globs.push(Glob {
                 weight: weight.min(100),
@@ -243,110 +244,86 @@ fn parse_globs(
             });
         }
     }
+    bad_fields.list(problems);
+    bad_values.list(problems);
 }
 
 /// Lines of two fields separated by `separator`: `aliases` (`alias type`)
 /// and `subclasses` (`type parent`).
 fn parse_pairs(
-    path: &Path,
     bytes: &[u8],
     separator: char,
-    diagnostics: &mut Vec<Diagnostic>,
+    problems: &mut Problems<'_>,
 ) -> Vec<(MimeType, MimeType)> {
     let mut pairs = Vec::new();
-    let mut found = Vec::new();
-    for (number, line) in lines(path, bytes, diagnostics) {
-        found.push((number, line.split_once(separator)));
-    }
-    for (number, split) in found {
-        let Some((first, second)) = split else {
-            diagnostics.push(Diagnostic::new(
-                path,
-                Some(Location::Line(number)),
-                "one field only, line skipped",
-            ));
+    let mut held = Held::new();
+    for (number, line) in lines(bytes, problems) {
+        let Some((first, second)) = line.split_once(separator) else {
+            held.report(number, "one field only, line skipped");
             continue;
         };
         if let (Some(first), Some(second)) = (
-            mime(first, path, number, diagnostics),
-            mime(second, path, number, diagnostics),
+            mime(first, number, &mut held),
+            mime(second, number, &mut held),
         ) {
             pairs.push((first, second));
         }
     }
+    held.list(problems);
     pairs
 }
 
 /// `icons` and `generic-icons`: `type:icon-name`.
-fn parse_icons(
-    path: &Path,
-    bytes: &[u8],
-    diagnostics: &mut Vec<Diagnostic>,
-) -> Vec<(MimeType, String)> {
-    let mut found = Vec::new();
-    for (number, line) in lines(path, bytes, diagnostics) {
-        found.push((number, line.split_once(':')));
-    }
+fn parse_icons(bytes: &[u8], problems: &mut Problems<'_>) -> Vec<(MimeType, String)> {
     let mut icons = Vec::new();
-    for (number, split) in found {
-        match split {
+    let mut held = Held::new();
+    for (number, line) in lines(bytes, problems) {
+        match line.split_once(':') {
             Some((mime_text, icon)) if !icon.is_empty() => {
-                if let Some(mime) = mime(mime_text, path, number, diagnostics) {
+                if let Some(mime) = mime(mime_text, number, &mut held) {
                     icons.push((mime, icon.to_owned()));
                 }
             }
-            _ => diagnostics.push(Diagnostic::new(
-                path,
-                Some(Location::Line(number)),
-                "no icon name, line skipped",
-            )),
+            _ => held.report(number, "no icon name, line skipped"),
         }
     }
+    held.list(problems);
     icons
 }
 
 /// `XMLnamespaces`: `namespaceURI localName type`, the local name possibly
 /// empty (two spaces).
-fn parse_namespaces(
-    path: &Path,
-    bytes: &[u8],
-    diagnostics: &mut Vec<Diagnostic>,
-) -> Vec<(String, String, MimeType)> {
-    let mut found = Vec::new();
-    for (number, line) in lines(path, bytes, diagnostics) {
-        let mut fields = line.splitn(3, ' ');
-        found.push((number, (fields.next(), fields.next(), fields.next())));
-    }
+fn parse_namespaces(bytes: &[u8], problems: &mut Problems<'_>) -> Vec<(String, String, MimeType)> {
     let mut namespaces = Vec::new();
-    for (number, fields) in found {
-        match fields {
+    let mut held = Held::new();
+    for (number, line) in lines(bytes, problems) {
+        let mut fields = line.splitn(3, ' ');
+        match (fields.next(), fields.next(), fields.next()) {
             (Some(namespace), Some(local), Some(mime_text))
                 if !(namespace.is_empty() && local.is_empty()) =>
             {
-                if let Some(mime) = mime(mime_text, path, number, diagnostics) {
+                if let Some(mime) = mime(mime_text, number, &mut held) {
                     namespaces.push((namespace.to_owned(), local.to_owned(), mime));
                 }
             }
-            _ => diagnostics.push(Diagnostic::new(
-                path,
-                Some(Location::Line(number)),
-                "not three fields, line skipped",
-            )),
+            _ => held.report(number, "not three fields, line skipped"),
         }
     }
+    held.list(problems);
     namespaces
 }
 
 /// `types`: one type per line (written by `update-mime-database`, not
 /// defined by the spec).
-fn parse_types(path: &Path, bytes: &[u8], diagnostics: &mut Vec<Diagnostic>) -> Vec<MimeType> {
-    let found: Vec<(usize, &str)> = lines(path, bytes, diagnostics);
+fn parse_types(bytes: &[u8], problems: &mut Problems<'_>) -> Vec<MimeType> {
     let mut types = Vec::new();
-    for (number, line) in found {
-        if let Some(mime) = mime(line, path, number, diagnostics) {
+    let mut held = Held::new();
+    for (number, line) in lines(bytes, problems) {
+        if let Some(mime) = mime(line, number, &mut held) {
             types.push(mime);
         }
     }
+    held.list(problems);
     types
 }
 
@@ -397,6 +374,17 @@ impl Cursor<'_> {
         }
     }
 
+    /// A magic line's start, `[indent] ">"`: the nesting depth, or `None`
+    /// if the line does not start that way.
+    fn indent(&mut self) -> Option<usize> {
+        let indent = if self.peek() == Some(b'>') {
+            0
+        } else {
+            self.number()? as usize
+        };
+        self.eat(b'>').then_some(indent)
+    }
+
     /// A section header `[priority:type]\n`.
     fn section(&mut self) -> Option<(u32, String)> {
         if !self.eat(b'[') {
@@ -419,74 +407,180 @@ impl Cursor<'_> {
     }
 }
 
-/// Places `item` at nesting depth `indent` under the last item of each
-/// shallower level. `false` if the depth skips a level.
-fn place<T>(
-    roots: &mut Vec<T>,
-    indent: usize,
-    item: T,
-    children: fn(&mut T) -> &mut Vec<T>,
-) -> bool {
-    let mut level = roots;
-    for _ in 0..indent {
-        let Some(last) = level.last_mut() else {
-            return false;
-        };
-        level = children(last);
+/// A magic or tree magic test that holds nested tests.
+trait Nested: Sized {
+    fn children(&mut self) -> &mut Vec<Self>;
+}
+
+impl Nested for Matchlet {
+    fn children(&mut self) -> &mut Vec<Self> {
+        &mut self.children
     }
-    level.push(item);
-    true
+}
+
+impl Nested for TreeMatchlet {
+    fn children(&mut self) -> &mut Vec<Self> {
+        &mut self.children
+    }
+}
+
+/// A whole line that later lines may still go under.
+struct Open<T> {
+    item: T,
+    /// Whether a line directly under it was skipped, or dropped.
+    lost: bool,
+}
+
+/// The lines of one `magic` or `treemagic` section, nested.
+///
+/// A damaged test fails closed. If all its nested lines were skipped,
+/// the test is dropped: keeping it alone would match more than the rule
+/// allows. This applies recursively to its parents. A test with some
+/// surviving nested lines is kept.
+///
+/// Only the last line at each level can accept more nested lines, so only
+/// those lines are kept open. A skipped line leaves only a flag behind.
+struct Section<T> {
+    /// Where the section header starts.
+    at: usize,
+    /// The finished top-level tests.
+    kept: Vec<T>,
+    /// The last whole line of each level, from the top.
+    open: Vec<Open<T>>,
+    /// Whether the last line of known depth was skipped, under the
+    /// deepest open line: deeper lines go with it.
+    lost_last: bool,
+    /// Whether a line was placed whole.
+    placed: bool,
+    /// Whether a skipped line's depth is unknown, and so where any line
+    /// belongs.
+    unknown_depth: bool,
+}
+
+impl<T: Nested> Section<T> {
+    fn new(at: usize) -> Self {
+        Self {
+            at,
+            kept: Vec::new(),
+            open: Vec::new(),
+            lost_last: false,
+            placed: false,
+            unknown_depth: false,
+        }
+    }
+
+    /// Places `item` (`None`: a skipped line, already reported) at nesting
+    /// depth `indent` (`None`: unknown) under the last line of each
+    /// shallower level. A line below a skipped line goes with it, without
+    /// a diagnostic of its own.
+    ///
+    /// Returns the problem to report when `item` skips a level or is too
+    /// deep: it is then skipped, under the deepest line it reaches.
+    fn place(&mut self, indent: Option<usize>, item: Option<T>) -> Option<&'static str> {
+        let Some(indent) = indent else {
+            self.unknown_depth = true;
+            return None;
+        };
+        let depth = indent.min(self.open.len());
+        if depth < indent && self.lost_last {
+            return None;
+        }
+        self.close(depth);
+        let fits = depth == indent && indent <= MAX_DEPTH;
+        let whole = item.is_some();
+        if let Some(item) = item.filter(|_| fits) {
+            self.open.push(Open { item, lost: false });
+            self.lost_last = false;
+            self.placed = true;
+        } else {
+            if let Some(parent) = self.open.last_mut() {
+                parent.lost = true;
+            }
+            self.lost_last = true;
+        }
+        (whole && !fits).then_some("nesting skips a level or is too deep, line skipped")
+    }
+
+    /// Finishes the open lines at `depth` and below, deepest first: each
+    /// goes under the line above it, or is dropped if it lost all its
+    /// nested lines.
+    fn close(&mut self, depth: usize) {
+        while self.open.len() > depth
+            && let Some(Open { mut item, lost }) = self.open.pop()
+        {
+            let keep = !(lost && item.children().is_empty());
+            match (self.open.last_mut(), keep) {
+                (Some(parent), true) => parent.item.children().push(item),
+                (Some(parent), false) => parent.lost = true,
+                (None, true) => self.kept.push(item),
+                (None, false) => {}
+            }
+        }
+    }
+
+    /// The tests left whole. A section that had some and is left with none
+    /// is reported.
+    fn finish(mut self, problems: &mut Problems<'_>) -> Vec<T> {
+        self.close(0);
+        let (kept, message) = if self.unknown_depth {
+            (
+                Vec::new(),
+                "a skipped line of unknown depth, section skipped",
+            )
+        } else {
+            (
+                self.kept,
+                "no test left whole (one lost all its nested lines), section skipped",
+            )
+        };
+        if self.placed && kept.is_empty() {
+            problems.report(Some(Location::Offset(self.at)), message);
+        }
+        kept
+    }
 }
 
 /// The `magic` file.
-fn parse_magic(path: &Path, bytes: &[u8], folder: &mut Folder, diagnostics: &mut Vec<Diagnostic>) {
+fn parse_magic(bytes: &[u8], folder: &mut Folder, problems: &mut Problems<'_>) {
     const HEADER: &[u8] = b"MIME-Magic\0\n";
-    let report = |diagnostics: &mut Vec<Diagnostic>, at: usize, message: &str| {
-        diagnostics.push(Diagnostic::new(path, Some(Location::Offset(at)), message));
+    let report = |problems: &mut Problems<'_>, at: usize, message: &str| {
+        problems.report(Some(Location::Offset(at)), message);
     };
     let Some(body) = bytes.strip_prefix(HEADER) else {
-        report(diagnostics, 0, "no MIME-Magic header, file skipped");
+        report(problems, 0, "no MIME-Magic header, file skipped");
         return;
     };
     let mut cursor = Cursor { bytes: body, at: 0 };
-    let mut rule: Option<MagicRule> = None;
-    let finish = |rule: Option<MagicRule>, folder: &mut Folder| {
-        let Some(mut rule) = rule else { return };
-        let marker = |matchlet: &Matchlet| {
-            matchlet.start == 0 && matchlet.value == NO_MAGIC && matchlet.children.is_empty()
-        };
-        if rule.matchlets.iter().any(marker) {
-            folder.no_magic.push(rule.mime.clone());
-            rule.matchlets.retain(|matchlet| !marker(matchlet));
-        }
-        if !rule.matchlets.is_empty() {
-            folder.magic.push(rule);
+    let mut rule: Option<(MagicRule, Section<Matchlet>)> = None;
+    let finish = |rule: Option<(MagicRule, Section<Matchlet>)>,
+                  folder: &mut Folder,
+                  problems: &mut Problems<'_>| {
+        if let Some((mut rule, section)) = rule {
+            rule.matchlets = section.finish(problems);
+            add_magic_rule(rule, folder);
         }
     };
     while cursor.peek().is_some() {
         let line_start = cursor.at + HEADER.len();
         if cursor.peek() == Some(b'[') {
-            finish(rule.take(), folder);
+            finish(rule.take(), folder, problems);
             if let Some((priority, mime)) = cursor.section() {
                 match MimeType::new(&mime) {
                     Ok(mime) => {
-                        rule = Some(MagicRule {
+                        let found = MagicRule {
                             priority: priority.min(100),
                             mime,
                             matchlets: Vec::new(),
-                        });
+                        };
+                        rule = Some((found, Section::new(line_start)));
                     }
                     Err(err) => {
-                        report(diagnostics, line_start, &format!("{err}, section skipped"));
+                        report(problems, line_start, &format!("{err}, section skipped"));
                         rule = None;
                     }
                 }
             } else {
-                report(
-                    diagnostics,
-                    line_start,
-                    "bad section header, section skipped",
-                );
+                report(problems, line_start, "bad section header, section skipped");
                 rule = None;
                 // Skip to the next section header.
                 while cursor.peek().is_some_and(|byte| byte != b'[') {
@@ -495,38 +589,57 @@ fn parse_magic(path: &Path, bytes: &[u8], folder: &mut Folder, diagnostics: &mut
             }
             continue;
         }
-        match parse_matchlet(&mut cursor) {
-            Ok((indent, matchlet)) => {
-                if let Some(rule) = &mut rule
-                    && (indent > MAX_DEPTH
-                        || !place(&mut rule.matchlets, indent, matchlet, |m| &mut m.children))
+        let indent = cursor.indent();
+        let parsed = if indent.is_some() {
+            parse_matchlet(&mut cursor)
+        } else {
+            Err(Skip::Line)
+        };
+        let section = rule.as_mut().map(|(_, section)| section);
+        match parsed {
+            Ok(matchlet) => {
+                if let Some(problem) =
+                    section.and_then(|section| section.place(indent, Some(matchlet)))
                 {
-                    report(
-                        diagnostics,
-                        line_start,
-                        "nesting skips a level or is too deep, line skipped",
-                    );
+                    report(problems, line_start, problem);
                 }
             }
-            Err(Skip::Line) => {
+            Err(skip) => {
+                if let Some(section) = section {
+                    section.place(indent, None);
+                }
+                if let Skip::Rest = skip {
+                    report(
+                        problems,
+                        line_start,
+                        "truncated value, rest of file skipped",
+                    );
+                    break;
+                }
                 report(
-                    diagnostics,
+                    problems,
                     line_start,
                     "unknown or malformed field, line skipped",
                 );
                 cursor.skip_line();
             }
-            Err(Skip::Rest) => {
-                report(
-                    diagnostics,
-                    line_start,
-                    "truncated value, rest of file skipped",
-                );
-                break;
-            }
         }
     }
-    finish(rule, folder);
+    finish(rule, folder, problems);
+}
+
+/// Adds `rule` to `folder`, its `__NOMAGIC__` marker as a deletion.
+fn add_magic_rule(mut rule: MagicRule, folder: &mut Folder) {
+    let marker = |matchlet: &Matchlet| {
+        matchlet.start == 0 && matchlet.value == NO_MAGIC && matchlet.children.is_empty()
+    };
+    if rule.matchlets.iter().any(marker) {
+        folder.no_magic.push(rule.mime.clone());
+        rule.matchlets.retain(|matchlet| !marker(matchlet));
+    }
+    if !rule.matchlets.is_empty() {
+        folder.magic.push(rule);
+    }
 }
 
 enum Skip {
@@ -536,16 +649,9 @@ enum Skip {
     Rest,
 }
 
-/// `[indent] ">" start "=" len value ["&" mask] ["~" word-size] ["+" range] "\n"`
-fn parse_matchlet(cursor: &mut Cursor<'_>) -> Result<(usize, Matchlet), Skip> {
-    let indent = if cursor.peek() == Some(b'>') {
-        0
-    } else {
-        cursor.number().ok_or(Skip::Line)? as usize
-    };
-    if !cursor.eat(b'>') {
-        return Err(Skip::Line);
-    }
+/// After the indent (see [`Cursor::indent`]): `start "=" len value ["&"
+/// mask] ["~" word-size] ["+" range] "\n"`
+fn parse_matchlet(cursor: &mut Cursor<'_>) -> Result<Matchlet, Skip> {
     let start = cursor.number().ok_or(Skip::Line)?;
     if !cursor.eat(b'=') {
         return Err(Skip::Line);
@@ -569,60 +675,54 @@ fn parse_matchlet(cursor: &mut Cursor<'_>) -> Result<(usize, Matchlet), Skip> {
         // An unknown field: the spec says to ignore the whole line.
         return Err(Skip::Line);
     }
-    Ok((
-        indent,
-        Matchlet {
-            start,
-            range,
-            word_size,
-            value,
-            mask,
-            children: Vec::new(),
-        },
-    ))
+    Ok(Matchlet {
+        start,
+        range,
+        word_size,
+        value,
+        mask,
+        children: Vec::new(),
+    })
 }
 
 /// The `treemagic` file.
-fn parse_treemagic(
-    path: &Path,
-    bytes: &[u8],
-    folder: &mut Folder,
-    diagnostics: &mut Vec<Diagnostic>,
-) {
+fn parse_treemagic(bytes: &[u8], folder: &mut Folder, problems: &mut Problems<'_>) {
     const HEADER: &[u8] = b"MIME-TreeMagic\0\n";
-    let report = |diagnostics: &mut Vec<Diagnostic>, at: usize, message: &str| {
-        diagnostics.push(Diagnostic::new(path, Some(Location::Offset(at)), message));
+    let report = |problems: &mut Problems<'_>, at: usize, message: &str| {
+        problems.report(Some(Location::Offset(at)), message);
     };
     let Some(body) = bytes.strip_prefix(HEADER) else {
-        report(diagnostics, 0, "no MIME-TreeMagic header, file skipped");
+        report(problems, 0, "no MIME-TreeMagic header, file skipped");
         return;
     };
     let mut cursor = Cursor { bytes: body, at: 0 };
-    let mut rule: Option<TreeRule> = None;
-    let finish = |rule: Option<TreeRule>, folder: &mut Folder| {
-        if let Some(rule) = rule.filter(|rule| !rule.matchlets.is_empty()) {
-            folder.tree.push(rule);
+    let mut rule: Option<(TreeRule, Section<TreeMatchlet>)> = None;
+    let finish = |rule: Option<(TreeRule, Section<TreeMatchlet>)>,
+                  folder: &mut Folder,
+                  problems: &mut Problems<'_>| {
+        if let Some((mut rule, section)) = rule {
+            rule.matchlets = section.finish(problems);
+            if !rule.matchlets.is_empty() {
+                folder.tree.push(rule);
+            }
         }
     };
     while cursor.peek().is_some() {
         let line_start = cursor.at + HEADER.len();
         if cursor.peek() == Some(b'[') {
-            finish(rule.take(), folder);
+            finish(rule.take(), folder, problems);
             if let Some((priority, Ok(mime))) = cursor
                 .section()
                 .map(|(priority, mime)| (priority, MimeType::new(&mime)))
             {
-                rule = Some(TreeRule {
+                let found = TreeRule {
                     priority: priority.min(100),
                     mime,
                     matchlets: Vec::new(),
-                });
+                };
+                rule = Some((found, Section::new(line_start)));
             } else {
-                report(
-                    diagnostics,
-                    line_start,
-                    "bad section header, section skipped",
-                );
+                report(problems, line_start, "bad section header, section skipped");
                 rule = None;
                 cursor.skip_line();
                 while cursor.peek().is_some_and(|byte| byte != b'[') {
@@ -637,30 +737,24 @@ fn parse_treemagic(
             .map_or(body.len(), |newline| cursor.at + newline);
         let line = &body[cursor.at..line_end];
         cursor.at = (line_end + 1).min(body.len());
-        match parse_tree_line(line) {
-            Some((_, matchlet)) if leaves_root(&matchlet.path) => {
-                report(
-                    diagnostics,
-                    line_start,
-                    "rule path leaves the volume root (`..` or a leading `/`), line skipped",
-                );
+        let (indent, matchlet) = parse_tree_line(line);
+        let problem = match &matchlet {
+            None => Some("malformed line, skipped"),
+            Some(matchlet) if leaves_root(&matchlet.path) => {
+                Some("rule path leaves the volume root (`..` or a leading `/`), line skipped")
             }
-            Some((indent, matchlet)) => {
-                if let Some(rule) = &mut rule
-                    && (indent > MAX_DEPTH
-                        || !place(&mut rule.matchlets, indent, matchlet, |m| &mut m.children))
-                {
-                    report(
-                        diagnostics,
-                        line_start,
-                        "nesting skips a level or is too deep, line skipped",
-                    );
-                }
-            }
-            None => report(diagnostics, line_start, "malformed line, skipped"),
+            Some(_) => None,
+        };
+        if let Some(problem) = problem {
+            report(problems, line_start, problem);
+        }
+        if let Some((_, section)) = &mut rule
+            && let Some(problem) = section.place(indent, matchlet.filter(|_| problem.is_none()))
+        {
+            report(problems, line_start, problem);
         }
     }
-    finish(rule, folder);
+    finish(rule, folder, problems);
 }
 
 /// Whether a tree magic rule path could reach outside the volume root.
@@ -668,15 +762,26 @@ fn leaves_root(path: &str) -> bool {
     path.starts_with('/') || path.split('/').any(|component| component == "..")
 }
 
-/// `[indent] ">" "\"" path "\"" "=" type ["," option]*`
-fn parse_tree_line(line: &[u8]) -> Option<(usize, TreeMatchlet)> {
-    let line = std::str::from_utf8(line).ok()?;
-    let (indent, rest) = line.split_once('>')?;
-    let indent = if indent.is_empty() {
-        0
-    } else {
-        indent.parse().ok()?
+/// `[indent] ">" "\"" path "\"" "=" type ["," option]*`: the nesting
+/// depth, if the line starts with one, and the matchlet, if the line is
+/// well-formed.
+fn parse_tree_line(line: &[u8]) -> (Option<usize>, Option<TreeMatchlet>) {
+    let Some(close) = line.iter().position(|&byte| byte == b'>') else {
+        return (None, None);
     };
+    let indent = match &line[..close] {
+        [] => Some(0),
+        digits => std::str::from_utf8(digits)
+            .ok()
+            .and_then(|digits| digits.parse().ok()),
+    };
+    let matchlet = indent.and_then(|_| parse_tree_matchlet(&line[close + 1..]));
+    (indent, matchlet)
+}
+
+/// After the indent: `"\"" path "\"" "=" type ["," option]*`
+fn parse_tree_matchlet(rest: &[u8]) -> Option<TreeMatchlet> {
+    let rest = std::str::from_utf8(rest).ok()?;
     let rest = rest.strip_prefix('"')?;
     let (path, rest) = rest.split_once('"')?;
     let rest = rest.strip_prefix('=')?;
@@ -705,7 +810,7 @@ fn parse_tree_line(line: &[u8]) -> Option<(usize, TreeMatchlet)> {
             mime => matchlet.mimetype = Some(MimeType::new(mime).ok()?),
         }
     }
-    Some((indent, matchlet))
+    Some(matchlet)
 }
 
 #[cfg(test)]
@@ -805,6 +910,24 @@ mod tests {
     }
 
     #[test]
+    fn glob_problems_are_listed_by_kind_then_by_line() {
+        // Lines that are not UTF-8 first, then bad fields, then bad types
+        // and patterns.
+        let (_, diagnostics) = folder_from(
+            "globs2",
+            b"50:text/plain:\nx\n\xff\n50:notatype:*.c\ny:text/plain:*.d\n",
+        );
+        let lines: Vec<_> = diagnostics
+            .iter()
+            .map(|d| match d.location {
+                Some(Location::Line(line)) => line,
+                _ => 0,
+            })
+            .collect();
+        assert_eq!(lines, [3, 2, 5, 1, 4], "{diagnostics:?}");
+    }
+
+    #[test]
     fn the_spec_magic_example_is_read() {
         let bytes = b"MIME-Magic\0\n[50:text/x-diff]\n>0=\x00\x05diff\t\n>0=\x00\x04***\t\n>0=\x00\x17Common subdirectories: \n";
         let (folder, diagnostics) = folder_from("magic", bytes);
@@ -842,8 +965,9 @@ mod tests {
 
     #[test]
     fn broken_magic_is_skipped_in_parts() {
-        // An unknown field, a level skipped, a truncated value.
-        let bytes = b"MIME-Magic\0\n[50:a/b]\n>0=\x00\x01A?junk\n>0=\x00\x01B\n3>1=\x00\x01C\n>0=\x00\x09short";
+        // A level skipped, an unknown field, a truncated value. (A line that
+        // skips a level below `B` would drop `B`, its only nested line lost.)
+        let bytes = b"MIME-Magic\0\n[50:a/b]\n3>1=\x00\x01C\n>0=\x00\x01A?junk\n>0=\x00\x01B\n>0=\x00\x09short";
         let (folder, diagnostics) = folder_from("magic", bytes);
         assert_eq!(folder.magic[0].matchlets.len(), 1);
         assert_eq!(folder.magic[0].matchlets[0].value, b"B");
@@ -910,6 +1034,43 @@ mod tests {
         let child = &top.children[0];
         assert!(child.executable && child.match_case);
         assert_eq!(child.mimetype, Some(m("image/jpeg")));
+    }
+
+    #[test]
+    fn a_file_lists_a_limited_number_of_problems() {
+        let limit = crate::read::MAX_DIAGNOSTICS;
+        for (name, header, line) in [
+            ("globs2", &b""[..], &b"x\n"[..]),
+            ("globs", b"", b"x\n"),
+            ("magic", b"MIME-Magic\0\n", b">\n"),
+            ("treemagic", b"MIME-TreeMagic\0\n", b"x\n"),
+            ("aliases", b"", b"x\n"),
+            ("subclasses", b"", b"x\n"),
+            ("icons", b"", b"x\n"),
+            ("generic-icons", b"", b"x\n"),
+            ("XMLnamespaces", b"", b"x\n"),
+            ("types", b"", b"x\n"),
+        ] {
+            let mut bytes = header.to_vec();
+            for _ in 0..3 * limit {
+                bytes.extend_from_slice(line);
+            }
+            let (_, diagnostics) = folder_from(name, &bytes);
+            assert_eq!(diagnostics.len(), limit + 1, "{name}");
+            assert!(
+                diagnostics[..limit]
+                    .iter()
+                    .all(|diagnostic| diagnostic.location.is_some()),
+                "{name}: {diagnostics:?}"
+            );
+            let last = &diagnostics[limit];
+            assert_eq!(last.location, None, "{name}");
+            assert_eq!(
+                last.message,
+                format!("more than {limit} problems; the rest are not listed"),
+                "{name}"
+            );
+        }
     }
 
     #[test]

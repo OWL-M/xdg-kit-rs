@@ -10,7 +10,7 @@ use std::sync::Arc;
 use common::Fixture;
 use xdg_kit_desktop_entry::{AppIndex, Launch, LaunchOptions, Target};
 use xdg_kit_mime::{MimeDatabase, MimeType};
-use xdg_kit_mime_apps::{Matched, MimeAppsList, OpenError, TypePattern, open_plan};
+use xdg_kit_mime_apps::{Matched, MediaType, MimeAppsList, OpenError, TypePattern, open_plan};
 
 fn m(text: &str) -> MimeType {
     MimeType::new(text).unwrap()
@@ -150,6 +150,112 @@ fn a_config_folder_that_is_an_applications_folder_keeps_its_apps() {
 }
 
 #[test]
+fn a_config_home_that_is_an_applications_folder_lists_its_apps_later() {
+    // Its desktop files count where the data levels are, so a removal in
+    // $XDG_CONFIG_DIRS reaches them.
+    let mut fixture = Fixture::new();
+    fixture.folders = vec![("XDG_CONFIG_HOME", "local/applications")];
+    fixture.app(
+        "local/applications",
+        "xkt-a.desktop",
+        "text/x-xkt-plain;",
+        "",
+    );
+    fixture.app(
+        "share1/applications",
+        "xkt-b.desktop",
+        "text/x-xkt-plain;",
+        "",
+    );
+    fixture.write(
+        "etc/mimeapps.list",
+        "[Removed Associations]\ntext/x-xkt-plain=xkt-a.desktop;\n",
+    );
+    assert_eq!(ids(&fixture, "text/x-xkt-plain"), ["xkt-b.desktop"]);
+    assert_eq!(
+        fixture
+            .mime_apps()
+            .default_for(&m("text/x-xkt-plain"))
+            .unwrap()
+            .id(),
+        "xkt-b.desktop"
+    );
+}
+
+#[test]
+fn a_config_dir_that_is_an_applications_folder_lists_its_apps_later() {
+    // The data home comes before the data dirs, wherever the config dirs
+    // point.
+    let mut fixture = Fixture::new();
+    fixture.folders = vec![("XDG_CONFIG_DIRS", "share1/applications")];
+    fixture.app(
+        "local/applications",
+        "xkt-local.desktop",
+        "text/x-xkt-plain;",
+        "",
+    );
+    fixture.app(
+        "share1/applications",
+        "xkt-share.desktop",
+        "text/x-xkt-plain;",
+        "",
+    );
+    assert_eq!(
+        ids(&fixture, "text/x-xkt-plain"),
+        ["xkt-local.desktop", "xkt-share.desktop"]
+    );
+    let apps = fixture.mime_apps();
+    assert_eq!(
+        apps.default_for(&m("text/x-xkt-plain")).unwrap().id(),
+        "xkt-local.desktop"
+    );
+    let share1 = fixture.path("share1/applications/mimeapps.list");
+    assert_eq!(
+        apps.files().iter().filter(|file| **file == share1).count(),
+        1,
+        "the file is read once: {:?}",
+        apps.files()
+    );
+}
+
+#[test]
+fn an_applications_folder_listed_again_counts_once() {
+    // The config home is the data home's applications folder, and the data
+    // dirs list the data home again: the folder is one data level, and an
+    // index without it is reported once.
+    let mut fixture = Fixture::new();
+    fixture.folders = vec![("XDG_CONFIG_HOME", "local/applications")];
+    fixture.prepended = vec![("XDG_DATA_DIRS", "local")];
+    fixture.app(
+        "local/applications",
+        "xkt-local.desktop",
+        "text/x-xkt-plain;",
+        "",
+    );
+    fixture.app(
+        "share1/applications",
+        "xkt-share.desktop",
+        "text/x-xkt-plain;",
+        "",
+    );
+    let apps = fixture.mime_apps_with(AppIndex::from_dirs(
+        fixture.applications().into_iter().skip(1),
+    ));
+    let missing = apps
+        .diagnostics()
+        .iter()
+        .filter(|found| found.message.contains("not in the AppIndex"))
+        .count();
+    assert_eq!(missing, 1, "{:?}", apps.diagnostics());
+    let found: Vec<String> = apps
+        .apps_for(&m("text/x-xkt-plain"))
+        .into_iter()
+        .map(|found| found.app.id().to_owned())
+        .collect();
+    assert_eq!(found, ["xkt-share.desktop"]);
+}
+
+#[test]
 fn matches_say_how_they_matched() {
     let fixture = Fixture::new();
     fixture.app(
@@ -188,7 +294,7 @@ fn matches_say_how_they_matched() {
             ),
             (
                 "xkt-text.desktop".into(),
-                Matched::Wildcard(TypePattern::Media("text".into()))
+                Matched::Wildcard(TypePattern::Media(MediaType::new("text").unwrap()))
             ),
             (
                 "xkt-data.desktop".into(),
@@ -244,7 +350,7 @@ fn any_data_stays_below_the_media_wildcard_when_aliased() {
         [
             (
                 "xkt-image.desktop".into(),
-                Matched::Wildcard(TypePattern::Media("image".into()))
+                Matched::Wildcard(TypePattern::Media(MediaType::new("image").unwrap()))
             ),
             (
                 "xkt-data.desktop".into(),
@@ -297,6 +403,67 @@ fn problems_in_list_files_reach_the_snapshot() {
     assert_eq!(messages.len(), 1, "{messages:?}");
     assert!(
         messages[0].contains("config/mimeapps.list:2: "),
+        "{messages:?}"
+    );
+}
+
+/// Makes a FIFO at `path`.
+#[cfg(not(target_vendor = "apple"))]
+fn fifo(path: &std::path::Path) {
+    rustix::fs::mknodat(
+        rustix::fs::CWD,
+        path,
+        rustix::fs::FileType::Fifo,
+        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        0,
+    )
+    .unwrap();
+}
+
+/// Runs `f` in a thread and returns its result. If a FIFO blocks the
+/// read, the test fails after `timeout`.
+#[cfg(not(target_vendor = "apple"))]
+fn within<T: Send + 'static>(
+    timeout: std::time::Duration,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> T {
+    let (send, receive) = std::sync::mpsc::channel();
+    std::thread::spawn(move || send.send(f()));
+    receive.recv_timeout(timeout).expect("it returns in time")
+}
+
+#[cfg(not(target_vendor = "apple"))]
+#[test]
+fn a_fifo_list_file_is_reported_not_waited_on() {
+    let fixture = Fixture::new();
+    fs::create_dir_all(fixture.path("config")).unwrap();
+    fifo(&fixture.path("config/mimeapps.list"));
+    let messages = within(std::time::Duration::from_secs(10), move || {
+        let apps = fixture.mime_apps();
+        apps.diagnostics()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<String>>()
+    });
+    assert_eq!(messages.len(), 1, "{messages:?}");
+    assert!(
+        messages[0].contains("config/mimeapps.list: cannot be read"),
+        "{messages:?}"
+    );
+}
+
+#[test]
+fn problems_in_list_files_see_aliases() {
+    let fixture = Fixture::new();
+    fixture.write(
+        "config/mimeapps.list",
+        "[Added Associations]\ntext/x-xkt-alias=xkt-a.desktop;\n[Removed Associations]\ntext/x-xkt-src=xkt-a.desktop;\n",
+    );
+    let apps = fixture.mime_apps();
+    let messages: Vec<String> = apps.diagnostics().iter().map(ToString::to_string).collect();
+    assert_eq!(messages.len(), 1, "{messages:?}");
+    assert!(
+        messages[0].contains("both added and removed"),
         "{messages:?}"
     );
 }
@@ -393,6 +560,36 @@ fn only_applications_are_associated() {
 }
 
 #[test]
+fn a_file_of_unknown_type_does_not_hold_its_id() {
+    // The index ignores the higher file, so the lower one is the ID's file,
+    // with its `MimeType=` and the lower level's added association. GLib
+    // counts every file name in a folder, so the higher file would hide
+    // both there; ignoring it is deliberate (decision 21).
+    let fixture = Fixture::new();
+    fixture.write(
+        "share1/applications/xkt-foo.desktop",
+        "[Desktop Entry]\nType=Service\nName=S\nMimeType=text/x-xkt-plain;\n",
+    );
+    fixture.app(
+        "share2/applications",
+        "xkt-foo.desktop",
+        "text/x-xkt-plain;",
+        "",
+    );
+    fixture.write(
+        "share2/applications/mimeapps.list",
+        "[Added Associations]\ntext/x-xkt-foo=xkt-foo.desktop;\n",
+    );
+    let apps = fixture.mime_apps();
+    let lower = fixture.path("share2/applications/xkt-foo.desktop");
+    for mime in ["text/x-xkt-plain", "text/x-xkt-foo"] {
+        let found = apps.apps_for(&m(mime));
+        let paths: Vec<_> = found.iter().map(|found| found.app.path()).collect();
+        assert_eq!(paths, [lower.as_path()], "{mime}");
+    }
+}
+
+#[test]
 fn a_url_scheme_has_only_its_own_handlers() {
     let fixture = Fixture::new();
     let dir = "share1/applications";
@@ -409,7 +606,9 @@ fn a_url_scheme_has_only_its_own_handlers() {
         found,
         [(
             "xkt-urls.desktop".into(),
-            Matched::Wildcard(TypePattern::Media("x-scheme-handler".into()))
+            Matched::Wildcard(TypePattern::Media(
+                MediaType::new("x-scheme-handler").unwrap()
+            ))
         )]
     );
     fs::remove_file(fixture.path("share1/applications/xkt-urls.desktop")).unwrap();
@@ -423,6 +622,90 @@ fn a_url_scheme_has_only_its_own_handlers() {
         ),
         Err(OpenError::NoApplication(_))
     ));
+}
+
+#[test]
+fn a_link_is_followed_when_desktop_entries_are_an_alias() {
+    // Detection gives the canonical type, which the database may name
+    // differently.
+    let fixture = Fixture::new();
+    fixture.add_types(
+        "aliased",
+        r#"<?xml version="1.0"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-xkt-desktop">
+    <alias type="application/x-desktop"/>
+    <glob pattern="*.desktop"/>
+  </mime-type>
+</mime-info>
+"#,
+    );
+    fixture.write(
+        "share1/applications/xkt-web.desktop",
+        "[Desktop Entry]\nType=Application\nName=Web\nExec=true %u\nMimeType=x-scheme-handler/xkt-web;\n",
+    );
+    fixture.write(
+        "files/site.desktop",
+        "[Desktop Entry]\nType=Link\nName=Site\nURL=xkt-web://example.org/\n",
+    );
+    let apps = fixture.mime_apps();
+    let path = fixture.path("files/site.desktop");
+    assert_eq!(
+        apps.mime_database()
+            .type_for_path(&path, &xdg_kit_mime::PathOptions::default())
+            .unwrap()
+            .mime,
+        m("application/x-xkt-desktop")
+    );
+    let plan = open_plan(&Target::Path(path), &apps, &LaunchOptions::default()).unwrap();
+    let Launch::Commands(commands) = plan.launch else {
+        panic!("{plan:?}")
+    };
+    assert_eq!(commands[0].args, ["xkt-web://example.org/"]);
+}
+
+#[test]
+fn a_url_scheme_aliased_to_data_has_only_its_own_handlers() {
+    // A database may make a scheme's type an alias of a data type; the URL
+    // still gets no data application (decision 8).
+    let fixture = Fixture::new();
+    fixture.add_types(
+        "aliased",
+        r#"<?xml version="1.0"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-xkt-web"><alias type="x-scheme-handler/xkt-web"/></mime-type>
+</mime-info>
+"#,
+    );
+    let dir = "share1/applications";
+    fixture.app(dir, "xkt-web.desktop", "x-scheme-handler/xkt-web;", "");
+    fixture.app(dir, "xkt-data.desktop", "application/octet-stream;", "");
+    fixture.app(dir, "xkt-all.desktop", "*/*;", "");
+    fixture.app(dir, "xkt-apps.desktop", "application/*;", "");
+    fixture.app(dir, "xkt-urls.desktop", "x-scheme-handler/*;", "");
+    let apps = fixture.mime_apps();
+    assert_eq!(
+        apps.mime_database()
+            .canonical(&m("x-scheme-handler/xkt-web")),
+        m("application/x-xkt-web")
+    );
+    let found: Vec<(String, Matched)> = apps
+        .apps_for(&m("x-scheme-handler/xkt-web"))
+        .into_iter()
+        .map(|found| (found.app.id().to_owned(), found.matched))
+        .collect();
+    assert_eq!(
+        found,
+        [
+            ("xkt-web.desktop".into(), Matched::Exact),
+            (
+                "xkt-urls.desktop".into(),
+                Matched::Wildcard(TypePattern::Media(
+                    MediaType::new("x-scheme-handler").unwrap()
+                ))
+            ),
+        ]
+    );
 }
 
 #[test]

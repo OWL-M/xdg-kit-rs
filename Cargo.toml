@@ -9,6 +9,7 @@ rust-version = "1.98"
 license = "Apache-2.0"
 
 [workspace.dependencies]
+libc = "0.2.190"
 mime = "0.3"
 quick-xml = "0.42"
 rustix = { version = "1.1", default-features = false, features = ["std", "process"] }

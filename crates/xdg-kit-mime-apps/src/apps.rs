@@ -12,7 +12,7 @@ use xdg_kit_desktop_entry::{AppEntry, AppIndex, Desktops, EntryType};
 use xdg_kit_mime::{MimeDatabase, MimeType};
 
 use crate::list::{Group, MIMEAPPS_LIST, MimeAppsList};
-use crate::{Diagnostic, TypePattern};
+use crate::{Diagnostic, MediaType, TypePattern};
 
 /// How an application matched a type.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,6 +43,9 @@ struct LevelPlace {
     desktop_specific: bool,
     /// The `applications` folder it sits in, for the data levels.
     applications: Option<PathBuf>,
+    /// Whether the file is read here: not at the later place of a folder
+    /// that is both a config folder and an `applications` folder.
+    read: bool,
 }
 
 /// One `mimeapps.list`, read.
@@ -86,9 +89,12 @@ impl MimeApps {
     /// `$XDG_CONFIG_HOME`, each `$XDG_CONFIG_DIRS` folder,
     /// `$XDG_DATA_HOME/applications` and each `$XDG_DATA_DIRS/applications`,
     /// at each one first `$desktop-mimeapps.list` for every name of
-    /// `desktops` (lowercased), then `mimeapps.list`. `apps` should be
-    /// [`AppIndex::load`] of the same `base_dirs`, so that its folders are
-    /// the data levels' `applications` folders.
+    /// `desktops` (lowercased), then `mimeapps.list`. A file reached again
+    /// is read once, where it comes first; a folder that is both a config
+    /// folder and an `applications` folder has its lists read at its config
+    /// place and its desktop files counted at its data place. `apps` should
+    /// be [`AppIndex::load`] of the same `base_dirs`, so that its folders
+    /// are the data levels' `applications` folders.
     #[must_use]
     pub fn load(
         base_dirs: &BaseDirs,
@@ -122,12 +128,14 @@ impl MimeApps {
                     path: dir.join(format!("{name}-{MIMEAPPS_LIST}")),
                     desktop_specific: true,
                     applications: applications.then(|| dir.to_owned()),
+                    read: true,
                 });
             }
             places.push(LevelPlace {
                 path: dir.join(MIMEAPPS_LIST),
                 desktop_specific: false,
                 applications: applications.then(|| dir.to_owned()),
+                read: true,
             });
         };
         add(base_dirs.config_home(), false);
@@ -138,18 +146,25 @@ impl MimeApps {
         for dir in base_dirs.data_dirs() {
             add(&dir.join("applications"), true);
         }
-        // A file reached twice is read once, where it comes first; a config
+        // A file reached twice is read once, where it comes first. A config
         // folder that is also an applications folder keeps its desktop
-        // files there.
+        // files at its data level, as in `GLib`.
         let mut kept: Vec<LevelPlace> = Vec::new();
-        for place in places {
-            match kept.iter_mut().find(|known| known.path == place.path) {
-                Some(known) => {
-                    if known.applications.is_none() {
-                        known.applications = place.applications;
-                    }
-                }
-                None => kept.push(place),
+        for mut place in places {
+            let mut known = kept
+                .iter()
+                .filter(|known| known.path == place.path)
+                .peekable();
+            if known.peek().is_none() {
+                kept.push(place);
+                continue;
+            }
+            if known.all(|known| known.applications.is_none())
+                && place.applications.is_some()
+                && !place.desktop_specific
+            {
+                place.read = false;
+                kept.push(place);
             }
         }
         Self::build(kept, apps, mime, None, setup)
@@ -186,17 +201,22 @@ impl MimeApps {
             }
             let associations = !place.desktop_specific;
             let stamp = FileStamp::of(&place.path);
-            let list = match MimeAppsList::open(&place.path) {
-                Ok(list) => list,
-                Err(err) => {
-                    diagnostics.push(Diagnostic::new(
-                        Some(place.path.clone()),
-                        None,
-                        format!("cannot be read: {err}"),
-                    ));
-                    MimeAppsList::parse(b"", place.desktop_specific)
+            let list = if place.read {
+                match MimeAppsList::open(&place.path) {
+                    Ok(list) => list,
+                    Err(err) => {
+                        diagnostics.push(Diagnostic::new(
+                            Some(place.path.clone()),
+                            None,
+                            format!("cannot be read: {err}"),
+                        ));
+                        MimeAppsList::parse(b"", place.desktop_specific)
+                    }
                 }
-            };
+            } else {
+                MimeAppsList::parse(b"", place.desktop_specific)
+            }
+            .resolving_aliases(Arc::clone(&mime));
             diagnostics.extend(list.diagnostics());
             let read = |group: Group| -> HashMap<TypePattern, Vec<String>> {
                 let mut found: HashMap<TypePattern, Vec<String>> = HashMap::new();
@@ -276,6 +296,7 @@ impl MimeApps {
     pub fn files(&self) -> Vec<&Path> {
         self.levels
             .iter()
+            .filter(|level| level.place.read)
             .map(|level| level.place.path.as_path())
             .collect()
     }
@@ -304,8 +325,9 @@ impl MimeApps {
     /// then `*/*`. At each step the spec's listing algorithm runs over every
     /// `mimeapps.list` and `applications` folder. Each application appears
     /// once, at its most specific match. A URL scheme's type
-    /// (`x-scheme-handler/…`) has only its own handlers and the
-    /// `x-scheme-handler/*` wildcard: a URL is no data.
+    /// (`x-scheme-handler/…`, as asked or as the database names it) has
+    /// only its own handlers and the `x-scheme-handler/*` wildcard: a URL
+    /// is no data.
     #[must_use]
     pub fn apps_for(&self, mime: &MimeType) -> Vec<AppMatch> {
         let mut found = Vec::new();
@@ -405,13 +427,17 @@ impl MimeApps {
     /// The steps from most to least specific.
     fn steps(&self, mime: &MimeType) -> Vec<(TypePattern, Matched)> {
         let canonical = self.mime.canonical(mime);
-        let media = TypePattern::Media(canonical.media().to_ascii_lowercase());
         let mut steps = vec![(TypePattern::Exact(canonical.clone()), Matched::Exact)];
-        if canonical.is_media("x-scheme-handler") {
-            // A URL is no data: its scheme's handlers, or none (decision 8).
-            steps.push((media.clone(), Matched::Wildcard(media)));
+        if mime.is_media("x-scheme-handler") || canonical.is_media("x-scheme-handler") {
+            // A URL is no data: its scheme's handlers, or none (decision 8),
+            // also when the database makes its type an alias of a type of
+            // another media type.
+            let urls =
+                TypePattern::Media(MediaType::new("x-scheme-handler").expect("a valid name"));
+            steps.push((urls.clone(), Matched::Wildcard(urls)));
             return steps;
         }
+        let media = TypePattern::Media(MediaType::new(canonical.media()).expect("a type's media"));
         // As `ancestors` names it: the database may make it an alias.
         let any_data = self
             .mime

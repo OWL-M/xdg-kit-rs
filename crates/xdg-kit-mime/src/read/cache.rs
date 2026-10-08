@@ -7,19 +7,17 @@
 //! loops from offsets that point back into the tree. It also bounds the
 //! bytes copied and time spent finding strings, so reading costs time and
 //! memory in proportion to the file size. Reports at most
-//! [`MAX_DIAGNOSTICS`] problems per file.
+//! [`MAX_DIAGNOSTICS`](super::MAX_DIAGNOSTICS) problems per file.
 
 use std::path::Path;
 
+use super::Problems;
 use crate::model::{Folder, Glob, MAX_DEPTH, MagicRule, Matchlet, NO_GLOBS, NO_MAGIC};
 use crate::{Diagnostic, Location, MimeType};
 
 /// Longest string read from the file. Real patterns, namespace URIs and icon
 /// names are far shorter; the limit bounds the search for each string's end.
 const MAX_STRING: usize = 4096;
-
-/// Problems listed per file before the rest are summed up in one line.
-const MAX_DIAGNOSTICS: usize = 100;
 
 /// The major version this reader understands.
 const MAJOR: u16 = 1;
@@ -46,8 +44,7 @@ impl std::fmt::Display for Unusable {
 
 struct Reader<'a> {
     bytes: &'a [u8],
-    path: &'a Path,
-    diagnostics: &'a mut Vec<Diagnostic>,
+    problems: Problems<'a>,
     /// Nodes and matchlets still allowed to be visited.
     budget: usize,
     /// Bytes still allowed to be copied out of the file. Strings are shared
@@ -57,8 +54,9 @@ struct Reader<'a> {
     byte_budget: usize,
     /// Whether the byte budget has run out (reported once).
     exhausted: bool,
-    /// Problems reported so far.
-    reported: usize,
+    /// Matchlets dropped so far because none of their children could be
+    /// read.
+    childless: usize,
 }
 
 impl Reader<'_> {
@@ -110,20 +108,7 @@ impl Reader<'_> {
     }
 
     fn report(&mut self, at: usize, message: impl Into<String>) {
-        self.reported += 1;
-        match self.reported.cmp(&(MAX_DIAGNOSTICS + 1)) {
-            std::cmp::Ordering::Less => self.diagnostics.push(Diagnostic::new(
-                self.path,
-                Some(Location::Offset(at)),
-                message,
-            )),
-            std::cmp::Ordering::Equal => self.diagnostics.push(Diagnostic::new(
-                self.path,
-                None,
-                format!("more than {MAX_DIAGNOSTICS} problems; the rest are not listed"),
-            )),
-            std::cmp::Ordering::Greater => {}
-        }
+        self.problems.report(Some(Location::Offset(at)), message);
     }
 
     fn mime_at(&mut self, at: usize) -> Option<MimeType> {
@@ -188,12 +173,11 @@ pub(crate) fn read(
     }
     let mut reader = Reader {
         bytes,
-        path,
-        diagnostics,
+        problems: Problems::new(path, diagnostics),
         budget: bytes.len() / 12 + 1,
         byte_budget: bytes.len().saturating_mul(8).saturating_add(64 * 1024),
         exhausted: false,
-        reported: 0,
+        childless: 0,
     };
     if minor > MINOR {
         reader.report(
@@ -410,7 +394,9 @@ fn read_suffix_nodes(
     }
 }
 
-/// `MagicList`: matches with their matchlet trees.
+/// `MagicList`: matches with their matchlet trees. A damaged matchlet fails
+/// closed: one with children of which none could be read is dropped, and
+/// that passes up the tree; a match left with no matchlets is dropped.
 fn read_magic(reader: &mut Reader<'_>, at: usize, folder: &mut Folder) {
     // The header's MAX_EXTENT is not trusted: the extent is worked out from
     // the matchlets read, as for the text files (see `read`).
@@ -442,7 +428,14 @@ fn read_magic(reader: &mut Reader<'_>, at: usize, folder: &mut Folder) {
         let Some(mime) = reader.mime_at(entry + 4) else {
             continue;
         };
+        let childless = reader.childless;
         let matchlets = read_matchlets(reader, n_matchlets, matchlets_at, 0);
+        if matchlets.is_empty() && reader.childless > childless {
+            reader.report(
+                entry,
+                "no matchlet left whole (one lost all its children), entry skipped",
+            );
+        }
         let marker = |matchlet: &Matchlet| {
             matchlet.start == 0 && matchlet.value == NO_MAGIC && matchlet.children.is_empty()
         };
@@ -522,6 +515,12 @@ fn read_matchlets(
             continue;
         };
         let children = read_matchlets(reader, n_children as usize, children_at as usize, depth + 1);
+        // Fails closed: without its children the matchlet would match more
+        // than the rule says.
+        if n_children > 0 && children.is_empty() {
+            reader.childless += 1;
+            continue;
+        }
         matchlets.push(Matchlet {
             start,
             range,
@@ -703,7 +702,7 @@ mod tests {
             "{total} bytes copied from a {len}-byte file"
         );
         assert!(
-            diagnostics.len() <= MAX_DIAGNOSTICS + 1,
+            diagnostics.len() <= crate::read::MAX_DIAGNOSTICS + 1,
             "{} diagnostics",
             diagnostics.len()
         );

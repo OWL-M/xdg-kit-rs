@@ -55,7 +55,7 @@ impl Loaded {
         let mut folder = Folder::default();
         let mut diagnostics = Vec::new();
         let cache_path = dir.join("mime.cache");
-        let parts = match fs::read(&cache_path) {
+        let parts = match xdg_kit_basedir::read_regular_file(&cache_path) {
             Ok(bytes) => match cache::read(&cache_path, &bytes, &mut folder, &mut diagnostics) {
                 Ok(()) => text::Parts::NotInCache,
                 Err(unusable) => {
@@ -501,41 +501,71 @@ impl MimeDatabase {
         parents
     }
 
-    /// Every type `mime` is, breadth-first, without `mime` itself: explicit
-    /// parents first, then the implicit `text/plain` (when `mime` or one of
-    /// its ancestors is `text/*`) and `application/octet-stream` (for
-    /// everything but `inode/*`). Each type appears once; loops in the
-    /// database are harmless.
+    /// Every type `mime` is, without `mime` itself: its explicit parents
+    /// breadth-first, then the implicit `text/plain` (when `mime` or one of
+    /// those ancestors is `text/*`) with its own ancestors breadth-first,
+    /// then `application/octet-stream` with its own ancestors, last. That
+    /// type is last wherever it is met: as an explicit parent, through
+    /// `text/plain`'s parents, or implicitly (for everything but an
+    /// `inode/*` type whose ancestors are all `inode/*`). Only the
+    /// ancestors found before `application/octet-stream` bring in
+    /// `text/plain`: a `text/*` type reachable only through
+    /// `application/octet-stream` does not. Each type appears once; loops
+    /// in the database are harmless.
     #[must_use]
     pub fn ancestors(&self, mime: &MimeType) -> Vec<MimeType> {
         let start = self.canonical(mime);
         let mut seen: HashSet<MimeType> = HashSet::from([start.clone()]);
         let mut found = Vec::new();
+        // Resolve the implicit types through the database, which may
+        // define them as aliases of other types.
+        let any_data = self.canonical(&MimeType::known("application/octet-stream"));
+        let mut any_data_met = self.add_ancestors(&start, Some(&any_data), &mut seen, &mut found);
+        // Subclassing is transitive: a type with a `text/*` ancestor is
+        // `text/plain` too, and so whatever `text/plain` is.
+        if start.is_media("text") || found.iter().any(|mime| mime.is_media("text")) {
+            let text = self.canonical(&MimeType::known("text/plain"));
+            if text == any_data {
+                any_data_met = true;
+            } else if seen.insert(text.clone()) {
+                found.push(text.clone());
+                any_data_met |= self.add_ancestors(&text, Some(&any_data), &mut seen, &mut found);
+            }
+        }
+        // Only a type that is `inode/*` through and through is not data.
+        let data = any_data_met
+            || !start.is_media("inode")
+            || found.iter().any(|mime| !mime.is_media("inode"));
+        if data && seen.insert(any_data.clone()) {
+            found.push(any_data.clone());
+            self.add_ancestors(&any_data, None, &mut seen, &mut found);
+        }
+        found
+    }
+
+    /// Adds unseen explicit ancestors of `start` to `found` breadth-first,
+    /// stopping at `held` without adding it. Returns whether `held` was
+    /// encountered.
+    fn add_ancestors(
+        &self,
+        start: &MimeType,
+        held: Option<&MimeType>,
+        seen: &mut HashSet<MimeType>,
+        found: &mut Vec<MimeType>,
+    ) -> bool {
+        let mut met = false;
         let mut queue = VecDeque::from([start.clone()]);
         while let Some(current) = queue.pop_front() {
             for parent in self.parents(&current) {
-                if seen.insert(parent.clone()) {
+                if held == Some(&parent) {
+                    met = true;
+                } else if seen.insert(parent.clone()) {
                     found.push(parent.clone());
                     queue.push_back(parent);
                 }
             }
         }
-        // Subclassing is transitive: a type with a `text/*` ancestor is
-        // `text/plain` too. Resolve the implicit types through the database,
-        // which may define them as aliases of other types.
-        let mut implicit = Vec::new();
-        if start.is_media("text") || found.iter().any(|mime| mime.is_media("text")) {
-            implicit.push(self.canonical(&MimeType::known("text/plain")));
-        }
-        if !start.is_media("inode") {
-            implicit.push(self.canonical(&MimeType::known("application/octet-stream")));
-        }
-        for mime in implicit {
-            if seen.insert(mime.clone()) {
-                found.push(mime);
-            }
-        }
-        found
+        met
     }
 
     /// Whether every `a` is also a `b`: the same type, a subclass through

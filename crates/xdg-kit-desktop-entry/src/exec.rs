@@ -3,11 +3,12 @@
 //!
 //! [`CommandLine::parse`] takes a value with string escapes already
 //! decoded, as returned by [`DesktopEntry::exec`](crate::DesktopEntry::exec).
-//! An unknown field code or an unclosed quote makes the command unusable
-//! under the spec and returns an [`ExecError`]. Other violations, such as
-//! an unquoted reserved character or a field code inside quotes, produce
-//! an [`ExecProblem`]. [`validate`](crate::validate) reports these, but they
-//! do not prevent launching.
+//! Parsing returns an [`ExecError`] for a missing or empty program, an
+//! unknown field code (including inside quotes), or an unclosed quote.
+//! These make the command unusable under the spec. Other violations,
+//! such as an unquoted reserved character or a field code inside quotes,
+//! produce an [`ExecProblem`]. [`validate`](crate::validate) reports these,
+//! but they do not prevent launching.
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -32,17 +33,24 @@ struct Arg {
     quoted: bool,
 }
 
+impl Arg {
+    /// Nothing at all, as `""` gives.
+    fn is_empty(&self) -> bool {
+        self.pieces == [Piece::Text(String::new())]
+    }
+}
+
 /// Why a command line cannot be used.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ExecError {
-    /// No program.
+    /// No program, or an empty one (`""`).
     Empty,
     /// A `"` with no closing one.
     UnclosedQuote,
     /// A `\` at the very end inside a quote.
     IncompleteEscape,
-    /// A `%` at the very end.
+    /// A `%` at the very end, or right before a closing quote.
     IncompleteFieldCode,
     /// A field code the spec does not list (`%x`).
     UnknownFieldCode(char),
@@ -54,10 +62,16 @@ impl fmt::Display for ExecError {
             Self::Empty => write!(f, "the command line has no program"),
             Self::UnclosedQuote => write!(f, "a quote is not closed"),
             Self::IncompleteEscape => write!(f, "the command line ends in an incomplete escape"),
-            Self::IncompleteFieldCode => {
-                write!(f, "the command line ends in an incomplete field code")
+            Self::IncompleteFieldCode => write!(
+                f,
+                "the command line or a quoted argument ends in an incomplete field code"
+            ),
+            Self::UnknownFieldCode(code) if code.is_ascii_graphic() => {
+                write!(f, "%{code} is not a field code the spec lists")
             }
-            Self::UnknownFieldCode(code) => write!(f, "%{code} is not a field code the spec lists"),
+            Self::UnknownFieldCode(code) => {
+                write!(f, "% before {code:?} is not a field code the spec lists")
+            }
         }
     }
 }
@@ -72,16 +86,23 @@ pub enum ExecProblem {
     ReservedOutsideQuotes(char),
     /// `` ` `` or `$` inside quotes without a backslash before it.
     UnescapedInQuotes(char),
+    /// A backslash inside quotes before a character other than `"`,
+    /// `` ` ``, `$` and `\`; the character is the one after the
+    /// backslash. The backslash is kept; the character after it is read
+    /// as if there were none (a `%` still starts a field code).
+    InvalidEscapeInQuotes(char),
     /// A quote that does not cover its whole argument.
     PartlyQuoted,
-    /// A field code inside a quoted argument (its expansion is undefined;
-    /// it is left as written).
+    /// A field code inside a quoted argument (its expansion is undefined).
+    /// One the spec lists is left as written; a deprecated one is removed
+    /// and also reported as [`ExecProblem::Deprecated`].
     FieldCodeInQuotes,
     /// More than one of `%f %F %u %U`.
     SeveralFileCodes,
     /// `%F`, `%U` or `%i` not as an argument on its own.
     NotStandalone(char),
-    /// A deprecated field code (`%d %D %n %N %v %m`), which is dropped.
+    /// A deprecated field code (`%d %D %n %N %v %m`), which is dropped,
+    /// inside quotes too.
     Deprecated(char),
     /// `=` in the program's name.
     EqualsInProgram,
@@ -96,8 +117,12 @@ impl fmt::Display for ExecProblem {
             Self::UnescapedInQuotes(c) => {
                 write!(f, "{c:?} inside quotes must be escaped with a backslash")
             }
+            Self::InvalidEscapeInQuotes(c) => write!(
+                f,
+                r#"a backslash before {c:?} is not an escape inside quotes; use \", \`, \$ or \\"#
+            ),
             Self::PartlyQuoted => write!(f, "a quote must enclose a whole argument"),
-            Self::FieldCodeInQuotes => write!(f, "a field code inside quotes is not expanded"),
+            Self::FieldCodeInQuotes => write!(f, "field codes may not be used inside quotes"),
             Self::SeveralFileCodes => write!(
                 f,
                 "a command line may contain at most one of %f, %F, %u and %U"
@@ -222,7 +247,8 @@ impl CommandLine {
                 text.push(c);
             }
             if had_deprecated && !started_quoted && arg.pieces.is_empty() && text.is_empty() {
-                // An argument that was only deprecated codes is removed.
+                // An argument that was only deprecated codes is removed. A
+                // quoted one stays, empty, as `""` does.
                 continue;
             }
             if !text.is_empty() || arg.pieces.is_empty() {
@@ -231,7 +257,8 @@ impl CommandLine {
             arg.quoted = started_quoted;
             args.push(arg);
         }
-        let Some(program) = args.first() else {
+        // An empty program, as `""` gives, is no program.
+        let Some(program) = args.first().filter(|program| !program.is_empty()) else {
             return Err(ExecError::Empty);
         };
         if program
@@ -341,11 +368,16 @@ fn read_quoted(
         };
         match c {
             '"' => return Ok(()),
-            '\\' => match chars.next() {
-                Some(escaped @ ('"' | '`' | '$' | '\\')) => text.push(escaped),
-                Some(other) => {
+            '\\' => match chars.peek() {
+                Some(&escaped @ ('"' | '`' | '$' | '\\')) => {
+                    chars.next();
+                    text.push(escaped);
+                }
+                // The backslash is kept; the next character is read as if
+                // it had none, so a `%` still starts a field code.
+                Some(&other) => {
+                    problems.push(ExecProblem::InvalidEscapeInQuotes(other));
                     text.push('\\');
-                    text.push(other);
                 }
                 None => return Err(ExecError::IncompleteEscape),
             },
@@ -353,15 +385,27 @@ fn read_quoted(
                 problems.push(ExecProblem::UnescapedInQuotes(c));
                 text.push(c);
             }
-            '%' => {
-                if chars.peek() == Some(&'%') {
+            '%' => match chars.peek() {
+                // Left to the next turn: the quote is not closed.
+                None => {}
+                Some('"') => return Err(ExecError::IncompleteFieldCode),
+                Some('%') => {
                     chars.next();
                     text.push('%');
-                } else {
+                }
+                Some(&code @ ('f' | 'F' | 'u' | 'U' | 'i' | 'c' | 'k')) => {
+                    chars.next();
                     problems.push(ExecProblem::FieldCodeInQuotes);
                     text.push('%');
+                    text.push(code);
                 }
-            }
+                Some(&code @ ('d' | 'D' | 'n' | 'N' | 'v' | 'm')) => {
+                    chars.next();
+                    problems.push(ExecProblem::FieldCodeInQuotes);
+                    problems.push(ExecProblem::Deprecated(code));
+                }
+                Some(&code) => return Err(ExecError::UnknownFieldCode(code)),
+            },
             _ => text.push(c),
         }
     }
@@ -473,6 +517,118 @@ mod tests {
         assert_eq!(problems("app pre\"q\""), [ExecProblem::PartlyQuoted]);
         assert_eq!(problems("app %m"), [ExecProblem::Deprecated('m')]);
         assert!(problems("env A=b app --x=%c %U").is_empty());
+    }
+
+    #[test]
+    fn an_empty_program_is_no_program() {
+        assert_eq!(CommandLine::parse(r#""""#), Err(ExecError::Empty));
+        assert_eq!(CommandLine::parse(r#""" foo"#), Err(ExecError::Empty));
+        assert_eq!(expand(r#"foo """#, &[]), ["foo", ""], "a later one is kept");
+    }
+
+    #[test]
+    fn other_escapes_in_quotes_are_problems_and_kept() {
+        let line = CommandLine::parse(r#"echo "abc\q""#).unwrap();
+        assert_eq!(line.problems(), [ExecProblem::InvalidEscapeInQuotes('q')]);
+        assert_eq!(
+            ExecProblem::InvalidEscapeInQuotes('q').to_string(),
+            r#"a backslash before 'q' is not an escape inside quotes; use \", \`, \$ or \\"#
+        );
+        assert!(
+            ExecProblem::InvalidEscapeInQuotes('\u{200b}')
+                .to_string()
+                .starts_with(r"a backslash before '\u{200b}' ")
+        );
+        assert_eq!(expand(r#"echo "abc\q""#, &[]), ["echo", "abc\\q"]);
+        assert!(
+            CommandLine::parse(r#"echo "\" \` \$ \\""#)
+                .unwrap()
+                .problems()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn percent_signs_inside_quotes() {
+        for (exec, err) in [
+            (r#"app "%z""#, ExecError::UnknownFieldCode('z')),
+            (r#"app "% x""#, ExecError::UnknownFieldCode(' ')),
+            (r#"app "%1""#, ExecError::UnknownFieldCode('1')),
+            (r#"app "100%""#, ExecError::IncompleteFieldCode),
+            (r#"app "a%""#, ExecError::IncompleteFieldCode),
+        ] {
+            assert_eq!(CommandLine::parse(exec), Err(err), "{exec}");
+        }
+        assert_eq!(
+            CommandLine::parse(r#"app "a%"#),
+            Err(ExecError::UnclosedQuote)
+        );
+        let line = CommandLine::parse(r#"app "%%z""#).unwrap();
+        assert!(line.problems().is_empty());
+        assert_eq!(expand(r#"app "%%z""#, &[]), ["app", "%z"]);
+        let line = CommandLine::parse(r#"app "%f""#).unwrap();
+        assert_eq!(line.problems(), [ExecProblem::FieldCodeInQuotes]);
+        assert_eq!(expand(r#"app "%f""#, &["/f"]), ["app", "%f"]);
+        let line = CommandLine::parse(r#"app "%d""#).unwrap();
+        assert_eq!(
+            line.problems(),
+            [ExecProblem::FieldCodeInQuotes, ExecProblem::Deprecated('d')]
+        );
+        assert_eq!(
+            expand(r#"app "%d""#, &[]),
+            ["app", ""],
+            "the quotes keep it"
+        );
+        assert_eq!(expand(r#"app "a%db""#, &[]), ["app", "ab"]);
+        assert_eq!(
+            ExecError::IncompleteFieldCode.to_string(),
+            "the command line or a quoted argument ends in an incomplete field code"
+        );
+        assert_eq!(
+            ExecError::UnknownFieldCode('z').to_string(),
+            "%z is not a field code the spec lists"
+        );
+        assert_eq!(
+            ExecError::UnknownFieldCode(' ').to_string(),
+            "% before ' ' is not a field code the spec lists"
+        );
+        assert_eq!(
+            CommandLine::parse("app %z"),
+            Err(ExecError::UnknownFieldCode('z'))
+        );
+    }
+
+    #[test]
+    fn a_bad_escape_in_quotes_leaves_the_next_character_to_the_quoting_rules() {
+        assert_eq!(
+            CommandLine::parse(r#"app "\%z""#),
+            Err(ExecError::UnknownFieldCode('z'))
+        );
+        let line = CommandLine::parse(r#"app "\%%z""#).unwrap();
+        assert_eq!(line.problems(), [ExecProblem::InvalidEscapeInQuotes('%')]);
+        assert_eq!(expand(r#"app "\%%z""#, &[]), ["app", r"\%z"]);
+        let line = CommandLine::parse(r#"app "\%d""#).unwrap();
+        assert_eq!(
+            line.problems(),
+            [
+                ExecProblem::InvalidEscapeInQuotes('%'),
+                ExecProblem::FieldCodeInQuotes,
+                ExecProblem::Deprecated('d'),
+            ]
+        );
+        assert_eq!(expand(r#"app "\%d""#, &[]), ["app", r"\"]);
+        let line = CommandLine::parse(r#"app "\%f""#).unwrap();
+        assert_eq!(
+            line.problems(),
+            [
+                ExecProblem::InvalidEscapeInQuotes('%'),
+                ExecProblem::FieldCodeInQuotes,
+            ]
+        );
+        assert_eq!(expand(r#"app "\%f""#, &["/f"]), ["app", r"\%f"]);
+        let line = CommandLine::parse(r#"app "a\qb""#).unwrap();
+        assert_eq!(line.problems(), [ExecProblem::InvalidEscapeInQuotes('q')]);
+        assert_eq!(expand(r#"app "a\qb""#, &[]), ["app", r"a\qb"]);
     }
 
     #[test]

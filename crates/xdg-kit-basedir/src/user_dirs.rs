@@ -5,7 +5,6 @@
 //! (`src/xdg-user-dir-lookup.c`).
 
 use std::ffi::OsStr;
-use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -94,7 +93,7 @@ impl UserDirs {
     #[must_use]
     pub fn load(base_dirs: &BaseDirs) -> Self {
         let path = base_dirs.config_home().join("user-dirs.dirs");
-        match fs::read(&path) {
+        match crate::read_regular_file(&path) {
             Ok(contents) => Self::from_bytes(base_dirs.home(), &contents),
             Err(err) => {
                 let mut dirs = Self::from_bytes(base_dirs.home(), b"");
@@ -246,6 +245,8 @@ fn trim_blanks_end(bytes: &[u8]) -> &[u8] {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
 
     const HOME: &str = "/home/u";
@@ -454,5 +455,26 @@ mod tests {
         let unreadable = UserDirs::load(&base);
         assert_eq!(unreadable.iter().count(), 0);
         assert_eq!(unreadable.diagnostics().len(), 1);
+    }
+
+    #[cfg(not(target_vendor = "apple"))]
+    #[test]
+    fn a_fifo_is_reported_not_waited_on() {
+        use crate::testing::{fifo, within};
+
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().to_owned();
+        fifo(&config.join("user-dirs.dirs"));
+        let base = BaseDirs::from_vars(move |name: &str| match name {
+            "HOME" => Some(HOME.into()),
+            "XDG_CONFIG_HOME" => Some(config.clone().into_os_string()),
+            _ => None,
+        })
+        .unwrap();
+        let dirs = within(std::time::Duration::from_secs(10), move || {
+            UserDirs::load(&base)
+        });
+        assert_eq!(dirs.iter().count(), 0);
+        assert_eq!(dirs.diagnostics().len(), 1);
     }
 }

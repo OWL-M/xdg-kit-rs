@@ -1,6 +1,6 @@
 [package]
 name = "xdg-kit-desktop-entry"
-description = "The freedesktop.org Desktop Entry spec: reading, lossless writing, validation, the installed applications, and launching"
+description = "The freedesktop.org Desktop Entry spec: reading, lossless writing, validation, the installed entries by desktop file ID, and launching"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

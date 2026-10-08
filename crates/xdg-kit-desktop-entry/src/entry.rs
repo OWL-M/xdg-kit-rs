@@ -8,6 +8,7 @@ use std::path::Path;
 use xdg_kit_locale::Locales;
 
 use crate::KeyFile;
+use crate::key_file::work;
 
 /// The main group of every desktop entry.
 pub const DESKTOP_ENTRY: &str = "Desktop Entry";
@@ -164,8 +165,9 @@ impl DesktopEntry {
     ///
     /// # Errors
     ///
-    /// When the file cannot be read. Problems in its text are diagnostics
-    /// of the key file.
+    /// When the file cannot be read, is not a regular file or is larger
+    /// than [`xdg_kit_basedir::MAX_FILE_LEN`]. Problems in its text are
+    /// diagnostics of the key file.
     pub fn read(path: impl AsRef<Path>) -> io::Result<Self> {
         KeyFile::read(path).map(Self::from_key_file)
     }
@@ -373,7 +375,11 @@ impl DesktopEntry {
         self.list("Actions")
             .unwrap_or_default()
             .into_iter()
-            .filter(|id| seen.insert(id.clone()))
+            .filter(|id| {
+                // The repeat check: one step, as the set is hashed.
+                work::count(1);
+                seen.insert(id.clone())
+            })
             .collect()
     }
 
@@ -438,10 +444,12 @@ impl DesktopEntry {
     /// the required `Name` (the spec says to ignore an action without it).
     #[must_use]
     pub fn action(&self, id: &str) -> Option<Action<'_>> {
-        if !self
-            .list("Actions")
-            .is_some_and(|ids| ids.iter().any(|listed| listed == id))
-        {
+        if !self.list("Actions").is_some_and(|ids| {
+            ids.iter().any(|listed| {
+                work::count(1);
+                listed == id
+            })
+        }) {
             return None;
         }
         self.listed_action(id)
@@ -453,7 +461,10 @@ impl DesktopEntry {
     pub fn actions(&self) -> Vec<Action<'_>> {
         self.action_ids()
             .iter()
-            .filter_map(|id| self.listed_action(id))
+            .filter_map(|id| {
+                work::count(1);
+                self.listed_action(id)
+            })
             .collect()
     }
 
@@ -626,23 +637,23 @@ mod tests {
     fn long_action_lists_are_read_in_linear_time() {
         use std::fmt::Write as _;
         let mut ids = String::new();
-        for at in 0..100_000 {
+        for at in 0..10_000 {
             let _ = write!(ids, "A{at};");
         }
         let entry = DesktopEntry::parse(
             format!("[Desktop Entry]\nType=Application\nName=a\nExec=a\nActions={ids}\n[Desktop Action A1]\nName=One\n").as_bytes(),
         );
-        let started = std::time::Instant::now();
-        assert_eq!(entry.action_ids().len(), 100_000);
-        assert_eq!(
-            entry.action("A1").map(|a| a.id().to_owned()).as_deref(),
-            Some("A1")
-        );
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
-            "{:?}",
-            started.elapsed()
-        );
+        let ((), steps) = work::steps(|| {
+            assert_eq!(entry.action_ids().len(), 10_000);
+            assert_eq!(entry.actions().len(), 1);
+            assert_eq!(
+                entry.action("A1").map(|a| a.id().to_owned()).as_deref(),
+                Some("A1")
+            );
+        });
+        // A step per id split off the list, checked for repeats, looked up
+        // or compared, and per line a lookup visits.
+        assert!(steps <= 7 * 10_000, "{steps} steps for 10,000 ids");
     }
 
     #[test]

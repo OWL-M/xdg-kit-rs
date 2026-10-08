@@ -12,6 +12,7 @@ xdg-kit-desktop-entry.workspace = true
 xdg-kit-mime.workspace = true
 
 [dev-dependencies]
+rustix = { workspace = true, features = ["fs"] }
 tempfile.workspace = true
 
 [lints]

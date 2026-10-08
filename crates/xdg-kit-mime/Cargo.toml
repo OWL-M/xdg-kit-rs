@@ -17,6 +17,11 @@ rustix = { workspace = true, features = ["fs"] }
 xdg-kit-basedir.workspace = true
 xdg-kit-locale.workspace = true
 
+# `O_SEARCH`, which rustix does not have, on the systems the libc crate
+# defines it for (see `LOOKUPS_ONLY` in src/tree.rs).
+[target.'cfg(any(target_vendor = "apple", target_os = "aix", target_os = "cygwin", target_os = "emscripten", target_os = "freebsd", target_os = "fuchsia", target_os = "illumos", target_os = "netbsd", target_os = "solaris"))'.dependencies]
+libc.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true
 

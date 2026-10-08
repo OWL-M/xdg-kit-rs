@@ -3,11 +3,14 @@
 //! using Extended Attributes").
 
 use std::ffi::OsStr;
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{self, Read};
+use std::os::fd::BorrowedFd;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::Path;
+
+use rustix::fs::{AtFlags, FileType, Mode, OFlags, Stat};
+use rustix::io::Errno;
 
 use crate::database::{IndexedGlob, lowercase};
 use crate::fnmatch::Name;
@@ -139,7 +142,9 @@ pub struct PathOptions {
     /// reported as mount points too.
     pub mount_points: bool,
     /// Use a regular file's `user.mime_type` extended attribute when it holds
-    /// a valid type. Off by default, as GNOME and KDE do not read it.
+    /// a valid type. Off by default, as GNOME and KDE do not read it. Read
+    /// on Linux, Android, Apple systems and Hurd; elsewhere this crate cannot
+    /// read extended attributes, and the option finds nothing.
     pub extended_attribute: bool,
 }
 
@@ -433,6 +438,29 @@ impl MimeDatabase {
         options: &PathOptions,
     ) -> io::Result<Detection> {
         let path = path.as_ref();
+        self.type_at(rustix::fs::CWD, path, *options, || attribute_type(path))
+    }
+
+    /// The type of the entry `name` in the open folder `folder`: what
+    /// [`MimeDatabase::type_for_path`] gives for the folder's path joined
+    /// with `name`, with the default options, but looked up from the
+    /// folder, so that the way to the folder does not count against the
+    /// limits on links and path length.
+    pub(crate) fn type_in(&self, folder: BorrowedFd<'_>, name: &OsStr) -> io::Result<Detection> {
+        // The default options leave the extended attribute off.
+        self.type_at(folder, Path::new(name), PathOptions::default(), || None)
+    }
+
+    /// [`MimeDatabase::type_for_path`] for `path` looked up from the folder
+    /// `dir` (the current folder for a plain path); `attribute` reads the
+    /// extended attribute when the options ask for it.
+    fn type_at(
+        &self,
+        dir: BorrowedFd<'_>,
+        path: &Path,
+        options: PathOptions,
+        attribute: impl FnOnce() -> Option<MimeType>,
+    ) -> io::Result<Detection> {
         let kind = |text| {
             Ok(Detection::new(
                 self.fixed(text),
@@ -440,44 +468,39 @@ impl MimeDatabase {
                 DecidedBy::FileKind,
             ))
         };
-        let mut metadata = fs::symlink_metadata(path)?;
-        if metadata.file_type().is_symlink() {
+        let mut metadata = rustix::fs::statat(dir, path, AtFlags::SYMLINK_NOFOLLOW)?;
+        if FileType::from_raw_mode(metadata.st_mode) == FileType::Symlink {
             if !options.follow_links {
                 return kind("inode/symlink");
             }
-            match fs::metadata(path) {
+            match rustix::fs::statat(dir, path, AtFlags::empty()) {
                 Ok(target) => metadata = target,
-                Err(err) if matches!(err.kind(), io::ErrorKind::NotFound) => {
-                    return kind("inode/symlink");
-                }
-                Err(err) if err.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error()) => {
-                    return kind("inode/symlink");
-                }
-                Err(err) => return Err(err),
+                Err(Errno::NOENT | Errno::LOOP) => return kind("inode/symlink"),
+                Err(err) => return Err(err.into()),
             }
         }
-        let file_type = metadata.file_type();
-        if file_type.is_dir() {
-            if options.mount_points && is_mount_point(path, &metadata) {
+        let file_type = FileType::from_raw_mode(metadata.st_mode);
+        if file_type == FileType::Directory {
+            if options.mount_points && is_mount_point(dir, path, &metadata) {
                 return kind("inode/mount-point");
             }
             return kind("inode/directory");
         }
-        if file_type.is_block_device() {
+        if file_type == FileType::BlockDevice {
             return kind("inode/blockdevice");
         }
-        if file_type.is_char_device() {
+        if file_type == FileType::CharacterDevice {
             return kind("inode/chardevice");
         }
-        if file_type.is_fifo() {
+        if file_type == FileType::Fifo {
             return kind("inode/fifo");
         }
-        if file_type.is_socket() {
+        if file_type == FileType::Socket {
             return kind("inode/socket");
         }
 
         if options.extended_attribute
-            && let Some(mime) = attribute_type(path)
+            && let Some(mime) = attribute()
         {
             return Ok(Detection::new(
                 self.canonical(&mime),
@@ -492,47 +515,70 @@ impl MimeDatabase {
         if let Some(best) = names.certain() {
             return Ok(best);
         }
-        if metadata.len() == 0 {
+        if metadata.st_size == 0 {
             return Ok(Detection::new(
                 self.fixed("application/x-zerosize"),
                 Certainty::Certain,
                 DecidedBy::Content,
             ));
         }
-        let data = read_head(path, self.sniff_len())?;
+        let data = read_head(dir, path, self.sniff_len())?;
         Ok(self.name_and_content(&names, &data))
     }
 }
 
-/// Whether the folder `path` (with `metadata`) is on another device than
-/// its parent, or is its own parent (`/`).
-fn is_mount_point(path: &Path, metadata: &fs::Metadata) -> bool {
-    match fs::metadata(path.join("..")) {
-        Ok(parent) => parent.dev() != metadata.dev() || parent.ino() == metadata.ino(),
+/// Whether the folder `path` from `dir` (with `metadata`) is on another
+/// device than its parent, or is its own parent (`/`).
+fn is_mount_point(dir: BorrowedFd<'_>, path: &Path, metadata: &Stat) -> bool {
+    match rustix::fs::statat(dir, path.join(".."), AtFlags::empty()) {
+        Ok(parent) => parent.st_dev != metadata.st_dev || parent.st_ino == metadata.st_ino,
         Err(_) => false,
     }
 }
 
 /// The `user.mime_type` extended attribute, if set to a valid type.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "hurd",
+    target_vendor = "apple"
+))]
 fn attribute_type(path: &Path) -> Option<MimeType> {
     let mut buffer = [0u8; 256];
     let len = rustix::fs::getxattr(path, "user.mime_type", &mut buffer[..]).ok()?;
     attribute_value(buffer.get(..len)?)
 }
 
+/// Where rustix reads no extended attributes, there is none to use.
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "hurd",
+    target_vendor = "apple"
+)))]
+fn attribute_type(_path: &Path) -> Option<MimeType> {
+    None
+}
+
 /// A `user.mime_type` value: a type, with a trailing NUL or whitespace
 /// allowed (tools differ in whether they write one).
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "hurd",
+    target_vendor = "apple"
+))]
 fn attribute_value(value: &[u8]) -> Option<MimeType> {
     let value = std::str::from_utf8(value).ok()?;
     MimeType::new(value.trim_end_matches(['\0', ' ', '\t', '\n', '\r'])).ok()
 }
 
-/// Up to `len` bytes from the start of the regular file `path`. Opened
-/// non-blocking and checked again after opening, so a file swapped for a
-/// FIFO in between is not waited on.
-fn read_head(path: &Path, len: usize) -> io::Result<Vec<u8>> {
-    use rustix::fs::{Mode, OFlags};
-    let fd = rustix::fs::open(
+/// Up to `len` bytes from the start of the regular file `path` from `dir`.
+/// Opened non-blocking and checked again after opening, so a file swapped
+/// for a FIFO in between is not waited on.
+fn read_head(dir: BorrowedFd<'_>, path: &Path, len: usize) -> io::Result<Vec<u8>> {
+    let fd = rustix::fs::openat(
+        dir,
         path,
         OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
         Mode::empty(),
@@ -553,6 +599,8 @@ fn read_head(path: &Path, len: usize) -> io::Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
 
     fn matchlet(start: u32, range: u32, value: &[u8], mask: Option<&[u8]>) -> Matchlet {
@@ -589,6 +637,12 @@ mod tests {
         assert!(!matchlet_matches(&parent, b"XB"));
     }
 
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "hurd",
+        target_vendor = "apple"
+    ))]
     #[test]
     fn attribute_values_allow_a_trailing_nul_or_newline() {
         let value = |bytes: &[u8]| attribute_value(bytes).map(|mime| mime.to_string());
@@ -598,6 +652,91 @@ mod tests {
         assert_eq!(value(b"not a type"), None);
         assert_eq!(value(b"\xff/\xfe"), None);
         assert_eq!(value(b""), None);
+    }
+
+    #[test]
+    fn a_name_in_a_folder_is_typed_as_its_path() {
+        use std::os::fd::AsFd;
+        use std::os::unix::fs::symlink;
+        let db_dir = tempfile::tempdir().unwrap();
+        fs::write(
+            db_dir.path().join("globs2"),
+            "50:text/x-diff:*.diff\n50:image/png:*.png\n50:text/x-c:*.c\n50:text/x-h:*.c\n",
+        )
+        .unwrap();
+        fs::write(
+            db_dir.path().join("magic"),
+            b"MIME-Magic\0\n[50:image/png]\n>0=\0\x04\x89PNG\n",
+        )
+        .unwrap();
+        let db = MimeDatabase::from_dirs([db_dir.path()]);
+        assert!(db.diagnostics().is_empty(), "{:?}", db.diagnostics());
+
+        let files = tempfile::tempdir().unwrap();
+        let path = |name: &str| files.path().join(name);
+        for (name, content) in [
+            ("a.diff", b"diff".as_slice()),
+            ("plain", b"words"),
+            ("binary", b"\x00\x01"),
+            ("picture", b"\x89PNG\r\n"),
+            ("picture.diff", b"\x89PNG\r\n"),
+            ("both.c", b"int x;"),
+            ("empty", b""),
+        ] {
+            fs::write(path(name), content).unwrap();
+        }
+        fs::write(files.path().join(OsStr::from_bytes(b"\xffname.diff")), "x").unwrap();
+        fs::create_dir(path("folder")).unwrap();
+        symlink("a.diff", path("link")).unwrap();
+        symlink("folder", path("folder-link")).unwrap();
+        symlink("missing", path("broken")).unwrap();
+        symlink("loop", path("loop")).unwrap();
+        // `mknodat` is not in rustix on Apple systems.
+        #[cfg(not(target_vendor = "apple"))]
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            path("fifo"),
+            rustix::fs::FileType::Fifo,
+            Mode::RUSR | Mode::WUSR,
+            0,
+        )
+        .unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind(path("socket")).unwrap();
+
+        let open = |path: &Path| {
+            let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+            rustix::fs::open(path, flags, Mode::empty()).unwrap()
+        };
+        let agree = |folder: &Path, name: &OsStr| {
+            let by_handle = db.type_in(open(folder).as_fd(), name);
+            let by_path = db.type_for_path(folder.join(name), &PathOptions::default());
+            assert_eq!(
+                by_handle.map_err(|err| err.kind()),
+                by_path.map_err(|err| err.kind()),
+                "{}",
+                folder.join(name).display()
+            );
+        };
+        let mut names: Vec<_> = fs::read_dir(files.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        names.push("missing".into());
+        assert_eq!(
+            names.len(),
+            if cfg!(target_vendor = "apple") {
+                15
+            } else {
+                16
+            }
+        );
+        for name in &names {
+            agree(files.path(), name);
+        }
+        // Mount points, links and folders the system has.
+        for entry in fs::read_dir("/").unwrap() {
+            agree(Path::new("/"), &entry.unwrap().file_name());
+        }
     }
 
     #[test]

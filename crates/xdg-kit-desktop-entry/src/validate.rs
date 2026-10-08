@@ -9,8 +9,8 @@ use crate::entry::{
     DESKTOP_ACTION, DESKTOP_ENTRY, KDE_DESKTOP_ENTRY, before_1_0, comma_list, list_items,
     valid_dbus_name,
 };
-use crate::exec::{CommandLine, ExecProblem};
-use crate::key_file::{KeyFile, KeyNames, valid_group_name, valid_key_name};
+use crate::exec::{CommandLine, ExecError, ExecProblem};
+use crate::key_file::{KeyFile, KeyNames, valid_group_name, valid_key_name, work};
 use crate::keys::{self, ACTION_KEYS, Applies, DESKTOP_KEYS, KeyDef, Status, ValueType};
 use crate::registry::{ADDITIONAL_CATEGORIES, DESKTOPS, MAIN_CATEGORIES, RESERVED_CATEGORIES};
 
@@ -95,10 +95,18 @@ impl Validator<'_> {
 
 /// Checks `file` as a desktop entry. When the key file knows its path, the
 /// file name is checked too (`.desktop`, `.directory`, a D-Bus name for
-/// `DBusActivatable`). The issues come in file order, then the
-/// whole-file ones.
+/// `DBusActivatable`). The issues come in line order, issues without a
+/// line last.
 #[must_use]
 pub fn validate(file: &KeyFile) -> Vec<Issue> {
+    // The checks run in passes, each in file order; stable, so that the
+    // issues of one line keep the order they were found in.
+    let mut issues = check_file(file);
+    issues.sort_by_key(|issue| (issue.line.is_none(), issue.line));
+    issues
+}
+
+fn check_file(file: &KeyFile) -> Vec<Issue> {
     let mut v = Validator {
         file,
         main: DESKTOP_ENTRY,
@@ -111,6 +119,7 @@ pub fn validate(file: &KeyFile) -> Vec<Issue> {
     }
     check_lines(&mut v, &text);
     for diagnostic in file.diagnostics() {
+        work::count(1);
         v.error(diagnostic.line, diagnostic.message.clone());
     }
     let groups = file.groups();
@@ -142,6 +151,7 @@ pub fn validate(file: &KeyFile) -> Vec<Issue> {
 /// leading spaces, which `desktop-file-validate` rejects.
 fn check_lines(v: &mut Validator<'_>, text: &[u8]) {
     for (index, line) in text.split(|&byte| byte == b'\n').enumerate() {
+        work::count(1);
         let number = Some(index + 1);
         if line.ends_with(b"\r") {
             v.error(
@@ -189,7 +199,11 @@ impl Main {
                 Some("true" | "1")
             ),
             only_show_in: list("OnlyShowIn"),
-            actions: list("Actions").unwrap_or_default().into_iter().collect(),
+            actions: list("Actions")
+                .unwrap_or_default()
+                .into_iter()
+                .inspect(|_| work::count(1))
+                .collect(),
             path: file.path().map(ToOwned::to_owned),
         }
     }
@@ -205,6 +219,7 @@ impl Main {
 }
 
 fn check_group(v: &mut Validator<'_>, group: &str, main: &Main) {
+    work::count(1);
     let line = v.file.group_line(group);
     if !valid_group_name(group) {
         // Already reported by the key-file layer.
@@ -245,6 +260,7 @@ fn check_group(v: &mut Validator<'_>, group: &str, main: &Main) {
         return;
     };
     for (key, locale) in v.file.keys(group) {
+        work::count(1);
         check_key(v, group, key, locale, defs, main);
     }
     check_required(v, group, main);
@@ -366,8 +382,34 @@ fn known_type(value: &str) -> bool {
     matches!(value, "Application" | "Link" | "Directory")
 }
 
-/// The value type's rules: strings are printable ASCII; booleans `true`
-/// or `false`.
+/// The escapes in `raw` that the spec does not give its value type, in
+/// order: strings have `\s \n \t \r \\`, and lists `\;` as well.
+/// Reading keeps any other as written. A backslash at the end is not
+/// counted here; see [`ends_in_backslash`].
+fn unknown_escapes(raw: &str, list: bool) -> impl Iterator<Item = char> {
+    let mut chars = raw.chars();
+    std::iter::from_fn(move || {
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                match chars.next() {
+                    Some('s' | 'n' | 't' | 'r' | '\\') | None => {}
+                    Some(';') if list => {}
+                    Some(other) => return Some(other),
+                }
+            }
+        }
+        None
+    })
+}
+
+/// Whether `raw` ends in a backslash that escapes nothing. Reading keeps
+/// it as one backslash.
+fn ends_in_backslash(raw: &str) -> bool {
+    raw.bytes().rev().take_while(|&b| b == b'\\').count() % 2 == 1
+}
+
+/// The value type's rules: strings are printable ASCII and use only the
+/// escapes the spec lists; booleans `true` or `false`.
 fn check_value(
     v: &mut Validator<'_>,
     line: Option<usize>,
@@ -376,19 +418,46 @@ fn check_value(
     raw: &str,
     before_1_0: bool,
 ) {
+    let list = matches!(
+        value_type,
+        ValueType::StringList | ValueType::LocaleStringList
+    );
     // Files before version 1.0 may separate lists by commas (spec
     // "Deprecated Items").
-    if before_1_0
-        && matches!(
-            value_type,
-            ValueType::StringList | ValueType::LocaleStringList
-        )
-        && comma_list(raw)
-    {
+    if before_1_0 && list && comma_list(raw) {
         v.push(
             Level::Warning,
             line,
             format!("{key}: a list separated by commas is deprecated; use ';'"),
+        );
+    }
+    let (kind, known) = if list {
+        ("a list", r"\s, \n, \t, \r, \\ or \;")
+    } else {
+        ("a string", r"\s, \n, \t, \r or \\")
+    };
+    if value_type != ValueType::Boolean
+        && let Some(escape) = unknown_escapes(raw, list).next()
+    {
+        // The command line's own escape needs its backslash escaped too.
+        let hint = if key == "Exec" && matches!(escape, '"' | '`' | '$') {
+            format!(r"; inside quotes, write \\{escape} in the file")
+        } else {
+            String::new()
+        };
+        v.error(
+            line,
+            format!(
+                "{key}: a backslash before {escape:?} is not an escape in {kind}; use {known}{hint}"
+            ),
+        );
+    }
+    if value_type != ValueType::Boolean && ends_in_backslash(raw) {
+        v.error(
+            line,
+            format!(
+                r"{key}: a backslash at the end is not an escape in {kind}; use \\ for a backslash"
+            ),
         );
     }
     match value_type {
@@ -463,7 +532,14 @@ fn check_meaning(
         }
         "Icon" => check_icon(v, line, &value),
         "OnlyShowIn" | "NotShowIn" => check_show_in(v, line, group, key, raw, main),
-        "Exec" => check_exec(v, line, &value),
+        // A bad escape in the file was reported by `check_value` already.
+        "Exec" => check_exec(
+            v,
+            line,
+            &value,
+            &unknown_escapes(raw, false).collect(),
+            ends_in_backslash(raw),
+        ),
         "Path" => {
             if !value.starts_with('/') {
                 v.push(
@@ -541,13 +617,30 @@ fn check_icon(v: &mut Validator<'_>, line: Option<usize>, value: &str) {
     }
 }
 
-fn check_exec(v: &mut Validator<'_>, line: Option<usize>, value: &str) {
+/// A bad escape inside quotes is left out when the value already has a
+/// bad string escape before the same character: it is most likely the
+/// same mistake. So the same character written both ways in one value
+/// (`"\q" "\\q"`) is reported once, as a string's. Likewise a lone
+/// backslash at the end of the value, inside quotes, is reported as a
+/// string's, and the quote it leaves open as not closed. Outside quotes
+/// it is also a reserved character, as `\\` would be.
+fn check_exec(
+    v: &mut Validator<'_>,
+    line: Option<usize>,
+    value: &str,
+    string_escapes: &std::collections::HashSet<char>,
+    ends_in_backslash: bool,
+) {
     match CommandLine::parse(value) {
+        Err(ExecError::IncompleteEscape) if ends_in_backslash => {
+            v.error(line, format!("Exec: {}", ExecError::UnclosedQuote));
+        }
         Err(err) => v.error(line, format!("Exec: {err}")),
         Ok(command) => {
             for problem in command.problems() {
                 let level = match problem {
                     ExecProblem::Deprecated(_) => Level::Warning,
+                    ExecProblem::InvalidEscapeInQuotes(c) if string_escapes.contains(c) => continue,
                     _ => Level::Error,
                 };
                 v.push(level, line, format!("Exec: {problem}"));
@@ -607,9 +700,18 @@ fn check_show_in(
 
 fn check_categories(v: &mut Validator<'_>, line: Option<usize>, raw: &str, main: &Main) {
     let categories = main.items(raw);
-    let has = |name: &str| categories.iter().any(|category| category == name);
+    let present: std::collections::HashSet<&str> = categories
+        .iter()
+        .inspect(|_| work::count(1))
+        .map(String::as_str)
+        .collect();
+    let has = |name: &str| {
+        work::count(1);
+        present.contains(name)
+    };
     let mut main_count = 0;
     for category in &categories {
+        work::count(1);
         if let Some((_, required)) = MAIN_CATEGORIES.iter().find(|(name, _)| name == category) {
             main_count += 1;
             if let Some(required) = required
@@ -663,6 +765,7 @@ fn check_categories(v: &mut Validator<'_>, line: Option<usize>, raw: &str, main:
 
 fn check_actions(v: &mut Validator<'_>, line: Option<usize>, raw: &str, main: &Main) {
     for id in main.items(raw) {
+        work::count(1);
         if id.is_empty() {
             v.error(line, "Actions contains an empty action");
         } else if !valid_action_id(&id) {
@@ -987,6 +1090,24 @@ mod tests {
         assert!(exec("foo ~/x")[0].contains("reserved"));
         assert!(exec("foo %f %u")[0].contains("at most one"));
         assert!(exec(r#"foo "a\\$b""#).is_empty());
+        assert_eq!(
+            exec(r#"foo "%z""#),
+            ["Exec: %z is not a field code the spec lists"]
+        );
+        assert_eq!(
+            exec(r#"foo "% x""#),
+            ["Exec: % before ' ' is not a field code the spec lists"]
+        );
+        assert!(exec(r#"foo "%%z""#).is_empty());
+        assert_eq!(
+            exec(r#"foo "%d""#),
+            ["Exec: field codes may not be used inside quotes"]
+        );
+        let deprecated = validate(&KeyFile::parse(
+            b"[Desktop Entry]\nType=Application\nName=a\nExec=foo \"%d\"\n",
+        ));
+        assert!(deprecated.iter().any(|issue| issue.level == Level::Warning
+            && issue.message == "Exec: %d is deprecated and is dropped"));
         assert!(with("Icon=icons/foo")[0].contains("relative path"));
         let icon_ext = validate(&KeyFile::parse(format!("{GOOD}Icon=foo.png\n").as_bytes()));
         assert!(icon_ext.iter().any(|i| i.level == Level::FutureError));
@@ -1009,6 +1130,197 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_program_is_an_error() {
+        let exec = |value: &str| {
+            errors(&format!(
+                "[Desktop Entry]\nType=Application\nName=a\nExec={value}\n"
+            ))
+        };
+        assert_eq!(exec(r#""""#), ["Exec: the command line has no program"]);
+        assert_eq!(exec(r#""" foo"#), ["Exec: the command line has no program"]);
+        assert!(exec(r#"foo """#).is_empty());
+    }
+
+    #[test]
+    fn escapes_the_value_type_does_not_list_are_errors() {
+        let issues = |extra: &str| -> Vec<(Option<usize>, String)> {
+            // No Exec in the first five lines, so that the sixth may be one.
+            let text = format!(
+                "[Desktop Entry]\nType=Application\nName=Foo\nDBusActivatable=true\n\
+                 Categories=Utility;\n{extra}\n"
+            );
+            validate(&KeyFile::parse(text.as_bytes()))
+                .into_iter()
+                .filter(|issue| issue.level == Level::Error)
+                .map(|issue| (issue.line, issue.message))
+                .collect()
+        };
+        let one = |extra: &str| {
+            let found = issues(extra);
+            assert_eq!(found.len(), 1, "{extra}: {found:?}");
+            assert_eq!(found[0].0, Some(6), "{extra}");
+            found[0].1.clone()
+        };
+        let string =
+            r"a backslash before 'q' is not an escape in a string; use \s, \n, \t, \r or \\";
+        let list =
+            r"a backslash before 'q' is not an escape in a list; use \s, \n, \t, \r, \\ or \;";
+        assert_eq!(one(r"Comment=a\qb"), format!("Comment: {string}"));
+        assert_eq!(one(r"Name[de]=a\qb"), format!("Name[de]: {string}"));
+        assert_eq!(one(r"Icon=a\qb"), format!("Icon: {string}"));
+        assert_eq!(
+            one(r"StartupWMClass=a\qb"),
+            format!("StartupWMClass: {string}")
+        );
+        assert_eq!(one(r"Keywords=a\q;b;"), format!("Keywords: {list}"));
+        assert!(one(r"Comment=a\;b").starts_with("Comment: a backslash before ';' "));
+        assert!(
+            one("Comment=a\\\u{200b}b").starts_with(r"Comment: a backslash before '\u{200b}' "),
+            "an invisible character is shown escaped"
+        );
+        assert!(issues(r"Comment=\s\n\t\r\\").is_empty());
+        assert!(issues(r"Keywords=a\;b;\s\n\t\r\\;").is_empty());
+        assert!(issues("Keywords=a;\nKeywords[de]=a\\;b;").is_empty());
+        // Booleans and keys outside the spec are not checked for escapes.
+        assert!(!one(r"Terminal=a\qb").contains("backslash"));
+        assert!(issues(r"X-Foo=a\qb").is_empty());
+        // In a quoted argument, `\\q` in the file is `\q` once unescaped.
+        assert_eq!(
+            one(r#"Exec=echo "abc\\q""#),
+            r#"Exec: a backslash before 'q' is not an escape inside quotes; use \", \`, \$ or \\"#
+        );
+        // `\q` in the file is one mistake, reported once, as a string's.
+        assert_eq!(one(r#"Exec=echo "abc\q""#), format!("Exec: {string}"));
+        // A bad string escape does not hide a different one inside quotes.
+        let messages = |extra: &str| -> Vec<String> {
+            issues(extra)
+                .into_iter()
+                .map(|(_, message)| message)
+                .collect()
+        };
+        let quoted_z =
+            r#"Exec: a backslash before 'z' is not an escape inside quotes; use \", \`, \$ or \\"#;
+        assert_eq!(
+            messages(r#"Exec=echo "a\q" "b\\z""#),
+            [format!("Exec: {string}"), quoted_z.to_owned()]
+        );
+        assert_eq!(
+            messages(r#"Exec=echo a\q "b\\z""#),
+            [
+                format!("Exec: {string}"),
+                r"Exec: reserved character '\\' outside quotes".to_owned(),
+                quoted_z.to_owned(),
+            ]
+        );
+        assert_eq!(
+            messages(r#"Exec=echo "a\"" "b\\z""#),
+            [
+                r#"Exec: a backslash before '"' is not an escape in a string; use \s, \n, \t, \r or \\; inside quotes, write \\" in the file"#.to_owned(),
+                quoted_z.to_owned(),
+            ]
+        );
+        // `\\%` in the file is `\%` once unescaped: the `%` still starts a
+        // field code, and an unknown one refuses the command line.
+        assert_eq!(
+            one(r#"Exec=app "\\%z""#),
+            "Exec: %z is not a field code the spec lists"
+        );
+        // `\%` in the file is a bad string escape as well.
+        assert_eq!(
+            messages(r#"Exec=app "\%z""#),
+            [
+                format!("Exec: {}", string.replace("'q'", "'%'")),
+                "Exec: %z is not a field code the spec lists".to_owned(),
+            ]
+        );
+        // A quote's escape written with one backslash gets a hint.
+        assert_eq!(
+            one(r#"Exec=sh -c "echo \"hi\"""#),
+            r#"Exec: a backslash before '"' is not an escape in a string; use \s, \n, \t, \r or \\; inside quotes, write \\" in the file"#
+        );
+        assert!(
+            one(r#"Exec=sh -c "echo \$HOME""#).ends_with(r"inside quotes, write \\$ in the file")
+        );
+        assert!(
+            one(r#"Exec=sh -c "echo \`date\`""#).ends_with(r"inside quotes, write \\` in the file")
+        );
+    }
+
+    #[test]
+    fn a_backslash_at_the_end_is_an_error() {
+        let with = |extra: &str| errors(&format!("{GOOD}{extra}\n"));
+        assert_eq!(
+            with(r"Comment=abc\"),
+            [
+                r"Comment: a backslash at the end is not an escape in a string; use \\ for a backslash"
+            ]
+        );
+        assert!(with(r"Comment=abc\\").is_empty());
+        assert!(with(r"Comment=abc\\\\").is_empty());
+        assert_eq!(
+            with(r"Keywords=a;b\"),
+            [
+                r"Keywords: a backslash at the end is not an escape in a list; use \\ for a backslash"
+            ]
+        );
+        assert_eq!(
+            with(r"Name[de]=a\"),
+            [
+                r"Name[de]: a backslash at the end is not an escape in a string; use \\ for a backslash"
+            ]
+        );
+        assert_eq!(
+            with(r"Icon=a\"),
+            [r"Icon: a backslash at the end is not an escape in a string; use \\ for a backslash"]
+        );
+        assert_eq!(
+            with("Actions=New;\n[Desktop Action New]\nName=a\\\nExec=a"),
+            [r"Name: a backslash at the end is not an escape in a string; use \\ for a backslash"]
+        );
+        let exec = |value: &str| {
+            errors(&format!(
+                "[Desktop Entry]\nType=Application\nName=a\nExec={value}\n"
+            ))
+        };
+        let string =
+            r"Exec: a backslash at the end is not an escape in a string; use \\ for a backslash";
+        // Inside quotes the backslash is reported once, as a string's; the
+        // quote it leaves open is a mistake of its own.
+        assert_eq!(exec(r#"foo "a\"#), [string, "Exec: a quote is not closed"]);
+        assert_eq!(
+            exec(r#"foo "a\\"#),
+            ["Exec: the command line ends in an incomplete escape"]
+        );
+        // Outside quotes a backslash is reserved, escaped in the file or not.
+        assert_eq!(
+            exec(r"foo a\"),
+            [string, r"Exec: reserved character '\\' outside quotes"]
+        );
+    }
+
+    #[test]
+    fn issues_come_in_line_order_then_whole_file_ones() {
+        let issues = validate(&KeyFile::parse(
+            b"[Desktop Entry]\nType=Application\nUnknown=1\nName=a\nExec=a\n not an entry\n",
+        ));
+        let lines: Vec<Option<usize>> = issues.iter().map(|issue| issue.line).collect();
+        assert_eq!(lines, [Some(3), Some(6), Some(6)], "{issues:?}");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("foo.txt");
+        // The missing Name is found after the group's keys (line 4) and
+        // before the next group's (line 9); the file name last of all.
+        std::fs::write(
+            &path,
+            "[Desktop Entry]\nType=Application\nExec=a\nUnknown=1\nActions=n;\n\
+             [Desktop Action n]\nName=n\nExec=a\nBad=1\n",
+        )
+        .unwrap();
+        let issues = validate(&KeyFile::read(&path).unwrap());
+        let lines: Vec<Option<usize>> = issues.iter().map(|issue| issue.line).collect();
+        assert_eq!(lines, [Some(1), Some(4), Some(9), None], "{issues:?}");
+    }
+
+    #[test]
     fn many_actions_are_checked_in_linear_time() {
         use std::fmt::Write as _;
         let mut text = String::from("[Desktop Entry]\nType=Application\nName=a\nExec=a\nActions=");
@@ -1019,13 +1331,17 @@ mod tests {
         for at in 0..20_000 {
             let _ = write!(text, "[Desktop Action A{at}]\nName=n\nExec=a\n");
         }
-        let started = std::time::Instant::now();
-        assert!(errors(&text).is_empty());
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(10),
-            "{:?}",
-            started.elapsed()
-        );
+        let file = KeyFile::parse(text.as_bytes());
+        let (issues, steps) = work::steps(|| validate(&file));
+        let errors: Vec<_> = issues
+            .iter()
+            .filter(|issue| issue.level == Level::Error)
+            .collect();
+        assert!(errors.is_empty(), "{errors:?}");
+        // A step per line written out and checked, per group, key or
+        // action id checked or listed, per line a lookup visits, and per
+        // block whose first line is worked out: about 25 per action.
+        assert!(steps <= 26 * 20_000, "{steps} steps for 20,000 actions");
     }
 
     #[test]
@@ -1041,6 +1357,21 @@ mod tests {
         assert!(categories("X-Made-Up;").is_empty());
         assert!(categories("TrayIcon;")[0].contains("needs OnlyShowIn"));
         assert!(categories("Utility;Calculator;").is_empty());
+    }
+
+    #[test]
+    fn long_category_lists_are_checked_in_linear_time() {
+        let mut value = "Building;".repeat(10_000);
+        value.push_str("Development;");
+        let file = KeyFile::parse(
+            format!("[Desktop Entry]\nType=Application\nName=a\nExec=a\nCategories={value}\n")
+                .as_bytes(),
+        );
+        let (issues, steps) = work::steps(|| validate(&file));
+        assert!(issues.is_empty(), "{issues:?}");
+        // A step per category split off the list, gathered and checked,
+        // and per category looked for.
+        assert!(steps <= 5 * 10_000, "{steps} steps for 10,000 categories");
     }
 
     #[test]

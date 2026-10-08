@@ -3,9 +3,10 @@
 
 use std::path::{Path, PathBuf};
 
-use quick_xml::NsReader;
-use quick_xml::events::Event;
-use quick_xml::name::ResolveResult;
+use quick_xml::events::attributes::Attribute;
+use quick_xml::events::{BytesStart, Event};
+use quick_xml::name::{PrefixDeclaration, ResolveResult};
+use quick_xml::{NsReader, XmlVersion};
 
 /// The namespace of the database's XML files.
 const NAMESPACE: &str = "http://www.freedesktop.org/standards/shared-mime-info";
@@ -62,7 +63,7 @@ impl TypeInfo {
                 continue;
             };
             info.found = true;
-            match std::fs::read(&path) {
+            match xdg_kit_basedir::read_regular_file(&path) {
                 Ok(bytes) => info.parse(&path, &bytes),
                 Err(err) => info.diagnostics.push(Diagnostic::new(
                     &path,
@@ -250,7 +251,17 @@ pub(crate) fn types_in(dir: &Path) -> Vec<MimeType> {
             let Some(subtype) = name.to_str().and_then(|name| name.strip_suffix(".xml")) else {
                 continue;
             };
-            if let Ok(mime) = MimeType::new(&format!("{media}/{subtype}")) {
+            let Ok(mime) = MimeType::new(&format!("{media}/{subtype}")) else {
+                continue;
+            };
+            // Regular files only (links followed), as `type_file` finds them;
+            // only a link needs another look.
+            let regular = match file.file_type() {
+                Ok(kind) if kind.is_symlink() => file.path().is_file(),
+                Ok(kind) => kind.is_file(),
+                Err(_) => false,
+            };
+            if regular {
                 types.push(mime);
             }
         }
@@ -260,14 +271,31 @@ pub(crate) fn types_in(dir: &Path) -> Vec<MimeType> {
 
 /// The namespace URI (empty when there is none) and local name of the root
 /// element of the XML document `bytes` starts, if it gets that far.
+///
+/// The namespace is the declaring attribute's value, with references to
+/// the predefined entities and character references replaced (`urn:a&amp;b`
+/// is `urn:a&b`), as `update-mime-database` stores it; a reference that
+/// cannot be replaced gives no root element. Entities declared in the
+/// document's internal DTD are not replaced, so a root whose namespace
+/// uses one gets no XML-root match (a known limit).
 pub(crate) fn root_element(bytes: &[u8]) -> Option<(String, String)> {
     let mut reader = NsReader::from_reader(bytes);
+    let mut version = XmlVersion::Implicit1_0;
     loop {
         let (namespace, event) = reader.read_resolved_event().ok()?;
         match event {
+            Event::Decl(declaration) => {
+                if let Ok(declared) = declaration.xml_version() {
+                    version = declared;
+                }
+            }
             Event::Start(element) | Event::Empty(element) => {
                 let namespace = match namespace {
-                    ResolveResult::Bound(namespace) => namespace.into_inner().to_owned(),
+                    ResolveResult::Bound(namespace) => match binding_attribute(&element) {
+                        Some(attribute) => attribute.normalized_value(version).ok()?.into_owned(),
+                        // Bound without a declaration: the `xml` prefix.
+                        None => namespace.into_inner().to_owned(),
+                    },
                     ResolveResult::Unbound => String::new(),
                     ResolveResult::Unknown(_) => return None,
                 };
@@ -278,6 +306,25 @@ pub(crate) fn root_element(bytes: &[u8]) -> Option<(String, String)> {
             _ => {}
         }
     }
+}
+
+/// The root `element`'s attribute that binds its prefix (or the default
+/// namespace), if it has one. Where it repeats, the last counts, as for the
+/// namespace `quick-xml` resolves.
+fn binding_attribute<'a>(element: &'a BytesStart<'_>) -> Option<Attribute<'a>> {
+    let prefix = element.name().prefix();
+    element
+        .attributes()
+        .with_checks(false)
+        .map_while(Result::ok)
+        .filter(
+            |attribute| match (attribute.key.as_namespace_binding(), prefix) {
+                (Some(PrefixDeclaration::Default), None) => true,
+                (Some(PrefixDeclaration::Named(name)), Some(prefix)) => name == prefix.as_ref(),
+                _ => false,
+            },
+        )
+        .last()
 }
 
 impl MimeDatabase {
@@ -316,6 +363,19 @@ impl MimeDatabase {
 mod tests {
     use super::*;
 
+    /// Makes a FIFO at `path`.
+    #[cfg(not(target_vendor = "apple"))]
+    fn fifo(path: &Path) {
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            path,
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+            0,
+        )
+        .unwrap();
+    }
+
     #[test]
     fn root_elements_with_and_without_namespaces() {
         let svg = br#"<?xml version="1.0"?><!-- c --><!DOCTYPE svg><svg xmlns="http://www.w3.org/2000/svg" width="1">"#;
@@ -336,6 +396,18 @@ mod tests {
             "cut before the root"
         );
         assert_eq!(root_element(b"\x00\xff garbage"), None);
+    }
+
+    #[test]
+    fn white_space_in_a_namespace_is_normalised_as_in_any_attribute() {
+        // A character reference gives its character; white space written
+        // as it is becomes a space (XML 1.0, 3.3.3).
+        let namespace = |root: &[u8]| root_element(root).unwrap().0;
+        assert_eq!(namespace(b"<doc xmlns=\"urn:a&#10;b\"/>"), "urn:a\nb");
+        assert_eq!(namespace(b"<doc xmlns=\"urn:a\nb\"/>"), "urn:a b");
+        assert_eq!(namespace(b"<doc xmlns=\"urn:a&#9;b\"/>"), "urn:a\tb");
+        assert_eq!(namespace(b"<doc xmlns=\"urn:a\tb\"/>"), "urn:a b");
+        assert_eq!(namespace(b"<x:doc xmlns:x=\"urn:a\r\nb\"/>"), "urn:a b");
     }
 
     #[test]
@@ -427,5 +499,26 @@ mod tests {
         let info = TypeInfo::read(&plain, [dir.path()].into_iter());
         assert_eq!(info.diagnostics.len(), 1);
         assert_eq!(types_in(dir.path()), [plain]);
+    }
+
+    #[test]
+    fn types_are_listed_from_regular_files_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = dir.path().join("text");
+        std::fs::create_dir_all(text.join("fake.xml")).unwrap();
+        // `mknodat` is not in rustix on Apple systems.
+        #[cfg(not(target_vendor = "apple"))]
+        fifo(&text.join("fifo.xml"));
+        std::fs::write(text.join("real.xml"), "").unwrap();
+        std::os::unix::fs::symlink("real.xml", text.join("linked.xml")).unwrap();
+        let mut types = types_in(dir.path());
+        types.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        assert_eq!(
+            types,
+            [
+                MimeType::new("text/linked").unwrap(),
+                MimeType::new("text/real").unwrap()
+            ]
+        );
     }
 }

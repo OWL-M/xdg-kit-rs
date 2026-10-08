@@ -136,11 +136,13 @@ fn gio_program() -> std::path::PathBuf {
         .expect("gio is not on PATH: run the tests in the dev shell (nix develop)")
 }
 
-/// A scenario: files to write (relative path, text), desktops, and the
-/// types to ask about.
+/// A scenario: files to write (relative path, text), desktops, folders
+/// that replace the fixture's (variable, folder), and the types to ask
+/// about.
 struct Scenario {
     name: &'static str,
     desktops: &'static [&'static str],
+    folders: &'static [(&'static str, &'static str)],
     apps: &'static [(&'static str, &'static str, &'static str, &'static str)],
     files: &'static [(&'static str, &'static str)],
     types: &'static [&'static str],
@@ -150,27 +152,34 @@ const S1: &str = "share1/applications";
 const S2: &str = "share2/applications";
 const LOCAL: &str = "local/applications";
 
+/// The empty scenario, for the fields a scenario leaves out.
+const BASE: Scenario = Scenario {
+    name: "",
+    desktops: &[],
+    folders: &[],
+    apps: &[],
+    files: &[],
+    types: &[],
+};
+
 const SCENARIOS: &[Scenario] = &[
     Scenario {
         name: "one-app",
-        desktops: &[],
         apps: &[(S1, "xkt-a.desktop", "text/x-xkt-plain;", "")],
-        files: &[],
         types: &["text/x-xkt-plain", "image/x-xkt-png"],
+        ..BASE
     },
     Scenario {
         name: "two-apps-by-id",
-        desktops: &[],
         apps: &[
             (S1, "xkt-b.desktop", "text/x-xkt-plain;", ""),
             (S1, "xkt-a.desktop", "text/x-xkt-plain;", ""),
         ],
-        files: &[],
         types: &["text/x-xkt-plain"],
+        ..BASE
     },
     Scenario {
         name: "user-default",
-        desktops: &[],
         apps: &[
             (S1, "xkt-a.desktop", "text/x-xkt-plain;", ""),
             (S1, "xkt-b.desktop", "text/x-xkt-plain;", ""),
@@ -180,10 +189,10 @@ const SCENARIOS: &[Scenario] = &[
             "[Default Applications]\ntext/x-xkt-plain=xkt-b.desktop;\n",
         )],
         types: &["text/x-xkt-plain"],
+        ..BASE
     },
     Scenario {
         name: "default-not-associated",
-        desktops: &[],
         apps: &[
             (S1, "xkt-a.desktop", "text/x-xkt-plain;", ""),
             (S1, "xkt-img.desktop", "image/x-xkt-png;", ""),
@@ -193,10 +202,10 @@ const SCENARIOS: &[Scenario] = &[
             "[Default Applications]\ntext/x-xkt-plain=xkt-img.desktop;\n",
         )],
         types: &["text/x-xkt-plain"],
+        ..BASE
     },
     Scenario {
         name: "default-next-if-missing",
-        desktops: &[],
         apps: &[
             (S1, "xkt-a.desktop", "text/x-xkt-plain;", ""),
             (S1, "xkt-b.desktop", "text/x-xkt-plain;", ""),
@@ -206,10 +215,10 @@ const SCENARIOS: &[Scenario] = &[
             "[Default Applications]\ntext/x-xkt-plain=xkt-gone.desktop;xkt-b.desktop;\n",
         )],
         types: &["text/x-xkt-plain"],
+        ..BASE
     },
     Scenario {
         name: "user-added",
-        desktops: &[],
         apps: &[
             (S1, "xkt-a.desktop", "text/x-xkt-plain;", ""),
             (S1, "xkt-viewer.desktop", "image/x-xkt-png;", ""),
@@ -219,10 +228,10 @@ const SCENARIOS: &[Scenario] = &[
             "[Added Associations]\ntext/x-xkt-plain=xkt-viewer.desktop;\n",
         )],
         types: &["text/x-xkt-plain", "image/x-xkt-png"],
+        ..BASE
     },
     Scenario {
         name: "user-removed",
-        desktops: &[],
         apps: &[
             (S1, "xkt-a.desktop", "text/x-xkt-plain;", ""),
             (S1, "xkt-b.desktop", "text/x-xkt-plain;", ""),
@@ -232,10 +241,10 @@ const SCENARIOS: &[Scenario] = &[
             "[Removed Associations]\ntext/x-xkt-plain=xkt-a.desktop;\n",
         )],
         types: &["text/x-xkt-plain"],
+        ..BASE
     },
     Scenario {
         name: "removal-scoping",
-        desktops: &[],
         apps: &[
             (S1, "xkt-a.desktop", "text/x-xkt-plain;", ""),
             (S2, "xkt-b.desktop", "text/x-xkt-plain;", ""),
@@ -245,10 +254,10 @@ const SCENARIOS: &[Scenario] = &[
             "[Removed Associations]\ntext/x-xkt-plain=xkt-a.desktop;xkt-b.desktop;\n",
         )],
         types: &["text/x-xkt-plain"],
+        ..BASE
     },
     Scenario {
         name: "addition-scoping",
-        desktops: &[],
         apps: &[
             (S1, "xkt-a.desktop", "image/x-xkt-png;", ""),
             (S2, "xkt-b.desktop", "image/x-xkt-png;", ""),
@@ -258,21 +267,20 @@ const SCENARIOS: &[Scenario] = &[
             "[Added Associations]\ntext/x-xkt-plain=xkt-a.desktop;xkt-b.desktop;\n",
         )],
         types: &["text/x-xkt-plain"],
+        ..BASE
     },
     Scenario {
         name: "shadowed-copy-does-not-count",
-        desktops: &[],
         apps: &[
             (S1, "xkt-a.desktop", "image/x-xkt-png;", ""),
             (S2, "xkt-a.desktop", "text/x-xkt-plain;", ""),
             (S2, "xkt-b.desktop", "text/x-xkt-plain;", ""),
         ],
-        files: &[],
         types: &["text/x-xkt-plain", "image/x-xkt-png"],
+        ..BASE
     },
     Scenario {
         name: "local-overrides-share",
-        desktops: &[],
         apps: &[
             (
                 LOCAL,
@@ -282,8 +290,8 @@ const SCENARIOS: &[Scenario] = &[
             ),
             (S1, "xkt-a.desktop", "image/x-xkt-png;", ""),
         ],
-        files: &[],
         types: &["text/x-xkt-plain", "image/x-xkt-png"],
+        ..BASE
     },
     Scenario {
         name: "desktop-specific-default",
@@ -304,10 +312,10 @@ const SCENARIOS: &[Scenario] = &[
             ),
         ],
         types: &["text/x-xkt-plain", "image/x-xkt-png"],
+        ..BASE
     },
     Scenario {
         name: "system-defaults",
-        desktops: &[],
         apps: &[
             (S1, "xkt-a.desktop", "text/x-xkt-plain;", ""),
             (S1, "xkt-b.desktop", "text/x-xkt-plain;", ""),
@@ -325,10 +333,10 @@ const SCENARIOS: &[Scenario] = &[
             ),
         ],
         types: &["text/x-xkt-plain", "image/x-xkt-png"],
+        ..BASE
     },
     Scenario {
         name: "parent-types",
-        desktops: &[],
         apps: &[
             (S1, "xkt-text.desktop", "text/x-xkt-plain;", ""),
             (S1, "xkt-c.desktop", "text/x-xkt-src;", ""),
@@ -339,17 +347,16 @@ const SCENARIOS: &[Scenario] = &[
             "[Default Applications]\ntext/x-xkt-plain=xkt-text.desktop;\n",
         )],
         types: &["text/x-xkt-src", "image/x-xkt-svg", "text/x-xkt-plain"],
+        ..BASE
     },
     Scenario {
         name: "aliases",
-        desktops: &[],
         apps: &[(S1, "xkt-c.desktop", "text/x-xkt-alias;", "")],
-        files: &[],
         types: &["text/x-xkt-src", "text/x-xkt-alias"],
+        ..BASE
     },
     Scenario {
         name: "url-schemes",
-        desktops: &[],
         apps: &[
             (
                 S1,
@@ -359,22 +366,20 @@ const SCENARIOS: &[Scenario] = &[
             ),
             (S1, "xkt-mail.desktop", "x-scheme-handler/xkt-mail;", ""),
         ],
-        files: &[],
         types: &["x-scheme-handler/xkt-web", "x-scheme-handler/xkt-mail"],
+        ..BASE
     },
     Scenario {
         name: "hidden-and-nodisplay",
-        desktops: &[],
         apps: &[
             (S1, "xkt-a.desktop", "text/x-xkt-plain;", "Hidden=true\n"),
             (S1, "xkt-b.desktop", "text/x-xkt-plain;", "NoDisplay=true\n"),
         ],
-        files: &[],
         types: &["text/x-xkt-plain"],
+        ..BASE
     },
     Scenario {
         name: "added-order-kept",
-        desktops: &[],
         apps: &[
             (S1, "xkt-a.desktop", "image/x-xkt-png;", ""),
             (S1, "xkt-b.desktop", "image/x-xkt-png;", ""),
@@ -384,10 +389,10 @@ const SCENARIOS: &[Scenario] = &[
             "[Added Associations]\ntext/x-xkt-plain=xkt-b.desktop;xkt-a.desktop;\n",
         )],
         types: &["text/x-xkt-plain"],
+        ..BASE
     },
     Scenario {
         name: "default-in-a-higher-folder",
-        desktops: &[],
         apps: &[
             (S1, "xkt-a.desktop", "text/x-xkt-plain;", ""),
             (S2, "xkt-b.desktop", "text/x-xkt-plain;", ""),
@@ -397,10 +402,10 @@ const SCENARIOS: &[Scenario] = &[
             "[Default Applications]\ntext/x-xkt-plain=xkt-a.desktop;\n",
         )],
         types: &["text/x-xkt-plain"],
+        ..BASE
     },
     Scenario {
         name: "added-and-removed-in-one-file",
-        desktops: &[],
         apps: &[
             (S1, "xkt-a.desktop", "image/x-xkt-png;", ""),
             (S1, "xkt-b.desktop", "text/x-xkt-plain;", ""),
@@ -410,10 +415,10 @@ const SCENARIOS: &[Scenario] = &[
             "[Added Associations]\ntext/x-xkt-plain=xkt-a.desktop;\n[Removed Associations]\ntext/x-xkt-plain=xkt-a.desktop;\n",
         )],
         types: &["text/x-xkt-plain"],
+        ..BASE
     },
     Scenario {
         name: "only-applications",
-        desktops: &[],
         apps: &[(S1, "xkt-c.desktop", "text/x-xkt-plain;", "")],
         files: &[
             (
@@ -430,20 +435,19 @@ const SCENARIOS: &[Scenario] = &[
             ),
         ],
         types: &["text/x-xkt-plain"],
+        ..BASE
     },
     Scenario {
         name: "unhandled-scheme",
-        desktops: &[],
         apps: &[
             (S1, "xkt-data.desktop", "application/octet-stream;", ""),
             (S1, "xkt-all.desktop", "*/*;", ""),
         ],
-        files: &[],
         types: &["x-scheme-handler/xkt-none"],
+        ..BASE
     },
     Scenario {
         name: "default-removed",
-        desktops: &[],
         apps: &[
             (S1, "xkt-a.desktop", "text/x-xkt-plain;", ""),
             (S1, "xkt-b.desktop", "text/x-xkt-plain;", ""),
@@ -453,10 +457,10 @@ const SCENARIOS: &[Scenario] = &[
             "[Default Applications]\ntext/x-xkt-plain=xkt-a.desktop;\n[Removed Associations]\ntext/x-xkt-plain=xkt-a.desktop;\n",
         )],
         types: &["text/x-xkt-plain"],
+        ..BASE
     },
     Scenario {
         name: "default-hidden",
-        desktops: &[],
         apps: &[
             (S1, "xkt-a.desktop", "text/x-xkt-plain;", "Hidden=true\n"),
             (S1, "xkt-b.desktop", "text/x-xkt-plain;", ""),
@@ -466,10 +470,10 @@ const SCENARIOS: &[Scenario] = &[
             "[Default Applications]\ntext/x-xkt-plain=xkt-a.desktop;\n",
         )],
         types: &["text/x-xkt-plain"],
+        ..BASE
     },
     Scenario {
         name: "default-for-a-parent-app",
-        desktops: &[],
         apps: &[
             (S1, "xkt-text.desktop", "text/x-xkt-plain;", ""),
             (S1, "xkt-c.desktop", "text/x-xkt-src;", ""),
@@ -479,10 +483,10 @@ const SCENARIOS: &[Scenario] = &[
             "[Default Applications]\ntext/x-xkt-src=xkt-text.desktop;\n",
         )],
         types: &["text/x-xkt-src", "text/x-xkt-plain"],
+        ..BASE
     },
     Scenario {
         name: "data-home-list",
-        desktops: &[],
         apps: &[
             (S1, "xkt-a.desktop", "text/x-xkt-plain;", ""),
             (S1, "xkt-b.desktop", "text/x-xkt-plain;", ""),
@@ -493,10 +497,10 @@ const SCENARIOS: &[Scenario] = &[
             "[Default Applications]\ntext/x-xkt-plain=xkt-b.desktop;\n[Added Associations]\ntext/x-xkt-plain=xkt-c.desktop;\n[Removed Associations]\ntext/x-xkt-plain=xkt-a.desktop;\n",
         )],
         types: &["text/x-xkt-plain"],
+        ..BASE
     },
     Scenario {
         name: "config-dirs",
-        desktops: &[],
         apps: &[
             (S1, "xkt-a.desktop", "text/x-xkt-plain;", ""),
             (S1, "xkt-b.desktop", "text/x-xkt-plain;", ""),
@@ -517,6 +521,7 @@ const SCENARIOS: &[Scenario] = &[
             ),
         ],
         types: &["text/x-xkt-plain", "image/x-xkt-png"],
+        ..BASE
     },
     Scenario {
         name: "desktop-names-in-order",
@@ -542,21 +547,20 @@ const SCENARIOS: &[Scenario] = &[
             ),
         ],
         types: &["text/x-xkt-plain", "image/x-xkt-png"],
+        ..BASE
     },
     Scenario {
         name: "hidden-masks-a-lower-copy",
-        desktops: &[],
         apps: &[
             (LOCAL, "xkt-a.desktop", "text/x-xkt-plain;", "Hidden=true\n"),
             (S1, "xkt-a.desktop", "text/x-xkt-plain;", ""),
             (S1, "xkt-b.desktop", "text/x-xkt-plain;", ""),
         ],
-        files: &[],
         types: &["text/x-xkt-plain"],
+        ..BASE
     },
     Scenario {
         name: "specific-addition-survives",
-        desktops: &[],
         apps: &[
             (S1, "xkt-a.desktop", "image/x-xkt-png;", ""),
             (S1, "xkt-b.desktop", "text/x-xkt-plain;", ""),
@@ -572,10 +576,10 @@ const SCENARIOS: &[Scenario] = &[
             ),
         ],
         types: &["text/x-xkt-src"],
+        ..BASE
     },
     Scenario {
         name: "alias-as-key",
-        desktops: &[],
         apps: &[
             (S1, "xkt-a.desktop", "text/x-xkt-src;", ""),
             (S1, "xkt-b.desktop", "text/x-xkt-src;", ""),
@@ -585,26 +589,49 @@ const SCENARIOS: &[Scenario] = &[
             "[Default Applications]\ntext/x-xkt-alias=xkt-b.desktop;\n",
         )],
         types: &["text/x-xkt-src"],
+        ..BASE
     },
     Scenario {
         name: "wildcards",
-        desktops: &[],
         apps: &[
             (S1, "xkt-images.desktop", "image/*;", ""),
             (S1, "xkt-all.desktop", "*/*;", ""),
         ],
-        files: &[],
         types: &["image/x-xkt-png"],
+        ..BASE
     },
     Scenario {
         name: "implied-parents",
-        desktops: &[],
         apps: &[
             (S1, "xkt-text.desktop", "text/plain;", ""),
             (S1, "xkt-data.desktop", "application/octet-stream;", ""),
         ],
-        files: &[],
         types: &["text/x-xkt-foo", "image/x-xkt-png"],
+        ..BASE
+    },
+    Scenario {
+        name: "config-home-is-data-home-applications",
+        folders: &[("XDG_CONFIG_HOME", "local/applications")],
+        apps: &[
+            (LOCAL, "xkt-a.desktop", "text/x-xkt-plain;", ""),
+            (S1, "xkt-b.desktop", "text/x-xkt-plain;", ""),
+        ],
+        files: &[(
+            "etc/mimeapps.list",
+            "[Removed Associations]\ntext/x-xkt-plain=xkt-a.desktop;\n",
+        )],
+        types: &["text/x-xkt-plain"],
+        ..BASE
+    },
+    Scenario {
+        name: "config-dir-is-data-dir-applications",
+        folders: &[("XDG_CONFIG_DIRS", "share1/applications")],
+        apps: &[
+            (LOCAL, "xkt-local.desktop", "text/x-xkt-plain;", ""),
+            (S1, "xkt-share.desktop", "text/x-xkt-plain;", ""),
+        ],
+        types: &["text/x-xkt-plain"],
+        ..BASE
     },
 ];
 
@@ -615,6 +642,7 @@ fn build(scenario: &Scenario) -> Fixture {
         .iter()
         .map(|&name| name.to_owned())
         .collect();
+    fixture.folders = scenario.folders.to_vec();
     for (dir, id, types, extra) in scenario.apps {
         fixture.app(dir, id, types, extra);
     }

@@ -21,8 +21,9 @@ use crate::TypePattern;
 /// `type=id;id;` line per type, both in byte order, for every desktop entry
 /// under the folder (sub-folders give IDs joined by `-`) that is not
 /// deleted ([`DesktopEntry::hidden`]) and is in UTF-8
-/// ([`DesktopEntry::supports_encoding`]), the rules `AppIndex` uses. Items
-/// of `MimeType=` that are not types or `media/*` wildcards (see
+/// ([`DesktopEntry::supports_encoding`]), as the tool lists them. Unlike
+/// `AppIndex`, entries of no or unknown `Type` are listed, as the tool does.
+/// Items of `MimeType=` that are not types or `media/*` wildcards (see
 /// [`TypePattern::parse`]) are left out, `*/*` too, as the tool does.
 ///
 /// # Errors
@@ -123,7 +124,8 @@ fn collect(
             let Ok(entry) = DesktopEntry::read(&path) else {
                 continue;
             };
-            // The same rules as `AppIndex`, which are `GLib`'s.
+            // As `update-desktop-database`: not deleted and in UTF-8. Unlike
+            // `AppIndex`, entries of no or unknown `Type` are listed.
             if entry.hidden() || !entry.supports_encoding() {
                 continue;
             }
@@ -183,11 +185,16 @@ mod tests {
         fs::create_dir_all(dir.path().join("z")).unwrap();
         fs::write(dir.path().join("z/nested.desktop"), entry).unwrap();
         std::os::unix::fs::symlink("z", dir.path().join("a")).unwrap();
-        let status = std::process::Command::new("mkfifo")
-            .arg(dir.path().join("blocked.desktop"))
-            .status()
-            .expect("mkfifo is on PATH");
-        assert!(status.success());
+        // `mknodat` is not in rustix on Apple systems.
+        #[cfg(not(target_vendor = "apple"))]
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            dir.path().join("blocked.desktop"),
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+            0,
+        )
+        .unwrap();
         assert_eq!(
             String::from_utf8(mimeinfo_cache(dir.path()).unwrap()).unwrap(),
             "[MIME Cache]\ntext/plain=a-nested.desktop;\n",

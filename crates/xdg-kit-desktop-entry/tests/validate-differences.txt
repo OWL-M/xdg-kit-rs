@@ -9,15 +9,23 @@ categories-audio-alone.desktop	invalid	valid	the menu spec: an entry with Audio 
 categories-deprecated.desktop	invalid	valid	Application is not a category in the menu spec 1.1 (which lists no deprecated ones); the tool still knows it as deprecated
 exec-backslash-unquoted.desktop	invalid	valid	the spec: backslash is a reserved character, and an argument with one must be quoted; the tool does not check it
 exec-code-in-quotes.desktop	invalid	valid	the spec: field codes must not be used inside a quoted argument; the tool does not check it
+exec-empty-program.desktop	invalid	valid	the spec: the Exec key must contain a command line, which starts with a program; the tool accepts "", an empty one
 exec-empty.desktop	invalid	valid	the spec: the Exec key must contain a command line, which starts with a program; the tool accepts an empty value
 exec-equals-in-program.desktop	invalid	valid	the spec: the program's name may not contain '='; the tool does not check it
 exec-files-not-standalone.desktop	invalid	valid	the spec: %F may only be used as an argument on its own; the tool does not check it
 exec-icon-not-standalone.desktop	invalid	valid	the latest spec text (xdg-specs da38d5a): %i may only be used as an argument on its own; the tool does not check it
 exec-partly-quoted.desktop	invalid	valid	the spec: arguments may be quoted in whole, and one with a reserved character (here a space) must be; the tool does not check it
+exec-quoted-deprecated-field-code.desktop	invalid	valid	the spec: field codes must not be used inside a quoted argument, and the deprecated ones are field codes too; the tool only warns that %d is deprecated
+exec-string-escaped-quote.desktop	invalid	valid	the spec: the escapes of a string are \s, \n, \t, \r and \\, applied before the quoting rule, so a \" inside quotes is written \\" in the file; the tool checks no string escapes, and in Exec skips the character after a backslash
+exec-string-invalid-escape.desktop	invalid	valid	the spec: the escapes of a string are \s, \n, \t, \r and \\, and \q is none of them; the tool checks no string escapes, and in Exec skips the character after a backslash
 exec-urls-not-standalone.desktop	invalid	valid	the spec: %U may only be used as an argument on its own; the tool does not check it
 link-no-url.desktop	invalid	valid	the spec: URL is required for Type=Link; the tool does not require it
+list-invalid-escape.desktop	invalid	valid	the spec: the escapes of a list are those of a string (\s, \n, \t, \r and \\) and \;, and \q is none of them; the tool checks no string escapes
 locale-empty-country.desktop	invalid	valid	the spec: a locale is lang_COUNTRY.ENCODING@MODIFIER with optional parts; an empty COUNTRY after "_" is not that form; the tool checks only the characters
 old-version-comma-lists.desktop	valid	invalid	the spec (Deprecated Items): when reading a pre-1.0 desktop entry, comma-separated lists should be supported; the tool reads GNOME,KDE as one name
 showin-both.desktop	valid	invalid	the spec forbids only the same desktop name in both OnlyShowIn and NotShowIn; the tool forbids having both keys
 showin-budgie.desktop	invalid	valid	Budgie is not a registered desktop in the menu spec 1.1; the tool's own list has it
+string-escaped-semicolon.desktop	invalid	valid	the spec: \; is an escape only in lists, and Comment is not a list; the tool checks no string escapes
+string-invalid-escape.desktop	invalid	valid	the spec: the escapes of a string are \s, \n, \t, \r and \\, and \q is none of them; the tool checks no string escapes
 string-not-ascii.desktop	invalid	valid	the spec: string values are ASCII; the tool accepts non-ASCII in StartupWMClass
+string-trailing-backslash.desktop	invalid	valid	the spec: the escapes of a string are \s, \n, \t, \r and \\, and a backslash at the end escapes nothing; the tool checks no string escapes

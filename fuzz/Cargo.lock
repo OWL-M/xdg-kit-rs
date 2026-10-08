@@ -180,6 +180,7 @@ version = "0.1.0"
 name = "xdg-kit-mime"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "quick-xml",
  "rustix",
  "xdg-kit-basedir",

@@ -147,7 +147,9 @@ impl MimeAppsList {
     }
 
     /// Uses `database` to resolve aliases, so edits also reach keys that
-    /// name an alias of the type. This matches how
+    /// name an alias of the type, and an ID added under one name and
+    /// removed under an alias is reported as both added and removed (see
+    /// [`MimeAppsList::diagnostics`]). This matches how
     /// [`MimeApps`](crate::MimeApps) reads them. Without it, keys match
     /// only when they name the same type, ignoring case.
     #[must_use]
@@ -235,7 +237,9 @@ impl MimeAppsList {
     /// Problems found when reading: those of the key file, keys that are not
     /// type patterns, associations in a desktop-specific file (ignored), and
     /// an ID both added and removed for one type (the spec: invalid; the
-    /// addition counts, as it is read first).
+    /// addition counts, as it is read first), however the keys spell the
+    /// type: in another case, or, when [resolving
+    /// aliases](MimeAppsList::resolving_aliases), as an alias.
     #[must_use]
     pub fn diagnostics(&self) -> Vec<Diagnostic> {
         let mut found: Vec<Diagnostic> = self
@@ -618,6 +622,21 @@ mod tests {
             1,
             "{:?}",
             spellings.diagnostics()
+        );
+    }
+
+    #[test]
+    fn wildcards_match_and_are_written_in_any_case() {
+        // The key is not in lower case; the pattern is.
+        let list = MimeAppsList::parse(b"[Added Associations]\nImage/*=v.desktop;\n", false);
+        let image = TypePattern::Media(crate::MediaType::new("image").unwrap());
+        assert_eq!(list.ids(Group::Added, &image), ["v.desktop"]);
+        let mut list = MimeAppsList::parse(b"", false);
+        let image = TypePattern::Media(crate::MediaType::new("IMAGE").unwrap());
+        list.add_association(&image, "a.desktop").unwrap();
+        assert_eq!(
+            list.to_bytes(),
+            b"[Added Associations]\nimage/*=a.desktop;\n"
         );
     }
 

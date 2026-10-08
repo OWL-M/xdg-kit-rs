@@ -9,7 +9,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use xdg_kit_locale::Locales;
-use xdg_kit_mime::{Certainty, DecidedBy, MimeDatabase, MimeType, PathOptions};
+use xdg_kit_mime::{
+    Certainty, DecidedBy, Location, MimeDatabase, MimeType, PathOptions, TreeOptions,
+};
 
 mod common;
 
@@ -788,6 +790,67 @@ fn refresh_notices_changed_added_and_removed_files() {
     assert_eq!(db.patterns_for(&m("text/x-diff")), ["*.diff", "*.patch"]);
 }
 
+/// Makes a FIFO at `path`.
+#[cfg(not(target_vendor = "apple"))]
+fn fifo(path: &Path) {
+    rustix::fs::mknodat(
+        rustix::fs::CWD,
+        path,
+        rustix::fs::FileType::Fifo,
+        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        0,
+    )
+    .unwrap();
+}
+
+/// Runs `f` in a thread and returns its result. If a FIFO blocks the
+/// read, the test fails after `timeout`.
+#[cfg(not(target_vendor = "apple"))]
+fn within<T: Send + 'static>(timeout: Duration, f: impl FnOnce() -> T + Send + 'static) -> T {
+    let (send, receive) = std::sync::mpsc::channel();
+    std::thread::spawn(move || send.send(f()));
+    receive.recv_timeout(timeout).expect("it returns in time")
+}
+
+#[cfg(not(target_vendor = "apple"))]
+#[test]
+fn a_fifo_mime_cache_is_reported_and_the_text_files_used() {
+    let dir = tempfile::tempdir().unwrap();
+    let mime = build(dir.path(), SYSTEM);
+    fs::remove_file(mime.join("mime.cache")).unwrap();
+    fifo(&mime.join("mime.cache"));
+    let db = within(Duration::from_secs(10), move || {
+        Box::new(MimeDatabase::from_dirs(vec![mime]))
+    });
+    let messages: Vec<String> = db.diagnostics().iter().map(ToString::to_string).collect();
+    assert_eq!(messages.len(), 1, "{messages:#?}");
+    assert!(messages[0].contains("mime.cache"), "{messages:#?}");
+    assert_eq!(
+        db.type_for_name("a.diff").best().unwrap().mime.as_str(),
+        "text/x-diff"
+    );
+}
+
+#[cfg(not(target_vendor = "apple"))]
+#[test]
+fn a_fifo_text_file_is_reported_and_the_rest_used() {
+    let dir = tempfile::tempdir().unwrap();
+    let mime = build(dir.path(), SYSTEM);
+    fs::remove_file(mime.join("mime.cache")).unwrap();
+    fs::remove_file(mime.join("magic")).unwrap();
+    fifo(&mime.join("magic"));
+    let db = within(Duration::from_secs(10), move || {
+        Box::new(MimeDatabase::from_dirs(vec![mime]))
+    });
+    let messages: Vec<String> = db.diagnostics().iter().map(ToString::to_string).collect();
+    assert_eq!(messages.len(), 1, "{messages:#?}");
+    assert!(messages[0].contains("magic"), "{messages:#?}");
+    assert_eq!(
+        db.type_for_name("a.diff").best().unwrap().mime.as_str(),
+        "text/x-diff"
+    );
+}
+
 #[test]
 fn damaged_files_are_reported_and_the_rest_used() {
     let dir = tempfile::tempdir().unwrap();
@@ -855,16 +918,11 @@ fn folders_and_special_files_are_typed_by_kind() {
     );
 
     // A FIFO is typed by its kind, never opened (opening would block).
-    let fifo = path("fifo");
-    rustix::fs::mknodat(
-        rustix::fs::CWD,
-        &fifo,
-        rustix::fs::FileType::Fifo,
-        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
-        0,
-    )
-    .unwrap();
-    assert_eq!(detect(&fifo, &defaults).mime.as_str(), "inode/fifo");
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        fifo(&path("fifo"));
+        assert_eq!(detect(&path("fifo"), &defaults).mime.as_str(), "inode/fifo");
+    }
     assert_eq!(
         detect(Path::new("/dev/null"), &defaults).mime.as_str(),
         "inode/chardevice"
@@ -964,6 +1022,12 @@ fn paths_by_name_content_and_link() {
 /// Needs a filesystem that holds user extended attributes, and fails where
 /// there is none, unless `XDG_KIT_SKIP_XATTR_TEST=1` says to skip it (the
 /// Nix build sandbox's folders cannot hold them; `checks.workspace` sets it).
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "hurd",
+    target_vendor = "apple"
+))]
 #[test]
 fn the_extended_attribute_is_used_only_when_asked() {
     if std::env::var_os("XDG_KIT_SKIP_XATTR_TEST").is_some_and(|value| value == "1") {
@@ -995,5 +1059,667 @@ fn the_extended_attribute_is_used_only_when_asked() {
     assert_eq!(
         (found.mime.as_str(), found.decided_by),
         ("application/x-old", DecidedBy::Attribute)
+    );
+}
+
+/// A folder with only the given text files (no `mime.cache`).
+fn text_only(dir: &Path, files: &[(&str, &[u8])]) -> MimeDatabase {
+    for (name, contents) in files {
+        fs::write(dir.join(name), contents).unwrap();
+    }
+    MimeDatabase::from_dirs([dir])
+}
+
+/// `application/x-custom`'s magic, `[90:application/x-custom]` followed by
+/// `lines`, as the only rule of a text-only folder.
+fn custom_magic(dir: &Path, lines: &[u8]) -> MimeDatabase {
+    let mut magic = b"MIME-Magic\0\n[90:application/x-custom]\n".to_vec();
+    magic.extend_from_slice(lines);
+    text_only(dir, &[("magic", &magic)])
+}
+
+fn is_custom(db: &MimeDatabase, data: &[u8]) -> bool {
+    db.type_for_data(data).mime.as_str() == "application/x-custom"
+}
+
+#[test]
+fn a_magic_matchlet_whose_only_child_is_damaged_is_dropped() {
+    for (what, child, problem) in [
+        (
+            "malformed",
+            &b"1>x=\x00\x01Q\n"[..],
+            "unknown or malformed field, line skipped",
+        ),
+        (
+            "unknown field",
+            b"1>1=\x00\x01Q!future\n",
+            "unknown or malformed field, line skipped",
+        ),
+        (
+            "cut off at the end",
+            b"1>1=\x00\x05Q",
+            "truncated value, rest of file skipped",
+        ),
+        (
+            "nesting skips a level",
+            b"2>1=\x00\x01Q\n",
+            "nesting skips a level or is too deep, line skipped",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = custom_magic(dir.path(), &[&b">0=\x00\x01A\n"[..], child].concat());
+        assert!(!is_custom(&db, b"AQ"), "{what}");
+        assert!(!is_custom(&db, b"A"), "{what}");
+        let messages: Vec<(Option<Location>, &str)> = db
+            .diagnostics()
+            .iter()
+            .map(|found| (found.location, found.message.as_str()))
+            .collect();
+        // The child's line, then the section's header.
+        assert_eq!(
+            messages,
+            [
+                (Some(Location::Offset(45)), problem),
+                (
+                    Some(Location::Offset(12)),
+                    "no test left whole (one lost all its nested lines), section skipped"
+                ),
+            ],
+            "{what}"
+        );
+    }
+}
+
+#[test]
+fn a_magic_matchlet_that_keeps_one_child_still_matches_through_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = custom_magic(
+        dir.path(),
+        b">0=\x00\x01A\n1>1=\x00\x01Q\n1>1=\x00\x01Z!future\n",
+    );
+    assert!(is_custom(&db, b"AQ"));
+    assert!(!is_custom(&db, b"AZ"));
+    assert!(!is_custom(&db, b"A"));
+}
+
+#[test]
+fn losing_every_child_passes_up_the_magic_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = custom_magic(
+        dir.path(),
+        b">0=\x00\x01A\n1>1=\x00\x01Q\n2>2=\x00\x01R!future\n>0=\x00\x01B\n",
+    );
+    assert!(!is_custom(&db, b"AQR"));
+    assert!(!is_custom(&db, b"AQ"));
+    assert!(is_custom(&db, b"B"), "a sibling rule is kept");
+    // A line below a damaged line goes with it, not under an earlier
+    // sibling.
+    let dir = tempfile::tempdir().unwrap();
+    let db = custom_magic(
+        dir.path(),
+        b">0=\x00\x01A\n1>1=\x00\x01B\n1>1=\x00\x01Q!future\n2>2=\x00\x01C\n",
+    );
+    assert!(is_custom(&db, b"AB"));
+}
+
+#[test]
+fn a_damaged_top_level_magic_line_disappears_but_one_of_unknown_depth_drops_the_section() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = custom_magic(dir.path(), b">0=\x00\x01A!future\n>0=\x00\x01B\n");
+    assert!(is_custom(&db, b"B"));
+    assert!(!is_custom(&db, b"A"));
+    let dir = tempfile::tempdir().unwrap();
+    let db = custom_magic(dir.path(), b">0=\x00\x01B\nx>0=\x00\x01C\n>0=\x00\x01D\n");
+    assert!(!is_custom(&db, b"B"));
+    assert!(!is_custom(&db, b"D"));
+}
+
+const NESTED_MAGIC: &str = r#"
+  <mime-type type="application/x-custom">
+    <magic priority="90">
+      <match type="string" offset="0" value="A">
+        <match type="string" offset="1" value="Q"/>
+        <match type="string" offset="1" value="Z"/>
+      </match>
+    </magic>
+  </mime-type>
+"#;
+
+/// Points the value of a matchlet of the first magic rule in
+/// `mime.cache` outside the file, and returns its first byte. `route`
+/// picks the matchlet: its index among the rule's matchlets, then among
+/// each one's children.
+fn wreck_cache_matchlet(mime: &Path, route: &[usize]) -> u8 {
+    let path = mime.join("mime.cache");
+    let mut bytes = fs::read(&path).unwrap();
+    let u32_at = |bytes: &[u8], at: usize| {
+        u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap()) as usize
+    };
+    let magic = u32_at(&bytes, 24);
+    let first_match = u32_at(&bytes, magic + 8);
+    let mut count = u32_at(&bytes, first_match + 8);
+    let mut first = u32_at(&bytes, first_match + 12);
+    let mut matchlet = 0;
+    for &index in route {
+        assert!(index < count, "{route:?}");
+        matchlet = first + 32 * index;
+        count = u32_at(&bytes, matchlet + 24);
+        first = u32_at(&bytes, matchlet + 28);
+    }
+    let value = bytes[u32_at(&bytes, matchlet + 16)];
+    bytes[matchlet + 16..matchlet + 20].copy_from_slice(&u32::MAX.to_be_bytes());
+    fs::write(&path, bytes).unwrap();
+    value
+}
+
+#[test]
+fn a_cache_matchlet_whose_children_are_damaged_is_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let mime = build(dir.path(), NESTED_MAGIC);
+    wreck_cache_matchlet(&mime, &[0, 0]);
+    wreck_cache_matchlet(&mime, &[0, 1]);
+    let db = MimeDatabase::from_dirs([&mime]);
+    let messages: Vec<&str> = db
+        .diagnostics()
+        .iter()
+        .map(|found| found.message.as_str())
+        .collect();
+    assert_eq!(
+        messages,
+        [
+            "matchlet value or mask outside the file, skipped",
+            "matchlet value or mask outside the file, skipped",
+            "no matchlet left whole (one lost all its children), entry skipped",
+        ]
+    );
+    for data in [&b"A"[..], b"AQ", b"AZ"] {
+        assert!(!is_custom(&db, data), "{data:?}");
+    }
+}
+
+#[test]
+fn a_cache_entry_that_loses_its_matchlets_for_mixed_reasons_is_reported_once() {
+    // One matchlet loses its only child, the other its own value.
+    let dir = tempfile::tempdir().unwrap();
+    let mime = build(
+        dir.path(),
+        r#"
+  <mime-type type="application/x-custom">
+    <magic priority="90">
+      <match type="string" offset="0" value="A">
+        <match type="string" offset="1" value="Q"/>
+      </match>
+      <match type="string" offset="0" value="B"/>
+    </magic>
+  </mime-type>
+"#,
+    );
+    assert_eq!(wreck_cache_matchlet(&mime, &[0, 0]), b'Q');
+    assert_eq!(wreck_cache_matchlet(&mime, &[1]), b'B');
+    let db = MimeDatabase::from_dirs([&mime]);
+    let messages: Vec<&str> = db
+        .diagnostics()
+        .iter()
+        .map(|found| found.message.as_str())
+        .collect();
+    assert_eq!(
+        messages,
+        [
+            "matchlet value or mask outside the file, skipped",
+            "matchlet value or mask outside the file, skipped",
+            "no matchlet left whole (one lost all its children), entry skipped",
+        ]
+    );
+    for data in [&b"A"[..], b"AQ", b"B"] {
+        assert!(!is_custom(&db, data), "{data:?}");
+    }
+}
+
+#[test]
+fn a_cache_matchlet_that_keeps_one_child_still_matches_through_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let mime = build(dir.path(), NESTED_MAGIC);
+    let lost = wreck_cache_matchlet(&mime, &[0, 1]);
+    let kept = if lost == b'Q' { b'Z' } else { b'Q' };
+    let db = MimeDatabase::from_dirs([&mime]);
+    assert!(is_custom(&db, &[b'A', kept]));
+    assert!(!is_custom(&db, &[b'A', lost]));
+    assert!(!is_custom(&db, b"A"));
+}
+
+/// `x-content/x-custom`'s tree magic, `[50:x-content/x-custom]` followed by
+/// `lines`, as the only rule of a text-only folder; and the types found for
+/// a volume holding the folder `a/b`.
+fn custom_tree_types(lines: &str) -> Vec<String> {
+    let dir = tempfile::tempdir().unwrap();
+    let treemagic = format!("MIME-TreeMagic\0\n[50:x-content/x-custom]\n{lines}");
+    let db = text_only(dir.path(), &[("treemagic", treemagic.as_bytes())]);
+    let volume = tempfile::tempdir().unwrap();
+    fs::create_dir_all(volume.path().join("a/b")).unwrap();
+    db.content_types_for_root(volume.path(), &TreeOptions::default())
+        .unwrap()
+        .iter()
+        .map(ToString::to_string)
+        .collect()
+}
+
+#[test]
+fn a_tree_matchlet_whose_only_child_is_damaged_is_dropped() {
+    for child in [
+        "1>\"a/c\"=socket\n",
+        "1>\"../c\"=directory\n",
+        "1>\"a/c\"=directory,not/a type!\n",
+        "2>\"a/c\"=directory\n",
+        "1>\"Foo",
+    ] {
+        assert!(
+            custom_tree_types(&format!(">\"a\"=directory\n{child}")).is_empty(),
+            "{child}"
+        );
+    }
+    assert!(
+        custom_tree_types(">\"a\"=directory\nx>\"a\"=directory\n>\"a/b\"=directory\n").is_empty()
+    );
+}
+
+#[test]
+fn a_tree_matchlet_that_keeps_one_child_still_matches_through_it() {
+    assert_eq!(
+        custom_tree_types(">\"a\"=directory\n1>\"a/b\"=directory\n1>\"a/c\"=socket\n"),
+        ["x-content/x-custom"]
+    );
+    assert!(
+        custom_tree_types(">\"a\"=directory\n1>\"a/c\"=directory\n1>\"a/b\"=socket\n").is_empty()
+    );
+}
+
+#[test]
+fn a_well_formed_last_tree_line_without_a_newline_is_read() {
+    assert_eq!(
+        custom_tree_types(">\"a\"=directory\n1>\"a/b\"=directory"),
+        ["x-content/x-custom"]
+    );
+    assert!(custom_tree_types(">\"a\"=directory\n1>\"a/c\"=directory").is_empty());
+}
+
+#[test]
+fn non_empty_asks_for_an_entry_besides_dot_and_dot_dot() {
+    assert!(custom_tree_types(">\"a/b\"=directory,non-empty\n").is_empty());
+    assert_eq!(
+        custom_tree_types(">\"a\"=directory,non-empty\n"),
+        ["x-content/x-custom"]
+    );
+}
+
+/// Whether `x-content/x-custom`, with the tree rule `line`, is found for a
+/// volume holding `xo/inner/f`, `xo/run` (executable), `xo/notes` (text)
+/// and `xo/d/x`, where `xo` can be searched but not listed (mode 111).
+/// `None` where the permission is not enforced (as for root).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn found_through_unlistable_folder(line: &str) -> Option<bool> {
+    let dir = tempfile::tempdir().unwrap();
+    let treemagic = format!("MIME-TreeMagic\0\n[50:x-content/x-custom]\n{line}\n");
+    let db = text_only(dir.path(), &[("treemagic", treemagic.as_bytes())]);
+    assert!(db.diagnostics().is_empty(), "{:?}", db.diagnostics());
+    let volume = tempfile::tempdir().unwrap();
+    let xo = volume.path().join("xo");
+    fs::create_dir_all(xo.join("inner")).unwrap();
+    fs::create_dir_all(xo.join("d")).unwrap();
+    fs::write(xo.join("inner/f"), "").unwrap();
+    fs::write(xo.join("d/x"), "").unwrap();
+    fs::write(xo.join("notes"), "some plain text\n").unwrap();
+    fs::write(xo.join("run"), "#!/bin/sh\n").unwrap();
+    fs::set_permissions(xo.join("run"), fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(&xo, fs::Permissions::from_mode(0o111)).unwrap();
+    let enforced = fs::read_dir(&xo).is_err();
+    let found = enforced.then(|| {
+        !db.content_types_for_root(volume.path(), &TreeOptions::default())
+            .unwrap()
+            .is_empty()
+    });
+    fs::set_permissions(&xo, fs::Permissions::from_mode(0o755)).unwrap();
+    if !enforced {
+        eprintln!("folder permissions are not enforced here (root?): not checked");
+    }
+    found
+}
+
+#[test]
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn a_path_through_a_folder_that_cannot_be_listed_is_found() {
+    let Some(found) = found_through_unlistable_folder(">\"xo/inner/f\"=file,match-case") else {
+        return;
+    };
+    assert!(found);
+    for (line, expected) in [
+        // Case-insensitively, the spelling the rule writes is looked up.
+        (">\"xo/inner/f\"=file", true),
+        // The volume root can be listed.
+        (">\"XO/inner/f\"=file", true),
+        // Other spellings in `xo` cannot be seen.
+        (">\"xo/INNER/f\"=file", false),
+        (">\"xo/INNER/f\"=file,match-case", false),
+        // The checks on an entry of `xo`.
+        (">\"xo/run\"=file,executable", true),
+        (">\"xo/notes\"=file,executable", false),
+        (">\"xo/notes\"=file,text/plain", true),
+        (">\"xo/d\"=directory,non-empty", true),
+        (">\"xo/inner\"=directory,non-empty,inode/directory", true),
+    ] {
+        assert_eq!(
+            found_through_unlistable_folder(line),
+            Some(expected),
+            "{line}"
+        );
+    }
+}
+
+#[test]
+fn a_folder_that_can_be_listed_is_searched_in_every_spelling() {
+    assert_eq!(
+        custom_tree_types(">\"A/B\"=directory\n"),
+        ["x-content/x-custom"]
+    );
+}
+
+/// Whether `x-content/x-custom`, with the only tree rule `>"path"=file`,
+/// is found for the volume `root`.
+fn custom_file_found(root: &Path, path: &str) -> bool {
+    let dir = tempfile::tempdir().unwrap();
+    let treemagic = format!("MIME-TreeMagic\0\n[50:x-content/x-custom]\n>\"{path}\"=file\n");
+    let db = text_only(dir.path(), &[("treemagic", treemagic.as_bytes())]);
+    assert!(db.diagnostics().is_empty(), "{:?}", db.diagnostics());
+    !db.content_types_for_root(root, &TreeOptions::default())
+        .unwrap()
+        .is_empty()
+}
+
+#[test]
+fn a_path_is_found_whatever_the_route_to_its_folder() {
+    // A lookup follows at most 40 links. `real/target` is a file through
+    // two links; one name for `real` is a chain of 39 links, the other
+    // one link. Looked up as one path, `<chain>/target` has 41 links.
+    // Which name the volume lists first is the file system's order, so
+    // both are swapped.
+    let cases = [("a", "A"), ("A", "a")]
+        .into_iter()
+        .flat_map(|names| [(names, true), (names, false)]);
+    for ((chain, short), chain_first) in cases {
+        let root = tempfile::tempdir().unwrap();
+        let path = |name: &str| root.path().join(name);
+        fs::create_dir(path("real")).unwrap();
+        fs::write(path("file"), "x").unwrap();
+        symlink("t2", path("real/target")).unwrap();
+        symlink("../file", path("real/t2")).unwrap();
+        for link in 1..38 {
+            symlink(format!("l{}", link + 1), path(&format!("l{link}"))).unwrap();
+        }
+        symlink("real", path("l38")).unwrap();
+        let make_chain = || symlink("l1", path(chain)).unwrap();
+        if chain_first {
+            make_chain();
+        }
+        symlink("real", path(short)).unwrap();
+        if !chain_first {
+            make_chain();
+        }
+        assert!(
+            custom_file_found(root.path(), "a/target"),
+            "{chain} through 39 links, {short} through one"
+        );
+    }
+}
+
+#[test]
+fn a_path_longer_than_the_system_allows_is_found_step_by_step() {
+    use rustix::fs::{Mode, OFlags};
+    // 21 folders of 200 bytes: the whole path is over 4,096 bytes, each
+    // name well under 255.
+    let name = "d".repeat(200);
+    let root = tempfile::tempdir().unwrap();
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+    let mut folder = rustix::fs::open(root.path(), flags, Mode::empty()).unwrap();
+    for _ in 0..21 {
+        rustix::fs::mkdirat(&folder, name.as_str(), Mode::RWXU).unwrap();
+        folder = rustix::fs::openat(&folder, name.as_str(), flags, Mode::empty()).unwrap();
+    }
+    rustix::fs::openat(
+        &folder,
+        "target",
+        OFlags::WRONLY | OFlags::CREATE | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::WUSR,
+    )
+    .unwrap();
+    let rule_path = format!("{}target", format!("{name}/").repeat(21));
+    assert!(root.path().join(&rule_path).as_os_str().len() > 4096);
+    assert!(custom_file_found(root.path(), &rule_path));
+}
+
+const ESCAPED_NAMESPACE: &str = r#"
+  <mime-type type="application/xml">
+    <magic priority="40"><match type="string" offset="0" value="&lt;?xml"/></magic>
+  </mime-type>
+  <mime-type type="application/x-amp+xml">
+    <sub-class-of type="application/xml"/>
+    <root-XML namespaceURI="urn:a&amp;b" localName="doc"/>
+  </mime-type>
+  <mime-type type="application/x-plain+xml">
+    <sub-class-of type="application/xml"/>
+    <root-XML namespaceURI="urn:plain" localName="doc"/>
+  </mime-type>
+"#;
+
+#[test]
+fn xml_namespaces_are_compared_as_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let mime = build(dir.path(), ESCAPED_NAMESPACE);
+    assert_eq!(
+        fs::read_to_string(mime.join("XMLnamespaces")).unwrap(),
+        "urn:a&b doc application/x-amp+xml\nurn:plain doc application/x-plain+xml\n",
+        "update-mime-database stores the value"
+    );
+    for cache in [true, false] {
+        if !cache {
+            fs::remove_file(mime.join("mime.cache")).unwrap();
+        }
+        let db = MimeDatabase::from_dirs([&mime]);
+        assert!(db.diagnostics().is_empty(), "{:?}", db.diagnostics());
+        let detect = |root: &str| {
+            let found = db.type_for_data(format!("<?xml version=\"1.0\"?>{root}").as_bytes());
+            (found.mime.to_string(), found.decided_by)
+        };
+        for (root, wanted) in [
+            (r#"<doc xmlns="urn:a&amp;b"/>"#, "application/x-amp+xml"),
+            (r#"<doc xmlns="urn:a&#38;b"/>"#, "application/x-amp+xml"),
+            (
+                r#"<p:doc xmlns:p="urn:a&#x26;b"/>"#,
+                "application/x-amp+xml",
+            ),
+            (r#"<doc xmlns="urn:plain"/>"#, "application/x-plain+xml"),
+            (r#"<p:doc xmlns:p="urn:plain"/>"#, "application/x-plain+xml"),
+        ] {
+            assert_eq!(
+                detect(root),
+                (wanted.to_owned(), DecidedBy::XmlRoot),
+                "{root} (cache: {cache})"
+            );
+        }
+        assert_eq!(
+            detect(r#"<doc xmlns="urn:a&amp;b&bogus;"/>"#).0,
+            "application/xml",
+            "an unknown entity: no root match"
+        );
+    }
+}
+
+#[test]
+fn white_space_in_xml_namespaces_is_normalised() {
+    // update-mime-database refuses a namespace with a space or a newline,
+    // but keeps a tab written as a character reference.
+    let dir = tempfile::tempdir().unwrap();
+    let mime = build(
+        dir.path(),
+        r#"
+  <mime-type type="application/xml">
+    <magic priority="40"><match type="string" offset="0" value="&lt;?xml"/></magic>
+  </mime-type>
+  <mime-type type="application/x-tab+xml">
+    <sub-class-of type="application/xml"/>
+    <root-XML namespaceURI="urn:a&#9;b" localName="doc"/>
+  </mime-type>
+"#,
+    );
+    assert_eq!(
+        fs::read_to_string(mime.join("XMLnamespaces")).unwrap(),
+        "urn:a\tb doc application/x-tab+xml\n"
+    );
+    for cache in [true, false] {
+        if !cache {
+            fs::remove_file(mime.join("mime.cache")).unwrap();
+        }
+        let db = MimeDatabase::from_dirs([&mime]);
+        assert!(db.diagnostics().is_empty(), "{:?}", db.diagnostics());
+        let detect = |root: &str| {
+            db.type_for_data(format!("<?xml version=\"1.0\"?>{root}").as_bytes())
+                .mime
+                .to_string()
+        };
+        assert_eq!(
+            detect("<doc xmlns=\"urn:a&#9;b\"/>"),
+            "application/x-tab+xml",
+            "cache: {cache}"
+        );
+        assert_eq!(
+            detect("<doc xmlns=\"urn:a\tb\"/>"),
+            "application/xml",
+            "a tab as it is becomes a space (cache: {cache})"
+        );
+    }
+}
+
+#[test]
+fn implicit_ancestors_are_followed_through_their_own_parents() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = text_only(
+        dir.path(),
+        &[(
+            "subclasses",
+            b"text/x-child text/x-parent\n\
+              text/plain application/x-parent\n\
+              application/x-parent application/x-grandparent\n\
+              application/octet-stream application/x-under-any\n",
+        )],
+    );
+    assert!(db.is_a(&m("text/x-any"), &m("application/x-parent")));
+    assert!(db.is_a(&m("text/x-any"), &m("application/x-grandparent")));
+    assert!(db.is_a(&m("image/x-any"), &m("application/x-under-any")));
+    assert_eq!(
+        db.ancestors(&m("text/x-child")),
+        [
+            m("text/x-parent"),
+            m("text/plain"),
+            m("application/x-parent"),
+            m("application/x-grandparent"),
+            m("application/octet-stream"),
+            m("application/x-under-any"),
+        ]
+    );
+    assert!(!db.is_a(&m("inode/directory"), &m("application/x-under-any")));
+}
+
+#[test]
+fn an_inode_type_under_a_data_type_is_any_data_too() {
+    // Subclassing is transitive: `text/x-any` is `application/octet-stream`.
+    let dir = tempfile::tempdir().unwrap();
+    let db = text_only(dir.path(), &[("subclasses", b"inode/x-thing text/x-any\n")]);
+    assert_eq!(
+        db.ancestors(&m("inode/x-thing")),
+        [
+            m("text/x-any"),
+            m("text/plain"),
+            m("application/octet-stream"),
+        ]
+    );
+    assert!(db.ancestors(&m("inode/directory")).is_empty());
+}
+
+#[test]
+fn a_parent_loop_through_text_plain_ends_with_application_octet_stream_last() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = text_only(
+        dir.path(),
+        &[(
+            "subclasses",
+            b"text/plain application/x-loop\n\
+              application/x-loop application/octet-stream\n\
+              application/x-loop text/x-looped\n\
+              text/x-looped text/plain\n",
+        )],
+    );
+    assert_eq!(
+        db.ancestors(&m("text/x-any")),
+        [
+            m("text/plain"),
+            m("application/x-loop"),
+            m("text/x-looped"),
+            m("application/octet-stream"),
+        ]
+    );
+    // Named explicitly, it is last too.
+    assert_eq!(
+        db.ancestors(&m("text/plain")),
+        [
+            m("application/x-loop"),
+            m("text/x-looped"),
+            m("application/octet-stream"),
+        ]
+    );
+}
+
+#[test]
+fn an_explicit_application_octet_stream_parent_comes_last() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = text_only(
+        dir.path(),
+        &[(
+            "subclasses",
+            b"application/x-a application/octet-stream\n\
+              application/x-a application/x-b\n\
+              application/x-b application/x-c\n\
+              application/x-c application/octet-stream\n\
+              application/octet-stream application/x-under-any\n\
+              application/x-under-any application/x-b\n",
+        )],
+    );
+    assert_eq!(
+        db.ancestors(&m("application/x-a")),
+        [
+            m("application/x-b"),
+            m("application/x-c"),
+            m("application/octet-stream"),
+            m("application/x-under-any"),
+        ]
+    );
+    // Its own ancestors are found as any type's.
+    assert_eq!(
+        db.ancestors(&m("application/octet-stream")),
+        [
+            m("application/x-under-any"),
+            m("application/x-b"),
+            m("application/x-c"),
+        ]
+    );
+    // An `inode/*` type below it is data.
+    let db = text_only(
+        dir.path(),
+        &[(
+            "subclasses",
+            b"inode/x-thing application/octet-stream\n\
+              inode/x-thing inode/x-other\n",
+        )],
+    );
+    assert_eq!(
+        db.ancestors(&m("inode/x-thing")),
+        [m("inode/x-other"), m("application/octet-stream")]
     );
 }

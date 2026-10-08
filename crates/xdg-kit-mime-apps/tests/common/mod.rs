@@ -38,9 +38,14 @@ const TYPES: &str = r#"<?xml version="1.0"?>
 /// - `config` (`XDG_CONFIG_HOME`), `etc` and `etc2` (`XDG_CONFIG_DIRS`);
 /// - `local` (`XDG_DATA_HOME`), `share1`, `share2` and `mime-data`
 ///   (`XDG_DATA_DIRS`, the last holding only the MIME database).
+///
+/// `folders` replaces a variable's folder by another one under the root;
+/// `prepended` puts another one first in a list variable.
 pub struct Fixture {
     pub root: tempfile::TempDir,
     pub desktops: Vec<String>,
+    pub folders: Vec<(&'static str, &'static str)>,
+    pub prepended: Vec<(&'static str, &'static str)>,
 }
 
 impl Fixture {
@@ -48,6 +53,8 @@ impl Fixture {
         let fixture = Self {
             root: tempfile::tempdir().unwrap(),
             desktops: Vec::new(),
+            folders: Vec::new(),
+            prepended: Vec::new(),
         };
         fixture.add_types("test", TYPES);
         fixture
@@ -100,7 +107,7 @@ impl Fixture {
             data_dirs.push(":");
             data_dirs.push(p(name));
         }
-        vec![
+        let mut vars = vec![
             ("HOME", self.root.path().as_os_str().to_owned()),
             ("XDG_CONFIG_HOME", p("config")),
             ("XDG_CONFIG_DIRS", {
@@ -112,7 +119,19 @@ impl Fixture {
             ("XDG_DATA_HOME", p("local")),
             ("XDG_DATA_DIRS", data_dirs),
             ("XDG_CURRENT_DESKTOP", self.desktops.join(":").into()),
-        ]
+        ];
+        for (name, value) in &mut vars {
+            if let Some((_, folder)) = self.folders.iter().find(|(known, _)| known == name) {
+                *value = p(folder);
+            }
+            for (_, folder) in self.prepended.iter().filter(|(known, _)| known == name) {
+                let mut list = p(folder);
+                list.push(":");
+                list.push(&*value);
+                *value = list;
+            }
+        }
+        vars
     }
 
     pub fn base_dirs(&self) -> BaseDirs {
@@ -126,11 +145,15 @@ impl Fixture {
     }
 
     pub fn mime_apps(&self) -> MimeApps {
-        let base_dirs = self.base_dirs();
+        self.mime_apps_with(AppIndex::load(&self.base_dirs()))
+    }
+
+    /// As [`Fixture::mime_apps`], with `index` for the applications.
+    pub fn mime_apps_with(&self, index: AppIndex) -> MimeApps {
         MimeApps::load(
-            &base_dirs,
+            &self.base_dirs(),
             &Desktops::new(self.desktops.clone()),
-            Arc::new(AppIndex::load(&base_dirs)),
+            Arc::new(index),
             Arc::new(MimeDatabase::from_dirs([self.path("mime-data/mime")])),
         )
     }

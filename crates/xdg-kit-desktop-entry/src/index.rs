@@ -1,4 +1,4 @@
-//! The installed applications by desktop file ID (Desktop Entry spec
+//! The installed desktop entries by desktop file ID (Desktop Entry spec
 //! "Desktop File ID").
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -11,12 +11,13 @@ use std::sync::Arc;
 
 use xdg_kit_basedir::{BaseDirs, FileStamp};
 
-use crate::{DesktopEntry, Desktops, Diagnostic};
+use crate::{DesktopEntry, Desktops, Diagnostic, EntryType};
 
 /// Deepest folder nesting followed below an `applications` folder.
 const MAX_DEPTH: usize = 32;
 
-/// An installed application: a desktop entry with its desktop file ID.
+/// An installed desktop entry (an application, a link or a folder) with
+/// its desktop file ID.
 #[derive(Debug, Clone)]
 pub struct AppEntry {
     id: String,
@@ -102,10 +103,13 @@ struct Found {
     entry: Arc<DesktopEntry>,
 }
 
-/// The installed applications, indexed by desktop file ID from entries
-/// under the data directories' `applications` folders. The first file for
-/// an ID takes precedence. This is an immutable snapshot;
-/// [`AppIndex::refresh`] returns a new one when files change.
+/// The installed desktop entries (applications, links and folders),
+/// indexed by desktop file ID from the files under the data directories'
+/// `applications` folders. The first file for an ID takes precedence.
+/// Unreadable files, unsupported encodings, and missing or unknown `Type`
+/// values are ignored, allowing a later file to supply the same ID.
+/// This is an immutable snapshot; [`AppIndex::refresh`] returns a new one
+/// when files change.
 #[derive(Debug)]
 pub struct AppIndex {
     /// The `applications` folders, most important first, with stamps.
@@ -113,15 +117,15 @@ pub struct AppIndex {
     /// Every folder scanned, with its stamp, so added files are noticed.
     folders: Vec<(PathBuf, FileStamp)>,
     found: Vec<Found>,
-    /// Files skipped as unreadable or in an unsupported encoding, with their
-    /// stamps, so a fix to one is noticed.
+    /// Files skipped as unreadable, in an unsupported encoding or of an
+    /// unknown or no type, with their stamps, so a fix to one is noticed.
     ignored: Vec<(PathBuf, FileStamp)>,
     /// The winning file of each ID, as an index into `found`; `None` when
-    /// it says `Hidden=true` (the application is deleted).
+    /// it says `Hidden=true` (the entry is deleted).
     by_id: BTreeMap<String, Option<usize>>,
     /// The IDs each root holds (by index into `roots`), shadowed ones
     /// included; files that could not be read or are ignored for their
-    /// encoding are not counted, shadowed or not.
+    /// encoding or type are not counted, shadowed or not.
     held: Vec<BTreeSet<String>>,
     /// Files a more important folder shadows, read and stamped so that
     /// `held` stays right and a change to one is noticed.
@@ -130,7 +134,7 @@ pub struct AppIndex {
 }
 
 impl AppIndex {
-    /// The applications under `$XDG_DATA_HOME/applications` and each
+    /// The desktop entries under `$XDG_DATA_HOME/applications` and each
     /// `$XDG_DATA_DIRS/applications`, in that order of importance.
     #[must_use]
     pub fn load(base_dirs: &BaseDirs) -> Self {
@@ -140,7 +144,7 @@ impl AppIndex {
         Self::from_dirs(dirs)
     }
 
-    /// The applications under exactly these `applications` folders, most
+    /// The desktop entries under exactly these `applications` folders, most
     /// important first.
     #[must_use]
     pub fn from_dirs(dirs: impl IntoIterator<Item = impl Into<PathBuf>>) -> Self {
@@ -231,14 +235,11 @@ impl AppIndex {
                         .diagnostics
                         .extend(entry.key_file().diagnostics().iter().cloned());
                 }
-                if !entry.supports_encoding() {
-                    let encoding = entry.string("Encoding").unwrap_or_default();
-                    // The spec: an implementation that does not support an
-                    // encoding should ignore the file.
+                if let Some(reason) = ignored_because(&entry) {
                     index.diagnostics.push(Diagnostic::new(
                         Some(path.clone()),
                         None,
-                        format!("Encoding={encoding} is not supported; the file is ignored"),
+                        format!("{reason}; the file is ignored"),
                     ));
                     index.ignored.push((path, stamp));
                     continue;
@@ -361,8 +362,9 @@ impl AppIndex {
         Some(Self::scan(roots, &cache))
     }
 
-    /// The application with desktop file ID `id`, unless its winning file
-    /// says `Hidden=true`.
+    /// The desktop entry with desktop file ID `id`, unless its winning file
+    /// says `Hidden=true`. It may be a link or a folder as well as an
+    /// application (see [`DesktopEntry::entry_type`]).
     #[must_use]
     pub fn get(&self, id: &str) -> Option<AppEntry> {
         let at = (*self.by_id.get(id)?)?;
@@ -378,7 +380,8 @@ impl AppIndex {
         }
     }
 
-    /// Every application, by desktop file ID, without the hidden ones.
+    /// Every desktop entry (applications, links and folders), by desktop
+    /// file ID, without the hidden ones.
     pub fn iter(&self) -> impl Iterator<Item = AppEntry> + '_ {
         self.by_id
             .values()
@@ -391,9 +394,9 @@ impl AppIndex {
         self.roots.iter().map(|(path, _)| path.as_path()).collect()
     }
 
-    /// Files that could not be read or are ignored for their encoding
-    /// (shadowed ones too), ID clashes, and problems inside the winning
-    /// files.
+    /// Files that could not be read or are ignored for their encoding or
+    /// type (shadowed ones too), ID clashes, and problems inside the
+    /// winning files.
     #[must_use]
     pub fn diagnostics(&self) -> &[Diagnostic] {
         &self.diagnostics
@@ -402,8 +405,9 @@ impl AppIndex {
     /// Whether the folder `dir` (an index into [`AppIndex::dirs`]) holds a
     /// desktop file with ID `id`, even one a more important folder shadows
     /// or one that says `Hidden=true`. Files that could not be read, or that
-    /// are ignored for their encoding, do not count. The MIME Applications
-    /// spec's rules work folder by folder and need this.
+    /// are ignored for their encoding or for an unknown or missing `Type`,
+    /// do not count. The MIME Applications spec's rules work folder by
+    /// folder and need this.
     #[must_use]
     pub fn dir_holds(&self, dir: usize, id: &str) -> bool {
         self.held.get(dir).is_some_and(|ids| ids.contains(id))
@@ -415,12 +419,33 @@ impl AppIndex {
         self.held.get(dir).into_iter().flatten().map(String::as_str)
     }
 
-    /// The folder (index into [`AppIndex::dirs`]) the application `id` came
-    /// from.
+    /// The folder (index into [`AppIndex::dirs`]) the desktop entry `id`
+    /// came from.
     #[must_use]
     pub fn dir_of(&self, id: &str) -> Option<usize> {
         let at = (*self.by_id.get(id)?)?;
         Some(self.found[at].root)
+    }
+}
+
+/// Why the index ignores `entry`, if it does. The spec: an implementation
+/// that does not support an encoding should ignore the file, and
+/// implementations should ignore desktop entries with an unknown type
+/// (`Type` is required, so one without it is ignored too). `Hidden=true`
+/// deletes the ID whatever the type; minimal deletion files often have
+/// none.
+fn ignored_because(entry: &DesktopEntry) -> Option<String> {
+    if !entry.supports_encoding() {
+        let encoding = entry.string("Encoding").unwrap_or_default();
+        return Some(format!("Encoding={encoding} is not supported"));
+    }
+    if entry.hidden() {
+        return None;
+    }
+    match entry.entry_type() {
+        None => Some("no Type".to_owned()),
+        Some(EntryType::Other(other)) => Some(format!("Type={other} is not a type the spec lists")),
+        Some(_) => None,
     }
 }
 
@@ -476,6 +501,116 @@ mod tests {
         let index = AppIndex::from_dirs([high.path(), low.path()]);
         assert!(index.get("org.foo.desktop").is_none());
         assert_eq!(index.iter().count(), 0);
+    }
+
+    #[test]
+    fn hidden_without_a_type_deletes_the_id_too() {
+        let high = tempfile::tempdir().unwrap();
+        let low = tempfile::tempdir().unwrap();
+        write(
+            &high.path().join("org.foo.desktop"),
+            "[Desktop Entry]\nHidden=true\n",
+        );
+        write(&low.path().join("org.foo.desktop"), &app("low"));
+        let index = AppIndex::from_dirs([high.path(), low.path()]);
+        assert!(index.get("org.foo.desktop").is_none());
+        assert!(index.dir_holds(0, "org.foo.desktop"));
+        assert!(index.diagnostics().is_empty(), "{:?}", index.diagnostics());
+    }
+
+    #[test]
+    fn entries_of_an_unknown_or_no_type_are_ignored() {
+        let high = tempfile::tempdir().unwrap();
+        let low = tempfile::tempdir().unwrap();
+        write(
+            &high.path().join("org.foo.desktop"),
+            "[Desktop Entry]\nType=Service\nName=x\nExec=service\n",
+        );
+        write(
+            &high.path().join("org.bar.desktop"),
+            "[Desktop Entry]\nName=x\nExec=untyped\n",
+        );
+        write(&low.path().join("org.foo.desktop"), &app("low-foo"));
+        write(&low.path().join("org.bar.desktop"), &app("low-bar"));
+        // Shadowed, so read only to know whether the folder holds them.
+        write(&high.path().join("shadow.desktop"), &app("high"));
+        write(
+            &low.path().join("shadow.desktop"),
+            "[Desktop Entry]\nType=Service\nName=x\n",
+        );
+        write(
+            &low.path().join("link.desktop"),
+            "[Desktop Entry]\nType=Link\nName=x\nURL=https://x.org/\n",
+        );
+        write(
+            &low.path().join("menu.desktop"),
+            "[Desktop Entry]\nType=Directory\nName=x\n",
+        );
+        let index = AppIndex::from_dirs([high.path(), low.path()]);
+        let exec = |id: &str| index.get(id).unwrap().entry().exec();
+        assert_eq!(exec("org.foo.desktop").as_deref(), Some("low-foo"));
+        assert_eq!(exec("org.bar.desktop").as_deref(), Some("low-bar"));
+        assert_eq!(index.dir_of("org.foo.desktop"), Some(1));
+        assert_eq!(
+            index.dir_ids(0).collect::<Vec<_>>(),
+            ["shadow.desktop"],
+            "ignored files are not held"
+        );
+        assert_eq!(
+            index.dir_ids(1).collect::<Vec<_>>(),
+            [
+                "link.desktop",
+                "menu.desktop",
+                "org.bar.desktop",
+                "org.foo.desktop"
+            ]
+        );
+        assert_eq!(
+            index
+                .iter()
+                .map(|app| app.id().to_owned())
+                .collect::<Vec<_>>(),
+            [
+                "link.desktop",
+                "menu.desktop",
+                "org.bar.desktop",
+                "org.foo.desktop",
+                "shadow.desktop"
+            ]
+        );
+        let messages: Vec<&str> = index
+            .diagnostics()
+            .iter()
+            .map(|d| d.message.as_str())
+            .collect();
+        assert_eq!(
+            messages,
+            [
+                "no Type; the file is ignored",
+                "Type=Service is not a type the spec lists; the file is ignored",
+                "Type=Service is not a type the spec lists; the file is ignored",
+            ]
+        );
+        assert!(index.refresh().is_none());
+        write(&high.path().join("org.foo.desktop"), &app("fixed"));
+        let index = index.refresh().expect("the ignored file was fixed");
+        assert_eq!(
+            index
+                .get("org.foo.desktop")
+                .unwrap()
+                .entry()
+                .exec()
+                .as_deref(),
+            Some("fixed")
+        );
+        write(
+            &low.path().join("shadow.desktop"),
+            "[Desktop Entry]\nType=Application\nName=x\nExec=x\n",
+        );
+        let index = index
+            .refresh()
+            .expect("the ignored shadowed file was fixed");
+        assert!(index.dir_holds(1, "shadow.desktop"));
     }
 
     #[test]

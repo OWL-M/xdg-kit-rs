@@ -110,8 +110,12 @@ fn file(
     follow_links: bool,
 ) -> Result<Result<MimeType, LaunchPlan>, OpenError> {
     let mime = type_of_file(apps, path)?;
+    // Detection gives canonical types: the database may make this an alias.
+    let desktop_entry = apps
+        .mime_database()
+        .canonical(&MimeType::new("application/x-desktop").expect("a valid type"));
     if follow_links
-        && mime == MimeType::new("application/x-desktop").expect("a valid type")
+        && mime == desktop_entry
         && let Ok(entry) = DesktopEntry::read(path)
         && entry.entry_type() == Some(EntryType::Link)
     {

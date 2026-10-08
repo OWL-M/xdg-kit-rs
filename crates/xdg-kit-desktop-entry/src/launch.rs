@@ -38,7 +38,8 @@ pub struct LaunchOptions {
     /// `DESKTOP_STARTUP_ID` or the D-Bus `desktop-startup-id`.
     pub startup_id: Option<String>,
     /// The command that runs a program in a terminal (such as
-    /// `["foot", "--"]`), needed for `Terminal=true`.
+    /// `["foot", "--"]`), needed for `Terminal=true`. An empty one counts
+    /// as none.
     pub terminal: Option<Vec<OsString>>,
     /// The languages for `%c` (the translated name) and `%i`.
     pub locales: Locales,
@@ -332,6 +333,7 @@ fn exec_plan(
             let terminal = options
                 .terminal
                 .as_ref()
+                .filter(|terminal| !terminal.is_empty())
                 .ok_or(LaunchError::NeedsTerminal)?;
             args.splice(0..0, terminal.iter().cloned());
         }
@@ -820,6 +822,44 @@ mod tests {
             plan("Exec=foo %z", &[]),
             Err(LaunchError::Exec(_))
         ));
+        assert!(matches!(
+            plan(r#"Exec=foo "%z""#, &[]),
+            Err(LaunchError::Exec(ExecError::UnknownFieldCode('z')))
+        ));
+        assert!(matches!(
+            plan(r#"Exec=foo "\\%z""#, &[]),
+            Err(LaunchError::Exec(ExecError::UnknownFieldCode('z')))
+        ));
+        assert_eq!(
+            commands(&plan(r#"Exec=foo "%%z" "a%db""#, &[]).unwrap()),
+            [vec!["foo", "%z", "ab"]]
+        );
+    }
+
+    #[test]
+    fn an_empty_terminal_command_is_no_terminal() {
+        let options = LaunchOptions {
+            terminal: Some(Vec::new()),
+            ..LaunchOptions::default()
+        };
+        assert!(matches!(
+            prepare_launch(&entry("Exec=top\nTerminal=true"), &[], &options),
+            Err(LaunchError::NeedsTerminal)
+        ));
+    }
+
+    #[test]
+    fn an_empty_program_cannot_launch() {
+        for exec in [r#"Exec="""#, r#"Exec="" foo"#] {
+            assert!(
+                matches!(plan(exec, &[]), Err(LaunchError::Exec(ExecError::Empty))),
+                "{exec}"
+            );
+        }
+        assert_eq!(
+            commands(&plan(r#"Exec=foo """#, &[]).unwrap()),
+            [vec!["foo", ""]]
+        );
     }
 
     #[cfg(feature = "dbus")]

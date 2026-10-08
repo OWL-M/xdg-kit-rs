@@ -20,12 +20,17 @@ compile_error!("xdg-kit-basedir supports Unix systems only");
 mod base_dirs;
 mod error;
 mod paths;
+mod read;
 mod runtime;
 mod stamp;
+// FIFOs are made with `mknodat`, which rustix does not have on Apple systems.
+#[cfg(all(test, not(target_vendor = "apple")))]
+mod testing;
 pub mod user_dirs;
 
 pub use base_dirs::BaseDirs;
 pub use error::{Diagnostic, DiagnosticSource, Error};
+pub use read::{MAX_FILE_LEN, read_regular_file};
 pub use runtime::RuntimeDirProblem;
 pub use stamp::FileStamp;
 pub use user_dirs::{UserDirKind, UserDirs};

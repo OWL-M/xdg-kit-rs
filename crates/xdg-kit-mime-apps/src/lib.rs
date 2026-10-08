@@ -44,4 +44,4 @@ pub use cache::{mimeinfo_cache, write_mimeinfo_cache};
 pub use error::Diagnostic;
 pub use list::{EditError, Group, MIMEAPPS_LIST, MimeAppsList};
 pub use open::{OpenError, open_plan};
-pub use pattern::TypePattern;
+pub use pattern::{MediaType, TypePattern};
