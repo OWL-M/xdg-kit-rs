@@ -50,8 +50,11 @@ pub struct Fixture {
 
 impl Fixture {
     pub fn new() -> Self {
+        let root = tempfile::tempdir().unwrap();
+        // The folders are joined into `XDG_DATA_DIRS` and `XDG_CONFIG_DIRS`.
+        assert_listable(root.path());
         let fixture = Self {
-            root: tempfile::tempdir().unwrap(),
+            root,
             desktops: Vec::new(),
             folders: Vec::new(),
             prepended: Vec::new(),
@@ -165,6 +168,15 @@ impl Fixture {
             .map(|name| self.path(name).join("applications"))
             .collect()
     }
+}
+
+/// Fails at once when `path`, under the temporary folder, holds a `:`,
+/// which would split it in an XDG path list.
+pub fn assert_listable(path: &Path) {
+    assert!(
+        !path.as_os_str().as_encoded_bytes().contains(&b':'),
+        "TMPDIR contains ':', which an XDG path list cannot hold; set TMPDIR to a path without ':'"
+    );
 }
 
 /// Runs `update-desktop-database` on `folder`, writing its `mimeinfo.cache`.

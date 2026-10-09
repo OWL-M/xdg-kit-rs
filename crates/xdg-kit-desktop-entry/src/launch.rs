@@ -12,6 +12,7 @@ use std::process::{Child, Command};
 
 use xdg_kit_locale::Locales;
 
+use crate::error::{quoted, quoted_message, shown_path};
 use crate::exec::{CommandLine, ExecError, Values};
 use crate::{Action, DesktopEntry, EntryType};
 
@@ -150,10 +151,13 @@ pub enum LaunchError {
     NeedsLocalCopy(String),
     /// `Terminal=true`, but no terminal command was given.
     NeedsTerminal,
-    /// A target cannot be expressed as needed: a URI without a scheme, a
-    /// `file:` URI with a host, a NUL byte, a path that cannot be made
-    /// absolute.
-    BadTarget(String),
+    /// A path given as a target cannot be passed: it has a NUL byte, or
+    /// cannot be made absolute.
+    BadPath(PathBuf),
+    /// A URI given as a target cannot be passed: it has no scheme or a NUL
+    /// byte, or it is a `file:` URI with a host, without an absolute path,
+    /// or with a bad `%` escape or an escaped NUL byte.
+    BadUri(String),
     /// Starting `program` failed. The programs started before it are still
     /// running: their handles are in `started`, to be waited on.
     Spawn {
@@ -174,25 +178,36 @@ impl fmt::Display for LaunchError {
             Self::Link(url) => write!(
                 f,
                 "the entry is a link ({}); open it with the default handler",
-                url.as_deref().unwrap_or("no URL")
+                url.as_deref().map_or_else(|| "no URL".to_owned(), quoted)
+            ),
+            Self::NotAnApplication(Some(EntryType::Other(name))) => write!(
+                f,
+                "the entry is not an application (Some(Other(\"{}\")))",
+                quoted(name)
             ),
             Self::NotAnApplication(kind) => write!(f, "the entry is not an application ({kind:?})"),
-            Self::NoSuchAction(id) => write!(f, "the entry has no action {id:?}"),
+            Self::NoSuchAction(id) => write!(f, "the entry has no action \"{}\"", quoted(id)),
             Self::NoExec => write!(f, "the entry has no Exec to run"),
             Self::Exec(err) => write!(f, "Exec cannot be used: {err}"),
             Self::NeedsLocalCopy(uri) => write!(
                 f,
-                "{uri} is not a local file and the program takes only local files; copy it first"
+                "{} is not a local file and the program takes only local files; copy it first",
+                quoted(uri)
             ),
             Self::NeedsTerminal => write!(
                 f,
                 "the program runs in a terminal, but no terminal was given"
             ),
-            Self::BadTarget(target) => write!(f, "cannot pass {target}"),
+            Self::BadPath(path) => write!(f, "cannot pass {}", shown_path(path)),
+            Self::BadUri(uri) => write!(f, "cannot pass {}", quoted(uri)),
             Self::Spawn { program, error, .. } => {
-                write!(f, "cannot start {}: {error}", program.to_string_lossy())
+                write!(
+                    f,
+                    "cannot start {}: {error}",
+                    shown_path(Path::new(program))
+                )
             }
-            Self::DBus(err) => write!(f, "D-Bus activation failed: {err}"),
+            Self::DBus(err) => write!(f, "D-Bus activation failed: {}", quoted_message(err)),
         }
     }
 }
@@ -410,7 +425,7 @@ fn to_uri(target: &Target) -> Result<String, LaunchError> {
                         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
             });
             if !valid || uri.contains('\0') {
-                return Err(LaunchError::BadTarget(uri.clone()));
+                return Err(LaunchError::BadUri(uri.clone()));
             }
             Ok(uri.clone())
         }
@@ -449,20 +464,20 @@ fn to_local(target: &Target) -> Result<OsString, LaunchError> {
                 Some(rest) => {
                     let (host, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
                     if !(host.is_empty() || host.eq_ignore_ascii_case("localhost")) {
-                        return Err(LaunchError::BadTarget(uri.clone()));
+                        return Err(LaunchError::BadUri(uri.clone()));
                     }
                     path
                 }
                 None => rest,
             };
             if !path.starts_with('/') {
-                return Err(LaunchError::BadTarget(uri.clone()));
+                return Err(LaunchError::BadUri(uri.clone()));
             }
             let path = path.split(['?', '#']).next().unwrap_or(path);
             percent_decode(path)
                 .filter(|bytes| !bytes.contains(&0))
                 .map(OsString::from_vec)
-                .ok_or_else(|| LaunchError::BadTarget(uri.clone()))
+                .ok_or_else(|| LaunchError::BadUri(uri.clone()))
         }
     }
 }
@@ -470,7 +485,7 @@ fn to_local(target: &Target) -> Result<OsString, LaunchError> {
 /// `path` made absolute against the current folder; one with a NUL byte
 /// cannot be passed to a program.
 fn absolute(path: &Path) -> Result<PathBuf, LaunchError> {
-    let bad = || LaunchError::BadTarget(path.display().to_string());
+    let bad = || LaunchError::BadPath(path.to_owned());
     if path.as_os_str().as_bytes().contains(&0) {
         return Err(bad());
     }
@@ -640,6 +655,73 @@ mod tests {
     }
 
     #[test]
+    fn text_from_the_entry_is_shown_escaped_and_cut() {
+        let bad = format!("\x1b\\n{}", "a".repeat(5000));
+        let errors = [
+            prepare_launch(
+                &DesktopEntry::parse(
+                    format!("[Desktop Entry]\nType=Link\nName=x\nURL={bad}\n").as_bytes(),
+                ),
+                &[],
+                &LaunchOptions::default(),
+            )
+            .unwrap_err(),
+            prepare_launch(
+                &DesktopEntry::parse(format!("[Desktop Entry]\nType={bad}\nName=x\n").as_bytes()),
+                &[],
+                &LaunchOptions::default(),
+            )
+            .unwrap_err(),
+            prepare_launch(
+                &entry("Exec=a"),
+                &[],
+                &LaunchOptions {
+                    action: Some(bad.clone()),
+                    ..LaunchOptions::default()
+                },
+            )
+            .unwrap_err(),
+            // A link's URL, given as a target.
+            plan("Exec=a %u", &[uri(&bad)]).unwrap_err(),
+            plan("Exec=a %f", &[uri(&format!("sftp://host/{bad}"))]).unwrap_err(),
+        ];
+        for error in errors {
+            crate::error::assert_shown_safely(&error.to_string());
+        }
+    }
+
+    #[test]
+    fn a_path_is_shown_escaped_and_whole() {
+        let long = format!("/nonexistent/{}\x1b", "d/".repeat(100));
+        let shown = format!("/nonexistent/{}\\u{{1b}}", "d/".repeat(100));
+        // A path given as a target.
+        let bad = plan("Exec=a %f", &[path(&format!("{long}\"'\0"))]).unwrap_err();
+        assert_eq!(bad.to_string(), format!("cannot pass {shown}\"'\\0"));
+        // The program, from `Exec`.
+        let missing = plan(&format!("Exec={long}"), &[])
+            .unwrap()
+            .spawn()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            missing.starts_with(&format!("cannot start {shown}: ")),
+            "{missing}"
+        );
+    }
+
+    #[test]
+    fn an_error_from_d_bus_is_shown_escaped_and_cut_at_256_characters() {
+        let error = LaunchError::DBus(format!("a\x1b[2J\n{}", "b".repeat(5000)));
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "D-Bus activation failed: a\\u{{1b}}[2J\\n{}…",
+                "b".repeat(250)
+            )
+        );
+    }
+
+    #[test]
     fn one_file_codes_give_one_command_per_target() {
         let both = [path("/a"), path("/b c")];
         assert_eq!(
@@ -695,13 +777,13 @@ mod tests {
         ));
         assert!(matches!(
             plan("Exec=view %f", &[uri("file://otherhost/a")]),
-            Err(LaunchError::BadTarget(_))
+            Err(LaunchError::BadUri(_))
         ));
         for bad in ["--help", "no scheme", "x:\0"] {
             assert!(
                 matches!(
                     plan("Exec=view %u", &[uri(bad)]),
-                    Err(LaunchError::BadTarget(_))
+                    Err(LaunchError::BadUri(_))
                 ),
                 "{bad:?} as a URI"
             );
@@ -710,14 +792,14 @@ mod tests {
             assert!(
                 matches!(
                     plan("Exec=view %f", &[uri(bad)]),
-                    Err(LaunchError::BadTarget(_))
+                    Err(LaunchError::BadUri(_))
                 ),
                 "{bad:?} as a local file"
             );
         }
         assert!(matches!(
             plan("Exec=view %f", &[path("/a\0b")]),
-            Err(LaunchError::BadTarget(_))
+            Err(LaunchError::BadPath(_))
         ));
     }
 
@@ -917,9 +999,25 @@ mod tests {
     fn spawned_programs_get_their_arguments() {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("out");
+        // The temporary folder's path, which may hold anything, is quoted
+        // for the shell (`'` as `'\''`), then as a quoted argument (`"`,
+        // `` ` ``, `$` and `\` after a `\`, `%` doubled), then escaped as
+        // the key file's string.
+        let shell = format!("'{}'", out.to_str().unwrap().replace('\'', r"'\''"));
+        let mut argument = String::new();
+        for c in shell.chars() {
+            match c {
+                '"' | '`' | '$' | '\\' => argument.extend(['\\', c]),
+                '%' => argument.push_str("%%"),
+                _ => argument.push(c),
+            }
+        }
         let script = format!(
-            "Exec=sh -c \"printf '%%s|' \\\"\\$@\\\" > {}\" sh %F",
-            out.display()
+            "Exec={}",
+            crate::key_file::escape(
+                &format!("sh -c \"printf '%%s|' \\\"\\$@\\\" > {argument}\" sh %F"),
+                false
+            )
         );
         let found = plan(&script, &[path("/a b"), path("/c")]).unwrap();
         for mut child in found.spawn().unwrap() {

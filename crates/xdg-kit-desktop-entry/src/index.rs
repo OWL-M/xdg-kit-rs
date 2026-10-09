@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use xdg_kit_basedir::{BaseDirs, FileStamp};
 
+use crate::error::{quoted, shown_path};
 use crate::{DesktopEntry, Desktops, Diagnostic, EntryType};
 
 /// Deepest folder nesting followed below an `applications` folder.
@@ -103,6 +104,22 @@ struct Found {
     entry: Arc<DesktopEntry>,
 }
 
+/// The target information that determines whether the walk follows a
+/// link: its type, device and inode, or the absence of a target. Unlike a
+/// [`FileStamp`], this stays unchanged when the target is edited in place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LinkStamp(Option<(fs::FileType, u64, u64)>);
+
+impl LinkStamp {
+    fn of(path: &Path) -> Self {
+        Self(
+            fs::metadata(path)
+                .ok()
+                .map(|metadata| (metadata.file_type(), metadata.dev(), metadata.ino())),
+        )
+    }
+}
+
 /// The installed desktop entries (applications, links and folders),
 /// indexed by desktop file ID from the files under the data directories'
 /// `applications` folders. The first file for an ID takes precedence.
@@ -120,6 +137,9 @@ pub struct AppIndex {
     /// Files skipped as unreadable, in an unsupported encoding or of an
     /// unknown or no type, with their stamps, so a fix to one is noticed.
     ignored: Vec<(PathBuf, FileStamp)>,
+    /// Links the walk met but did not follow, with what they lead to, so
+    /// that pointing one elsewhere is noticed.
+    links: Vec<(PathBuf, LinkStamp)>,
     /// The winning file of each ID, as an index into `found`; `None` when
     /// it says `Hidden=true` (the entry is deleted).
     by_id: BTreeMap<String, Option<usize>>,
@@ -168,6 +188,7 @@ impl AppIndex {
             folders: Vec::new(),
             found: Vec::new(),
             ignored: Vec::new(),
+            links: Vec::new(),
             by_id: BTreeMap::new(),
             held: vec![BTreeSet::new(); roots.len()],
             shadowed: Vec::new(),
@@ -204,8 +225,9 @@ impl AppIndex {
                         Some(path.clone()),
                         None,
                         format!(
-                            "desktop file ID {id} is also {}; the spec leaves the choice open, the first is kept",
-                            first.display()
+                            "desktop file ID {} is also {}; the spec leaves the choice open, the first is kept",
+                            quoted(&id),
+                            shown_path(first)
                         ),
                     ));
                     continue;
@@ -267,7 +289,8 @@ impl AppIndex {
     }
 
     /// Collects the `.desktop` files under `dir` as (path relative to the
-    /// root, full path), and stamps every folder.
+    /// root, full path), and stamps every folder and every link it does
+    /// not follow.
     fn walk(
         &mut self,
         dir: &Path,
@@ -279,7 +302,14 @@ impl AppIndex {
         let Ok(metadata) = fs::metadata(dir) else {
             return;
         };
-        if !metadata.is_dir() || !visited.insert((metadata.dev(), metadata.ino())) {
+        if !metadata.is_dir() {
+            return;
+        }
+        if !visited.insert((metadata.dev(), metadata.ino())) {
+            // A folder reached again (a link) is not walked, but what it
+            // leads to changes when a link on the way is pointed elsewhere,
+            // so `refresh` notices.
+            self.links.push((dir.to_owned(), LinkStamp::of(dir)));
             return;
         }
         self.folders.push((dir.to_owned(), FileStamp::of(dir)));
@@ -309,21 +339,29 @@ impl AppIndex {
                 Ok(metadata) if metadata.is_file() && name.as_bytes().ends_with(b".desktop") => {
                     files.push((relative, path));
                 }
-                // A link to nothing (yet): its stamp changes when the target
-                // appears, so `refresh` notices.
-                Err(_) if entry.file_type().is_ok_and(|kind| kind.is_symlink()) => {
-                    let stamp = FileStamp::of(&path);
-                    self.ignored.push((path, stamp));
+                // A link to nothing (yet), or to something that is neither a
+                // folder nor a `.desktop` file: what it leads to changes when
+                // the target appears or a link on the way is pointed
+                // elsewhere, so `refresh` notices.
+                _ if entry.file_type().is_ok_and(|kind| kind.is_symlink()) => {
+                    let stamp = LinkStamp::of(&path);
+                    self.links.push((path, stamp));
                 }
                 _ => {}
             }
         }
     }
 
-    /// Returns a new snapshot if any `applications` folder, sub-folder or
-    /// entry changed since this one was read, as detected by its
-    /// [`FileStamp`](xdg_kit_basedir::FileStamp). Returns `None` if nothing
-    /// changed. Reuses entries whose files are unchanged.
+    /// Returns a new snapshot if any source has changed, reusing entries
+    /// whose files are unchanged. Returns `None` if nothing changed.
+    ///
+    /// Changes to `applications` folders, sub-folders, entries and skipped
+    /// files are detected by their [`FileStamp`]. Links the walk encountered
+    /// but did not follow are compared by target identity: its type, device
+    /// and inode, or the absence of a target. These include aliases of folders
+    /// already walked, links to ignored targets and links that lead nowhere.
+    /// Retargeting such a link or replacing its target atomically (a new inode)
+    /// is detected; editing its target in place is not.
     #[must_use]
     pub fn refresh(&self) -> Option<Self> {
         let changed = self
@@ -332,6 +370,10 @@ impl AppIndex {
             .chain(&self.folders)
             .chain(&self.ignored)
             .any(|(path, stamp)| FileStamp::of(path) != *stamp)
+            || self
+                .links
+                .iter()
+                .any(|(path, stamp)| LinkStamp::of(path) != *stamp)
             || self
                 .found
                 .iter()
@@ -437,14 +479,17 @@ impl AppIndex {
 fn ignored_because(entry: &DesktopEntry) -> Option<String> {
     if !entry.supports_encoding() {
         let encoding = entry.string("Encoding").unwrap_or_default();
-        return Some(format!("Encoding={encoding} is not supported"));
+        return Some(format!("Encoding={} is not supported", quoted(&encoding)));
     }
     if entry.hidden() {
         return None;
     }
     match entry.entry_type() {
         None => Some("no Type".to_owned()),
-        Some(EntryType::Other(other)) => Some(format!("Type={other} is not a type the spec lists")),
+        Some(EntryType::Other(other)) => Some(format!(
+            "Type={} is not a type the spec lists",
+            quoted(&other)
+        )),
         Some(_) => None,
     }
 }
@@ -487,6 +532,44 @@ mod tests {
         assert_eq!(foo.entry().exec().as_deref(), Some("high"));
         assert_eq!(index.dir_of("org.foo.desktop"), Some(0));
         assert_eq!(index.dir_of("kde-konsole.desktop"), Some(1));
+    }
+
+    #[test]
+    fn names_and_values_in_diagnostics_are_shown_escaped_and_cut() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = format!("a\x1b{}", "b".repeat(200));
+        write(&dir.path().join(format!("{name}-c.desktop")), &app("x"));
+        write(&dir.path().join(format!("{name}/c.desktop")), &app("y"));
+        let bad = format!("\x1b\\n{}", "a".repeat(5000));
+        write(
+            &dir.path().join("type.desktop"),
+            &format!("[Desktop Entry]\nType={bad}\nName=x\n"),
+        );
+        write(
+            &dir.path().join("encoding.desktop"),
+            &format!("[Desktop Entry]\nType=Application\nName=x\nEncoding={bad}\n"),
+        );
+        let index = AppIndex::from_dirs([dir.path()]);
+        assert_eq!(index.diagnostics().len(), 3, "{:?}", index.diagnostics());
+        let (repeated, others) = index
+            .diagnostics()
+            .split_first()
+            .expect("the repeated ID first");
+        for found in others {
+            crate::error::assert_shown_safely(&found.message);
+        }
+        // The ID is cut; the path of the file kept is shown whole.
+        let first = dir.path().join(format!("{name}-c.desktop"));
+        let first = shown_path(&first);
+        assert!(!repeated.message.chars().any(char::is_control));
+        assert!(
+            repeated.message.starts_with(&format!(
+                "desktop file ID a\\u{{1b}}{}… is also {first};",
+                "b".repeat(30)
+            )),
+            "{}",
+            repeated.message
+        );
     }
 
     #[test]
@@ -771,6 +854,127 @@ mod tests {
         assert!(index.get("link.desktop").is_some());
     }
 
+    /// Points the link `link` at `target` in one step.
+    fn retarget(link: &Path, target: &Path) {
+        let new = link.with_extension("new");
+        std::os::unix::fs::symlink(target, &new).unwrap();
+        fs::rename(&new, link).unwrap();
+    }
+
+    /// What two indexes hold and say, side by side.
+    fn assert_same(index: &AppIndex, fresh: &AppIndex) {
+        let contents = |index: &AppIndex| {
+            let apps: Vec<_> = index
+                .iter()
+                .map(|app| {
+                    (
+                        app.id().to_owned(),
+                        app.path().to_owned(),
+                        app.entry().exec(),
+                    )
+                })
+                .collect();
+            let held: Vec<Vec<&str>> = (0..index.dirs().len())
+                .map(|dir| index.dir_ids(dir).collect())
+                .collect();
+            format!(
+                "{apps:?} {held:?} {:?} {:?}",
+                index.dirs(),
+                index.diagnostics()
+            )
+        };
+        assert_eq!(contents(index), contents(fresh));
+    }
+
+    #[test]
+    fn a_folder_link_skipped_as_an_alias_is_watched() {
+        let apps = tempfile::tempdir().unwrap();
+        let ext = tempfile::tempdir().unwrap();
+        let (d1, d2) = (ext.path().join("d1"), ext.path().join("d2"));
+        write(&d1.join("one.desktop"), &app("one"));
+        write(&d2.join("two.desktop"), &app("two"));
+        let mid = ext.path().join("mid");
+        std::os::unix::fs::symlink(&d1, apps.path().join("a")).unwrap();
+        std::os::unix::fs::symlink(&d1, &mid).unwrap();
+        std::os::unix::fs::symlink(&mid, apps.path().join("b")).unwrap();
+        let index = AppIndex::from_dirs([apps.path()]);
+        let ids = |index: &AppIndex| {
+            index
+                .iter()
+                .map(|app| app.id().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&index), ["a-one.desktop"], "b is the same folder");
+        assert!(index.refresh().is_none());
+        // Only a link outside the watched folders changes.
+        retarget(&mid, &d2);
+        let index = index.refresh().expect("b now leads to another folder");
+        assert_same(&index, &AppIndex::from_dirs([apps.path()]));
+        assert_eq!(ids(&index), ["a-one.desktop", "b-two.desktop"]);
+        assert!(index.refresh().is_none());
+    }
+
+    #[test]
+    fn a_link_to_neither_a_folder_nor_an_entry_is_watched() {
+        let apps = tempfile::tempdir().unwrap();
+        let ext = tempfile::tempdir().unwrap();
+        let plain = ext.path().join("plain");
+        write(&plain, "not an entry");
+        let d2 = ext.path().join("d2");
+        write(&d2.join("two.desktop"), &app("two"));
+        let mid = ext.path().join("mid");
+        std::os::unix::fs::symlink(&plain, &mid).unwrap();
+        std::os::unix::fs::symlink(&mid, apps.path().join("c")).unwrap();
+        let index = AppIndex::from_dirs([apps.path()]);
+        assert_eq!(index.iter().count(), 0);
+        assert!(index.refresh().is_none());
+        retarget(&mid, &d2);
+        let index = index.refresh().expect("c now leads to a folder");
+        assert_same(&index, &AppIndex::from_dirs([apps.path()]));
+        assert!(index.get("c-two.desktop").is_some());
+        assert!(index.refresh().is_none());
+    }
+
+    #[test]
+    fn links_that_stay_as_they_are_change_nothing() {
+        let apps = tempfile::tempdir().unwrap();
+        let ext = tempfile::tempdir().unwrap();
+        write(&ext.path().join("d1/one.desktop"), &app("one"));
+        write(&ext.path().join("plain"), "not an entry");
+        let link = |target: &Path, name: &str| {
+            std::os::unix::fs::symlink(target, apps.path().join(name)).unwrap();
+        };
+        link(&ext.path().join("d1"), "a");
+        link(&ext.path().join("d1"), "b");
+        link(&ext.path().join("plain"), "c");
+        link(&ext.path().join("missing"), "dangling.desktop");
+        link(&apps.path().join("loop"), "loop");
+        link(apps.path(), "root");
+        let index = AppIndex::from_dirs([apps.path()]);
+        assert_same(&index, &AppIndex::from_dirs([apps.path()]));
+        assert!(index.refresh().is_none());
+        assert!(index.refresh().is_none(), "asked again");
+    }
+
+    #[test]
+    fn editing_a_file_a_link_leads_to_changes_nothing() {
+        let apps = tempfile::tempdir().unwrap();
+        let ext = tempfile::tempdir().unwrap();
+        let plain = ext.path().join("notes.txt");
+        write(&plain, "one");
+        std::os::unix::fs::symlink(&plain, apps.path().join("notes")).unwrap();
+        let later = ext.path().join("later.desktop");
+        std::os::unix::fs::symlink(&later, apps.path().join("later.desktop")).unwrap();
+        let index = AppIndex::from_dirs([apps.path()]);
+        // In place: the same file, so the link would be skipped as before.
+        write(&plain, "one and two");
+        assert!(index.refresh().is_none(), "only the linked file changed");
+        write(&later, &app("later"));
+        let index = index.refresh().expect("the dangling link now resolves");
+        assert_same(&index, &AppIndex::from_dirs([apps.path()]));
+        assert!(index.get("later.desktop").is_some());
+    }
+
     #[test]
     fn files_in_an_unsupported_encoding_are_ignored() {
         let high = tempfile::tempdir().unwrap();
@@ -848,6 +1052,7 @@ mod tests {
 
     #[test]
     fn try_exec_looks_in_the_given_search_path() {
+        use std::os::fd::AsRawFd;
         use std::os::unix::fs::PermissionsExt;
         let root = tempfile::tempdir().unwrap();
         let bin = tempfile::tempdir().unwrap();
@@ -862,10 +1067,17 @@ mod tests {
         };
         with_try("yes.desktop", "present-tool");
         with_try("no.desktop", "absent-tool");
-        with_try("abs.desktop", &tool.display().to_string());
+        with_try(
+            "abs.desktop",
+            &crate::key_file::escape(tool.to_str().unwrap(), false),
+        );
         write(&root.path().join("none.desktop"), &app("none"));
         let index = AppIndex::from_dirs([root.path()]);
-        let search = std::ffi::OsString::from(format!("/nonexistent:{}", bin.path().display()));
+        // A `:` in the temporary folder's path would split it in a search
+        // path, so the folder is named by its open descriptor instead.
+        let bin_fd = fs::File::open(bin.path()).unwrap();
+        let search =
+            std::ffi::OsString::from(format!("/nonexistent:/proc/self/fd/{}", bin_fd.as_raw_fd()));
         assert!(index.get("yes.desktop").unwrap().try_exec(&search));
         assert!(!index.get("no.desktop").unwrap().try_exec(&search));
         assert!(index.get("abs.desktop").unwrap().try_exec(OsStr::new("")));
@@ -877,10 +1089,20 @@ mod tests {
         assert!(index.get("none.desktop").unwrap().try_exec(OsStr::new("")));
     }
 
+    /// Fails at once when `path`, under the temporary folder, holds a `:`,
+    /// which would split it in an XDG path list.
+    fn assert_listable(path: &Path) {
+        assert!(
+            !path.as_os_str().as_bytes().contains(&b':'),
+            "TMPDIR contains ':', which an XDG path list cannot hold; set TMPDIR to a path without ':'"
+        );
+    }
+
     #[test]
     fn load_reads_data_home_then_data_dirs() {
         let home = tempfile::tempdir().unwrap();
         let system = tempfile::tempdir().unwrap();
+        assert_listable(system.path());
         write(
             &home.path().join("applications/org.foo.desktop"),
             &app("home"),

@@ -96,8 +96,8 @@ pub(crate) fn read(
 /// Parses the contents of the file called `name` (`globs2`, `globs`,
 /// `magic`, `aliases`, `subclasses`, `icons`, `generic-icons`,
 /// `XMLnamespaces`, `treemagic` or `types`) into `folder`; other names are
-/// ignored. Lists at most [`MAX_DIAGNOSTICS`](super::MAX_DIAGNOSTICS)
-/// problems, as the cache reader does.
+/// ignored. Lists at most [`MAX_DIAGNOSTICS`] problems, as the cache reader
+/// does.
 pub(crate) fn parse(
     name: &str,
     path: &Path,

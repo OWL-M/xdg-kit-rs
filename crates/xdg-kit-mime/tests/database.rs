@@ -596,8 +596,53 @@ fn later_folders_override_and_delete() {
 }
 
 #[test]
+fn an_empty_value_in_a_more_important_folder_replaces_a_value() {
+    let system_dir = tempfile::tempdir().unwrap();
+    let user_dir = tempfile::tempdir().unwrap();
+    let system = build(system_dir.path(), SYSTEM);
+    // `update-mime-database` writes these self-closed: `<comment/>`.
+    let user = build(
+        user_dir.path(),
+        r#"<mime-type type="text/x-diff">
+             <comment></comment><comment xml:lang="de"></comment>
+             <acronym></acronym><expanded-acronym></expanded-acronym>
+           </mime-type>"#,
+    );
+    let file = fs::read_to_string(user.join("text/x-diff.xml")).unwrap();
+    assert!(file.contains("<comment/>"), "{file}");
+    let db = MimeDatabase::from_dirs(&[user, system]);
+    assert!(db.diagnostics().is_empty(), "{:?}", db.diagnostics());
+    let diff = m("text/x-diff");
+    assert!(
+        db.type_diagnostics(&diff).is_empty(),
+        "{:?}",
+        db.type_diagnostics(&diff)
+    );
+    assert_eq!(
+        db.description(&diff, &Locales::untranslated()).as_deref(),
+        Some("")
+    );
+    assert_eq!(
+        db.description(&diff, &Locales::new(["de"])).as_deref(),
+        Some("")
+    );
+    assert_eq!(db.acronym(&diff).as_deref(), Some(""));
+    assert_eq!(db.expanded_acronym(&diff).as_deref(), Some(""));
+}
+
+/// Fails at once when `path`, under the temporary folder, holds a `:`,
+/// which would split it in an XDG path list.
+fn assert_listable(path: &Path) {
+    assert!(
+        !path.as_os_str().as_bytes().contains(&b':'),
+        "TMPDIR contains ':', which an XDG path list cannot hold; set TMPDIR to a path without ':'"
+    );
+}
+
+#[test]
 fn the_data_home_listed_again_is_read_once() {
     let dir = tempfile::tempdir().unwrap();
+    assert_listable(dir.path());
     build(dir.path(), SYSTEM);
     let data = dir.path().as_os_str().to_owned();
     let base = xdg_kit_basedir::BaseDirs::from_vars(|name| match name {
@@ -876,6 +921,73 @@ fn damaged_files_are_reported_and_the_rest_used() {
     );
 }
 
+/// A folder holding the given files of `tests/old-writers`, which
+/// `update-mime-database` 0.30 (`mime.cache` 1.0, `globs`) and 0.60
+/// (`mime.cache` 1.1) wrote from `package.xml` there.
+fn old_writer(dir: &Path, files: &[&str]) -> PathBuf {
+    let from = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/old-writers");
+    for file in files {
+        let to = dir.join(file.rsplit('/').next().unwrap());
+        fs::copy(from.join(file), to).unwrap();
+    }
+    dir.to_owned()
+}
+
+#[test]
+fn a_version_1_0_cache_is_left_for_the_text_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let mime = old_writer(dir.path(), &["0.30/mime.cache", "0.30/globs"]);
+    let db = MimeDatabase::from_dirs(&[mime]);
+    let messages: Vec<String> = db.diagnostics().iter().map(ToString::to_string).collect();
+    assert_eq!(messages.len(), 1, "{messages:#?}");
+    assert!(
+        messages[0]
+            .ends_with("mime.cache: unsupported version 1.0; the text files are read instead"),
+        "{messages:#?}"
+    );
+    for (name, mime) in [
+        ("Afile", "text/x-a"),
+        ("x.aa", "text/x-a"),
+        ("abcz", "text/x-a"),
+        ("Bfile", "text/x-b"),
+        ("x.bb", "text/x-b"),
+    ] {
+        assert_eq!(
+            db.type_for_name(name).best().map(|found| found.mime),
+            Some(m(mime)),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn a_version_1_1_cache_is_read() {
+    let dir = tempfile::tempdir().unwrap();
+    // No text files: what is found comes from the cache.
+    let mime = old_writer(dir.path(), &["0.60/mime.cache"]);
+    let db = MimeDatabase::from_dirs(&[mime]);
+    assert!(db.diagnostics().is_empty(), "{:?}", db.diagnostics());
+    for (name, mime) in [
+        ("Afile", "text/x-a"),
+        ("x.aa", "text/x-a"),
+        ("abcz", "text/x-a"),
+        ("Bfile", "text/x-b"),
+        ("x.bb", "text/x-b"),
+    ] {
+        assert_eq!(
+            db.type_for_name(name).best().map(|found| found.mime),
+            Some(m(mime)),
+            "{name}"
+        );
+    }
+    assert_eq!(
+        db.patterns_for(&m("text/x-a")).len(),
+        3,
+        "{:?}",
+        db.patterns_for(&m("text/x-a"))
+    );
+}
+
 #[test]
 fn folders_and_special_files_are_typed_by_kind() {
     let dir = tempfile::tempdir().unwrap();
@@ -1017,6 +1129,46 @@ fn paths_by_name_content_and_link() {
         );
     }
     assert!(db.type_for_path(path("missing"), &defaults).is_err());
+}
+
+#[test]
+fn a_link_whose_target_cannot_be_reached_is_a_symlink_and_a_refused_one_an_error() {
+    let db = MimeDatabase::from_dirs(Vec::<PathBuf>::new());
+    let files = tempfile::tempdir().unwrap();
+    let path = |name: &str| files.path().join(name);
+    let detect = |name: &str| db.type_for_path(path(name), &PathOptions::default());
+    fs::write(path("file"), "x").unwrap();
+    symlink("missing", path("missing")).unwrap();
+    symlink("loop", path("loop")).unwrap();
+    symlink("file/child", path("through-a-file")).unwrap();
+    symlink("n".repeat(300), path("too-long")).unwrap();
+    for name in ["missing", "loop", "through-a-file", "too-long"] {
+        assert_eq!(
+            detect(name)
+                .map(|found| found.mime.as_str().to_owned())
+                .ok(),
+            Some("inode/symlink".to_owned()),
+            "{name}"
+        );
+    }
+
+    // A target that exists but may not be looked at is an error. (Root
+    // may look anyway, so there the check proves nothing and is skipped.)
+    fs::create_dir(path("locked")).unwrap();
+    fs::write(path("locked/inside"), "x").unwrap();
+    symlink("locked/inside", path("refused")).unwrap();
+    fs::set_permissions(path("locked"), fs::Permissions::from_mode(0o000)).unwrap();
+    let readable = fs::metadata(path("refused")).is_ok();
+    let refused = detect("refused");
+    fs::set_permissions(path("locked"), fs::Permissions::from_mode(0o755)).unwrap();
+    if readable {
+        eprintln!("a locked folder can be looked into (root?): the error is not checked");
+    } else {
+        assert_eq!(
+            refused.map_err(|err| err.kind()).err(),
+            Some(std::io::ErrorKind::PermissionDenied)
+        );
+    }
 }
 
 /// Needs a filesystem that holds user extended attributes, and fails where

@@ -27,6 +27,7 @@ mod stamp;
 #[cfg(all(test, not(target_vendor = "apple")))]
 mod testing;
 pub mod user_dirs;
+mod work;
 
 pub use base_dirs::BaseDirs;
 pub use error::{Diagnostic, DiagnosticSource, Error};

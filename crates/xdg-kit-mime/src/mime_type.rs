@@ -28,7 +28,7 @@ impl InvalidMimeType {
 
 impl fmt::Display for InvalidMimeType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "not a MIME type: {:?}", self.0)
+        write!(f, "not a MIME type: \"{}\"", crate::error::quoted(&self.0))
     }
 }
 
@@ -224,6 +224,20 @@ mod tests {
         }
         assert!(MimeType::new(&format!("a/{}", "b".repeat(127))).is_ok());
         assert!(MimeType::new("application/vnd.a+b_c-d.e!f#g$h&i^j").is_ok());
+    }
+
+    #[test]
+    fn a_refused_text_is_shown_escaped_and_cut() {
+        // The text may come from a file: it is shown as `quoted` shows it.
+        let shown = |bad: &str| MimeType::new(bad).unwrap_err().to_string();
+        assert_eq!(
+            shown("a/\u{1b}[2J\n"),
+            r#"not a MIME type: "a/\u{1b}[2J\n""#
+        );
+        assert_eq!(
+            shown(&format!("a/{}", "b".repeat(5000))),
+            format!("not a MIME type: \"a/{}…\"", "b".repeat(30))
+        );
     }
 
     #[cfg(feature = "mime")]

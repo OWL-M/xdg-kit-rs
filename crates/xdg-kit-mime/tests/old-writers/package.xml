@@ -1,0 +1,15 @@
+<?xml version="1.0"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="text/x-a">
+    <comment>A file</comment>
+    <glob pattern="Afile"/>
+    <glob pattern="*.aa"/>
+    <glob pattern="a*z"/>
+  </mime-type>
+  <mime-type type="text/x-b">
+    <comment>B file</comment>
+    <glob pattern="Bfile"/>
+    <glob pattern="*.bb"/>
+    <glob pattern="b*z"/>
+  </mime-type>
+</mime-info>

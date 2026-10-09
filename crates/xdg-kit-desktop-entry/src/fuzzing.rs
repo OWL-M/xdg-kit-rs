@@ -10,11 +10,10 @@ use crate::{DesktopEntry, KeyFile, LaunchOptions, Target, prepare_launch, valida
 
 /// Parses `bytes` as a key file, checks that writing preserves the bytes,
 /// and looks up every key. Then edits the file and compares it with a fresh
-/// parse of the edited text. Each lookup scans its key's lines, so the work
-/// is quadratic in the number of translations for one key. The worst
-/// 4 KiB input takes about 0.4 s under the address sanitizer, within
-/// `-timeout=5` at the default `-max_len`. Raising `-max_len` substantially
-/// can exceed that timeout.
+/// parse of the edited text; then removes keys and groups of the file and
+/// adds keys, picked by the first bytes of the input, comparing it with a
+/// fresh parse after each step. Each lookup finds its line by locale
+/// without looking through the key's other translations.
 pub fn key_file(bytes: &[u8]) {
     let file = KeyFile::parse(bytes);
     assert_eq!(file.to_bytes(), bytes, "a key file must round-trip");
@@ -41,17 +40,58 @@ pub fn key_file(bytes: &[u8]) {
         Some(" fuzz;\\\n")
     );
     // The edits update the index in place; it must match a fresh read.
-    assert_eq!(reread.groups(), edited.groups());
-    for group in reread.groups() {
-        assert_eq!(reread.keys(group), edited.keys(group), "[{group}]");
-        for (key, locale) in reread.keys(group) {
+    assert_like_reparse(&edited);
+    // Removals and additions mixed, each followed by every query, so that
+    // a stale index, count of lines or cache shows.
+    let groups: Vec<String> = edited.groups().into_iter().map(str::to_owned).collect();
+    let keys: Vec<(String, String, Option<String>)> = groups
+        .iter()
+        .flat_map(|group| {
+            edited
+                .keys(group)
+                .into_iter()
+                .map(|(key, locale)| (group.clone(), key.to_owned(), locale.map(str::to_owned)))
+        })
+        .collect();
+    for (step, &byte) in bytes.iter().take(32).enumerate() {
+        let pick = usize::from(byte / 4) + step;
+        match byte % 4 {
+            0 | 1 if !keys.is_empty() => {
+                let (group, key, locale) = &keys[pick % keys.len()];
+                edited.remove(group, key, locale.as_deref());
+            }
+            2 if !groups.is_empty() => {
+                edited.remove_group(&groups[pick % groups.len()]);
+            }
+            _ => {
+                let group = groups
+                    .get(pick % groups.len().max(1))
+                    .map_or("X-Fuzz", String::as_str);
+                // Refused for a group name the file read but cannot write.
+                let _ = edited.set_string(group, &format!("Added{}", pick % 3), "v");
+            }
+        }
+        assert_like_reparse(&edited);
+    }
+}
+
+/// Checks that `file` answers every query as a fresh parse of its text does.
+fn assert_like_reparse(file: &KeyFile) {
+    let fresh = KeyFile::parse_with(&file.to_bytes(), file.key_names());
+    assert_eq!(&fresh, file);
+    assert_eq!(fresh.groups(), file.groups());
+    for group in fresh.groups() {
+        assert_eq!(fresh.group_line(group), file.group_line(group), "[{group}]");
+        assert_eq!(fresh.keys(group), file.keys(group), "[{group}]");
+        for (key, locale) in fresh.keys(group) {
+            assert_eq!(fresh.raw(group, key, locale), file.raw(group, key, locale));
             assert_eq!(
-                reread.line_of(group, key, locale),
-                edited.line_of(group, key, locale)
+                fresh.line_of(group, key, locale),
+                file.line_of(group, key, locale)
             );
         }
     }
-    assert_eq!(reread.diagnostics(), edited.diagnostics());
+    assert_eq!(fresh.diagnostics(), file.diagnostics());
 }
 
 /// Parses `text` as an `Exec` value and expands it, both as given and with

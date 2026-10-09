@@ -4,12 +4,14 @@
 //! the reference parser that xdg-user-dirs ships for applications
 //! (`src/xdg-user-dir-lookup.c`).
 
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use crate::paths::normalize;
+use crate::work;
 use crate::{BaseDirs, Diagnostic};
 
 /// A user folder, by its name in `user-dirs.dirs` (`XDG_<NAME>_DIR`).
@@ -79,11 +81,25 @@ impl UserDirKind {
 }
 
 /// The user folders read from `user-dirs.dirs`.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct UserDirs {
     home: PathBuf,
     dirs: Vec<(UserDirKind, PathBuf)>,
+    // Where each name is in `dirs`. A name is its kind's name, so this
+    // matches kinds as lookups do.
+    index: HashMap<String, usize>,
     diagnostics: Vec<Diagnostic>,
+}
+
+impl std::fmt::Debug for UserDirs {
+    /// The folders in file order; the index into them is left out.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UserDirs")
+            .field("home", &self.home)
+            .field("dirs", &self.dirs)
+            .field("diagnostics", &self.diagnostics)
+            .finish_non_exhaustive()
+    }
 }
 
 impl UserDirs {
@@ -127,22 +143,31 @@ impl UserDirs {
     #[must_use]
     pub fn from_bytes(home: &Path, contents: &[u8]) -> Self {
         let mut dirs: Vec<(UserDirKind, PathBuf)> = Vec::new();
+        let mut index: HashMap<String, usize> = HashMap::new();
         for line in contents.split(|&byte| byte == b'\n') {
+            // The line, and each byte the split went over.
+            work::count(1 + line.len());
             let Some((name, path)) = parse_line(home, line) else {
                 continue;
             };
-            let kind = UserDirKind::from_name(name);
-            match dirs
-                .iter_mut()
-                .find(|(known, _)| known.name() == kind.name())
-            {
-                Some((_, known)) => *known = path,
-                None => dirs.push((kind, path)),
+            // The lookup, and each byte of the name hashed and compared.
+            work::count(1 + 2 * name.len());
+            if let Some(&at) = index.get(name) {
+                dirs[at].1 = path;
+            } else {
+                // Each byte of a new name copied into the key and the kind,
+                // and hashed and compared again to insert it.
+                work::count(4 * name.len());
+                index.insert(name.to_owned(), dirs.len());
+                dirs.push((UserDirKind::from_name(name), path));
             }
         }
+        // Each byte of home copied.
+        work::count(home.as_os_str().len());
         Self {
             home: home.to_owned(),
             dirs,
+            index,
             diagnostics: Vec::new(),
         }
     }
@@ -152,6 +177,8 @@ impl UserDirs {
     /// "To disable a directory, point it to the homedir").
     #[must_use]
     pub fn get(&self, kind: &UserDirKind) -> Option<&Path> {
+        // Each byte of home compared.
+        work::count(self.home.as_os_str().len());
         self.set(kind).filter(|path| *path != self.home)
     }
 
@@ -160,11 +187,14 @@ impl UserDirs {
     /// `$HOME/Desktop` for `DESKTOP` and `$HOME` for any other name.
     #[must_use]
     pub fn get_or_fallback(&self, kind: &UserDirKind) -> PathBuf {
-        match self.set(kind) {
+        // Each byte of the folder copied.
+        let found = match self.set(kind) {
             Some(path) => path.to_owned(),
             None if kind.name() == "DESKTOP" => self.home.join("Desktop"),
             None => self.home.clone(),
-        }
+        };
+        work::count(found.as_os_str().len());
+        found
     }
 
     /// Every folder that is set and not disabled, in the order in which each
@@ -183,10 +213,11 @@ impl UserDirs {
     }
 
     fn set(&self, kind: &UserDirKind) -> Option<&Path> {
-        self.dirs
-            .iter()
-            .find(|(known, _)| known.name() == kind.name())
-            .map(|(_, path)| path.as_path())
+        // The lookup, and each byte of the name hashed and compared.
+        work::count(1 + 2 * kind.name().len());
+        self.index
+            .get(kind.name())
+            .map(|&at| self.dirs[at].1.as_path())
     }
 }
 
@@ -194,14 +225,30 @@ impl UserDirs {
 /// line to skip.
 fn parse_line<'a>(home: &Path, line: &'a [u8]) -> Option<(&'a str, PathBuf)> {
     // The reference reads C strings: a line ends at its first NUL.
-    let line = line.split(|&byte| byte == 0).next().unwrap_or_default();
+    let line = line
+        .split(|&byte| {
+            work::count(1);
+            byte == 0
+        })
+        .next()
+        .unwrap_or_default();
     let line = skip_blanks(line);
     let rest = line.strip_prefix(b"XDG_")?;
-    let equals = rest.iter().position(|&byte| byte == b'=')?;
+    let equals = rest
+        .iter()
+        .inspect(|_| work::count(1))
+        .position(|&byte| byte == b'=')?;
     let name = trim_blanks_end(&rest[..equals]).strip_suffix(b"_DIR")?;
-    if name.is_empty() || name.iter().any(|&byte| byte == b' ' || byte == b'\t') {
+    if name.is_empty()
+        || name
+            .iter()
+            .inspect(|_| work::count(1))
+            .any(|&byte| byte == b' ' || byte == b'\t')
+    {
         return None;
     }
+    // Each byte `from_utf8` checks.
+    work::count(name.len());
     let name = std::str::from_utf8(name).ok()?;
     let value = skip_blanks(&rest[equals + 1..]).strip_prefix(b"\"")?;
     let (relative, value) = match value.strip_prefix(b"$HOME/") {
@@ -213,14 +260,22 @@ fn parse_line<'a>(home: &Path, line: &'a [u8]) -> Option<(&'a str, PathBuf)> {
     // Path joining would discard home for values such as `$HOME//Music`.
     let mut path = Vec::with_capacity(home.as_os_str().len() + 1 + value.len());
     if relative {
+        // Each byte of home copied.
+        work::count(home.as_os_str().len());
         path.extend_from_slice(home.as_os_str().as_bytes());
         path.push(b'/');
     }
     let mut bytes = value.iter();
     loop {
+        // Each byte of the value looked at and copied; a `\` and the byte
+        // it takes count one each.
+        work::count(1);
         match bytes.next()? {
             b'"' => break,
-            b'\\' => path.push(*bytes.next()?),
+            b'\\' => {
+                work::count(1);
+                path.push(*bytes.next()?);
+            }
             &byte => path.push(byte),
         }
     }
@@ -230,6 +285,7 @@ fn parse_line<'a>(home: &Path, line: &'a [u8]) -> Option<(&'a str, PathBuf)> {
 fn skip_blanks(bytes: &[u8]) -> &[u8] {
     let start = bytes
         .iter()
+        .inspect(|_| work::count(1))
         .position(|&byte| byte != b' ' && byte != b'\t')
         .unwrap_or(bytes.len());
     &bytes[start..]
@@ -238,6 +294,7 @@ fn skip_blanks(bytes: &[u8]) -> &[u8] {
 fn trim_blanks_end(bytes: &[u8]) -> &[u8] {
     let end = bytes
         .iter()
+        .inspect(|_| work::count(1))
         .rposition(|&byte| byte != b' ' && byte != b'\t')
         .map_or(0, |last| last + 1);
     &bytes[..end]
@@ -312,12 +369,22 @@ mod tests {
     fn a_later_line_replaces_an_earlier_one_but_a_broken_one_does_not() {
         let dirs = parse(concat!(
             "XDG_MUSIC_DIR=\"$HOME/Old\"\n",
+            "XDG_VIDEOS_DIR=\"$HOME/Videos\"\n",
             "XDG_MUSIC_DIR=\"$HOME/New\"\n",
             "XDG_MUSIC_DIR=\"$HOME/Broken\n",
         ));
         assert_eq!(
             dirs.get(&UserDirKind::Music),
             Some(Path::new("/home/u/New"))
+        );
+        // The replaced name keeps the place where it first appeared.
+        let order: Vec<_> = dirs.iter().collect();
+        assert_eq!(
+            order,
+            [
+                (&UserDirKind::Music, Path::new("/home/u/New")),
+                (&UserDirKind::Videos, Path::new("/home/u/Videos")),
+            ]
         );
     }
 
@@ -455,6 +522,151 @@ mod tests {
         let unreadable = UserDirs::load(&base);
         assert_eq!(unreadable.iter().count(), 0);
         assert_eq!(unreadable.diagnostics().len(), 1);
+    }
+
+    /// The bound for parsing `text`: twice the analysed cost of its lines,
+    /// with `name` bytes in names, `value` bytes in values (closing quotes
+    /// included) and `home` copied `homes` times. Per line ten steps: the
+    /// line, the two blank skips and the trim, the lookup, and the five
+    /// bytes `_DIR=` that the `=` search looks at after the name. Per byte:
+    /// two for the line and NUL splits; nine more for a new name (the `=`
+    /// search, the blank check, `from_utf8`, hashed and compared, copied
+    /// twice, hashed and compared again); three more for a value (the value
+    /// loop, normalized); three for each home copied (copied, normalized).
+    fn bound(text: &str, name: usize, value: usize, homes: usize) -> usize {
+        let lines = text.split('\n').count();
+        2 * (10 * lines + 2 * text.len() + 9 * name + 3 * value + 3 * homes * HOME.len())
+    }
+
+    /// `n` lines, each with its own name, and the bytes of their names and
+    /// of their values.
+    fn many_names(n: usize) -> (String, usize, usize) {
+        use std::fmt::Write as _;
+        let mut text = String::new();
+        let (mut name, mut value) = (0, 0);
+        for at in 0..n {
+            let _ = writeln!(text, "XDG_N{at}_DIR=\"$HOME/n{at}\"");
+            name += format!("N{at}").len();
+            value += format!("n{at}\"").len();
+        }
+        (text, name, value)
+    }
+
+    #[test]
+    fn large_files_are_read_in_linear_time() {
+        work::assert_linear(
+            10_000,
+            |n| {
+                let (text, _, _) = many_names(n);
+                let (dirs, steps) = work::steps(|| parse(&text));
+                assert_eq!(dirs.iter().count(), n);
+                (steps, text.len())
+            },
+            |n, _| {
+                let (text, name, value) = many_names(n);
+                bound(&text, name, value, n + 1)
+            },
+        );
+    }
+
+    #[test]
+    fn lookups_take_constant_time() {
+        work::assert_linear(
+            10_000,
+            |n| {
+                let (text, _, _) = many_names(n);
+                let dirs = parse(&text);
+                let kinds: Vec<_> = (0..=n)
+                    .map(|at| UserDirKind::from_name(&format!("N{at}")))
+                    .collect();
+                let (found, steps) = work::steps(|| {
+                    kinds
+                        .iter()
+                        .filter(|kind| {
+                            dirs.get(kind).is_some()
+                                && dirs.get_or_fallback(kind) != Path::new(HOME)
+                        })
+                        .count()
+                });
+                assert_eq!(found, n);
+                let names = kinds.iter().map(|kind| kind.name().len()).sum();
+                (steps, names)
+            },
+            // Twice the analysed cost. Per kind (`n + 1` of them): two
+            // lookups of one step each, home compared, and the folder (home,
+            // a slash and about the name) copied. Per byte of a name: hashed
+            // and compared by each lookup, and copied with the folder.
+            |n, names| 2 * ((2 + HOME.len() + HOME.len() + 1) * (n + 1) + 5 * names),
+        );
+    }
+
+    #[test]
+    fn a_long_value_is_read_in_linear_time() {
+        // Plain bytes, slashes and escaped quotes: each branch of the value
+        // loop, and normalizing.
+        let long = |n: usize| "a\\\"b/".repeat(n);
+        let text = |n: usize| format!("XDG_DESKTOP_DIR=\"$HOME/{}\"\n", long(n));
+        work::assert_linear(
+            200_000,
+            |n| {
+                let (long, text) = (long(n), text(n));
+                let (dirs, steps) = work::steps(|| parse(&text));
+                let expected = long.replace('\\', "");
+                assert_eq!(
+                    dirs.get(&UserDirKind::Desktop),
+                    Some(
+                        Path::new(HOME)
+                            .join(expected.trim_end_matches('/'))
+                            .as_path()
+                    )
+                );
+                (steps, long.len())
+            },
+            |n, long| bound(&text(n), "DESKTOP".len(), long + 1, 2),
+        );
+    }
+
+    #[test]
+    fn a_long_name_is_read_and_looked_up_in_linear_time() {
+        // One name of about 1 MB, through each step on a name: the `=`
+        // search, the blank check, `from_utf8`, hashing, the copies into
+        // the index and the kind, and the lookups of `get` and
+        // `get_or_fallback`, for that name and for one that is not set.
+        let name = |n: usize| "Ab_".repeat(n);
+        let text = |n: usize| format!("XDG_{}_DIR=\"$HOME/x\"\n", name(n));
+        work::assert_linear(
+            350_000,
+            |n| {
+                let (name, text) = (name(n), text(n));
+                let set = UserDirKind::from_name(&name);
+                let unset = UserDirKind::from_name(&format!("{name}Z"));
+                let (dirs, parsing) = work::steps(|| parse(&text));
+                let (found, lookups) = work::steps(|| {
+                    (
+                        dirs.get(&set),
+                        dirs.get_or_fallback(&set),
+                        dirs.get(&unset),
+                        dirs.get_or_fallback(&unset),
+                    )
+                });
+                let folder = Path::new("/home/u/x");
+                assert_eq!(
+                    found,
+                    (Some(folder), folder.to_owned(), None, PathBuf::from(HOME))
+                );
+                assert_eq!(dirs.iter().count(), 1);
+                (parsing + lookups, name.len())
+            },
+            // Parsing the line, with the value `x"` and home copied twice;
+            // then twice the analysed cost of four lookups: one step each,
+            // home compared or copied with at most two more bytes, and each
+            // byte of the name (one more for the unset one) hashed and
+            // compared.
+            |n, name| {
+                bound(&text(n), name, "x\"".len(), 2)
+                    + 2 * (4 * (1 + HOME.len() + 2) + 4 * 2 * (name + 1))
+            },
+        );
     }
 
     #[cfg(not(target_vendor = "apple"))]

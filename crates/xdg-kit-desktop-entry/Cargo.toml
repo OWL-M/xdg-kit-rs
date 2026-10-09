@@ -9,12 +9,23 @@ license.workspace = true
 [features]
 ## Launching applications through D-Bus activation (`DBusActivatable=true`).
 dbus = ["dep:zbus"]
+# Not public API: compiles in the work counter of this crate's counted tests
+# (`work` in src/key_file.rs), for the workspace's own tests only.
+# `xdg-kit-mime-apps` turns it on in its dev-dependencies, so that its counted
+# tests also count the work done in this crate. It may change or go at any
+# time; nothing else should turn it on.
+__count-work = []
 
 [dependencies]
 rustix = { workspace = true, features = ["fs"] }
 xdg-kit-basedir.workspace = true
 xdg-kit-locale.workspace = true
 zbus = { workspace = true, optional = true }
+
+# `MAXSYMLINKS`, the most links a write follows, on the systems the libc
+# crate defines it for (see `MAX_LINKS` in src/key_file.rs).
+[target.'cfg(any(target_os = "freebsd", target_os = "aix"))'.dependencies]
+libc.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

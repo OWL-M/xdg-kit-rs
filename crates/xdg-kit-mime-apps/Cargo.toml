@@ -7,13 +7,23 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+rustix = { workspace = true, features = ["fs"] }
 xdg-kit-basedir.workspace = true
 xdg-kit-desktop-entry.workspace = true
 xdg-kit-mime.workspace = true
 
+# `O_SEARCH`, which rustix does not have, on the systems the libc crate
+# defines it for (see `LOOKUPS_ONLY` in src/cache.rs).
+[target.'cfg(any(target_vendor = "apple", target_os = "aix", target_os = "cygwin", target_os = "emscripten", target_os = "freebsd", target_os = "fuchsia", target_os = "illumos", target_os = "netbsd", target_os = "solaris"))'.dependencies]
+libc.workspace = true
+
 [dev-dependencies]
-rustix = { workspace = true, features = ["fs"] }
 tempfile.workspace = true
+# The hidden `__count-work` feature (not public API) compiles in the key
+# file's work counter, which the counted tests here share (see `work` in
+# src/lib.rs). Dev-dependencies only: it is on when this crate's tests are
+# built, never for those who depend on this crate.
+xdg-kit-desktop-entry = { workspace = true, features = ["__count-work"] }
 
 [lints]
 workspace = true

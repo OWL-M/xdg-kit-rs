@@ -21,13 +21,16 @@ const MAX_STRING: usize = 4096;
 
 /// The major version this reader understands.
 const MAJOR: u16 = 1;
-/// The newest minor version this reader was written for.
+/// The newest minor version this reader supports explicitly. Version 1.1
+/// has the same layout and is read as 1.2. Its weight words contain only
+/// the weight, so the case-sensitive flag, absent in 1.1, reads as unset.
+/// Version 1.0 has a shorter header and smaller entries and is not read.
 const MINOR: u16 = 2;
 
 /// Why a `mime.cache` file is not used at all.
 #[derive(Debug)]
 pub(crate) enum Unusable {
-    /// A major version other than 1.
+    /// A major version other than 1, or 1.0.
     Version(u16, u16),
     /// Too short, or the header points outside the file.
     Damaged(&'static str, usize),
@@ -168,7 +171,7 @@ pub(crate) fn read(
     }
     let major = u16::from_be_bytes([bytes[0], bytes[1]]);
     let minor = u16::from_be_bytes([bytes[2], bytes[3]]);
-    if major != MAJOR {
+    if major != MAJOR || minor == 0 {
         return Err(Unusable::Version(major, minor));
     }
     let mut reader = Reader {
@@ -637,6 +640,45 @@ mod tests {
         let (result, _, diagnostics) = decode(&bytes);
         assert!(result.is_ok());
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    }
+
+    /// The 1.0 and 1.1 caches in `tests/old-writers` were written by
+    /// `update-mime-database` 0.30 and 0.60.
+    #[test]
+    fn version_1_0_is_refused_and_1_1_read_as_1_2() {
+        let mut bytes = cache_bytes();
+        bytes[3] = 0;
+        assert!(matches!(decode(&bytes).0, Err(Unusable::Version(1, 0))));
+        let old = include_bytes!("../../tests/old-writers/0.30/mime.cache");
+        assert!(matches!(decode(old).0, Err(Unusable::Version(1, 0))));
+
+        let (result, folder, diagnostics) =
+            decode(include_bytes!("../../tests/old-writers/0.60/mime.cache"));
+        assert!(result.is_ok() && diagnostics.is_empty(), "{diagnostics:?}");
+        let mut globs: Vec<_> = folder
+            .globs
+            .iter()
+            .map(|g| {
+                (
+                    g.pattern.as_str(),
+                    g.mime.as_str(),
+                    g.weight,
+                    g.case_sensitive,
+                )
+            })
+            .collect();
+        globs.sort_unstable();
+        assert_eq!(
+            globs,
+            [
+                ("*.aa", "text/x-a", 50, false),
+                ("*.bb", "text/x-b", 50, false),
+                ("Afile", "text/x-a", 50, false),
+                ("Bfile", "text/x-b", 50, false),
+                ("a*z", "text/x-a", 50, false),
+                ("b*z", "text/x-b", 50, false),
+            ]
+        );
     }
 
     #[test]

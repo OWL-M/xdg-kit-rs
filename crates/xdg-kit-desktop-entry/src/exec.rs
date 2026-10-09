@@ -7,11 +7,13 @@
 //! unknown field code (including inside quotes), or an unclosed quote.
 //! These make the command unusable under the spec. Other violations,
 //! such as an unquoted reserved character or a field code inside quotes,
-//! produce an [`ExecProblem`]. [`validate`](crate::validate) reports these,
+//! produce an [`ExecProblem`]. [`validate`](crate::validate()) reports these,
 //! but they do not prevent launching.
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
+
+use crate::key_file::work;
 
 /// Characters that need quoting ("Reserved characters"), besides space.
 const RESERVED: &[char] = &[
@@ -189,7 +191,8 @@ impl CommandLine {
     pub fn parse(exec: &str) -> Result<Self, ExecError> {
         let mut problems = Vec::new();
         let mut args = Vec::new();
-        let mut chars = exec.chars().peekable();
+        // A step per character read.
+        let mut chars = exec.chars().inspect(|_| work::count(1)).peekable();
         loop {
             while chars.peek() == Some(&' ') {
                 chars.next();
@@ -197,6 +200,7 @@ impl CommandLine {
             if chars.peek().is_none() {
                 break;
             }
+            work::count(1);
             let mut arg = Arg {
                 pieces: Vec::new(),
                 quoted: false,
@@ -261,16 +265,22 @@ impl CommandLine {
         let Some(program) = args.first().filter(|program| !program.is_empty()) else {
             return Err(ExecError::Empty);
         };
-        if program
-            .pieces
-            .iter()
-            .any(|piece| matches!(piece, Piece::Text(text) if text.contains('=')))
-        {
+        if program.pieces.iter().any(|piece| {
+            // A step for the piece, and per character looked through for a
+            // `=`.
+            work::count(1);
+            let Piece::Text(text) = piece else {
+                return false;
+            };
+            work::count(text.len());
+            text.contains('=')
+        }) {
             problems.push(ExecProblem::EqualsInProgram);
         }
         let mut file_codes = 0;
         for arg in &args {
             for piece in &arg.pieces {
+                work::count(1);
                 if let Piece::Code(code) = piece {
                     if matches!(code, 'f' | 'F' | 'u' | 'U') {
                         file_codes += 1;
@@ -358,7 +368,7 @@ impl CommandLine {
 
 /// Reads a quoted argument after its opening `"` up to the closing one.
 fn read_quoted(
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    chars: &mut std::iter::Peekable<impl Iterator<Item = char>>,
     text: &mut String,
     problems: &mut Vec<ExecProblem>,
 ) -> Result<(), ExecError> {
@@ -414,6 +424,40 @@ fn read_quoted(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Checks that parsing `a` and one argument of about n bytes, `unit`
+    /// repeated (inside quotes when `quoted`), is linear; the argument reads
+    /// as `read` repeated.
+    fn assert_long_argument_linear(unit: &str, read: &str, quoted: bool) {
+        work::assert_linear(
+            512 * 1024,
+            |n| {
+                let arg = unit.repeat(n / unit.len());
+                let exec = if quoted {
+                    format!("a \"{arg}\"")
+                } else {
+                    format!("a {arg}")
+                };
+                let (line, steps) = work::steps(|| CommandLine::parse(&exec));
+                assert_eq!(line.map(|line| line.problems().len()), Ok(0));
+                assert_eq!(expand(&exec, &[])[1], read.repeat(n / unit.len()));
+                (steps, exec.len())
+            },
+            // A step per character read, and per argument and piece: about 1
+            // per byte. Twice that.
+            |_, bytes| 2 * bytes,
+        );
+    }
+
+    #[test]
+    fn one_long_argument_is_parsed_in_linear_time() {
+        assert_long_argument_linear("abc%%", "abc%", false);
+    }
+
+    #[test]
+    fn one_long_quoted_argument_is_parsed_in_linear_time() {
+        assert_long_argument_linear(r"ab\\c%%", r"ab\c%", true);
+    }
 
     fn expand(exec: &str, files: &[&str]) -> Vec<String> {
         let line = CommandLine::parse(exec).unwrap();

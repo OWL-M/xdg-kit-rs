@@ -1,10 +1,12 @@
 use std::path::{Component, Path, PathBuf};
 
-use crate::Error;
+use crate::{Error, work};
 
 /// `path` with repeated and trailing slashes and `.` components removed.
 /// `..` is kept: resolving it needs the filesystem.
 pub(crate) fn normalize(path: &Path) -> PathBuf {
+    // Each byte split into components, and each byte copied.
+    work::count(2 * path.as_os_str().len());
     path.components().collect()
 }
 

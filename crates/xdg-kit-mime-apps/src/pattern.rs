@@ -5,6 +5,8 @@ use std::fmt;
 
 use xdg_kit_mime::{MimeDatabase, MimeType};
 
+use crate::work;
+
 /// The first half of a MIME type, such as `image`. Accepts an RFC 6838
 /// restricted name, just like [`MimeType`], and stores it in lower case
 /// because media types are case-insensitive.
@@ -18,6 +20,10 @@ impl MediaType {
     /// digit, followed by letters, digits or `!#$&^_.+-`.
     #[must_use]
     pub fn new(text: &str) -> Option<Self> {
+        // Copied into a type, which checks it (looking for the `/`, then
+        // through each name) and copies it again, then lowered into a copy:
+        // five steps per character.
+        work::count(5 * text.len());
         // A media type is valid when it makes a valid type.
         MimeType::new(&format!("{text}/x")).ok()?;
         Some(Self(text.to_ascii_lowercase()))
@@ -61,12 +67,16 @@ impl TypePattern {
     /// 6838 restricted names), `media/*` with such a media type, or `*/*`.
     #[must_use]
     pub fn parse(text: &str) -> Option<Self> {
+        // Compared with fixed names: not counted.
         if text == "*/*" {
             return Some(Self::Any);
         }
         if let Some(media) = text.strip_suffix("/*") {
             return MediaType::new(media).map(Self::Media);
         }
+        // `MimeType::new` looks for the `/`, checks each name, and copies
+        // the text: three steps per character.
+        work::count(3 * text.len());
         MimeType::new(text).ok().map(Self::Exact)
     }
 
@@ -77,6 +87,15 @@ impl TypePattern {
         match self {
             Self::Exact(mime) => Self::Exact(database.canonical(mime)),
             Self::Media(_) | Self::Any => self.clone(),
+        }
+    }
+
+    /// The length of the pattern's text without the `/*` of a wildcard.
+    pub(crate) fn text_len(&self) -> usize {
+        match self {
+            Self::Exact(mime) => mime.as_str().len(),
+            Self::Media(media) => media.as_str().len(),
+            Self::Any => 0,
         }
     }
 }

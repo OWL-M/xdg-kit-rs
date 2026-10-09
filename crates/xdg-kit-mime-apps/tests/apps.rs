@@ -749,6 +749,22 @@ fn edits_reach_keys_spelled_as_aliases() {
     );
 }
 
+/// The `file:` URI of `path`: bytes other than RFC 3986 unreserved ones
+/// and `/` are percent-encoded, as the temporary folder may hold any.
+fn file_uri(path: &std::path::Path) -> String {
+    use std::fmt::Write;
+    use std::os::unix::ffi::OsStrExt;
+    let mut uri = String::from("file://");
+    for &byte in path.as_os_str().as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'/') {
+            uri.push(char::from(byte));
+        } else {
+            let _ = write!(uri, "%{byte:02X}");
+        }
+    }
+    uri
+}
+
 #[test]
 fn opening_files_and_uris() {
     let fixture = Fixture::new();
@@ -789,7 +805,7 @@ fn opening_files_and_uris() {
         program(Target::Path(notes.clone())),
         format!("true [{:?}]", notes.as_os_str())
     );
-    let uri = format!("file://{}", notes.display());
+    let uri = file_uri(&notes);
     assert_eq!(
         program(Target::Uri(uri)),
         format!("true [{:?}]", notes.as_os_str()),
@@ -804,7 +820,7 @@ fn opening_files_and_uris() {
         "true [\"xkt-web://example.org/\"]",
         "a link opens its URL"
     );
-    let link_uri = format!("file://{}", fixture.path("files/site.desktop").display());
+    let link_uri = file_uri(&fixture.path("files/site.desktop"));
     assert_eq!(
         program(Target::Uri(link_uri)),
         "true [\"xkt-web://example.org/\"]",
@@ -835,4 +851,69 @@ fn opening_files_and_uris() {
         Err(OpenError::Type(..))
     ));
     fs::remove_file(&notes).unwrap();
+}
+
+#[test]
+fn a_links_url_is_shown_escaped_and_cut() {
+    let fixture = Fixture::new();
+    // An escape character, a line feed once unescaped, and length.
+    let bad = format!("\x1b\\n{}", "a".repeat(5000));
+    fixture.write(
+        "files/no-scheme.desktop",
+        &format!("[Desktop Entry]\nType=Link\nName=a\nURL={bad}\n"),
+    );
+    fixture.write(
+        "files/missing.desktop",
+        &format!("[Desktop Entry]\nType=Link\nName=a\nURL=file:///missing/{bad}\n"),
+    );
+    fixture.write(
+        &format!("files/no-url\x1b{}.desktop", "c".repeat(100)),
+        "[Desktop Entry]\nType=Link\nName=a\n",
+    );
+    let apps = fixture.mime_apps();
+    let options = LaunchOptions::default();
+    let message = |target: Target| open_plan(&target, &apps, &options).unwrap_err().to_string();
+    let no_scheme = message(Target::Path(fixture.path("files/no-scheme.desktop")));
+    assert!(!no_scheme.chars().any(char::is_control), "{no_scheme:?}");
+    assert!(no_scheme.chars().count() <= 250, "{no_scheme:?}");
+    // Paths are escaped but shown whole.
+    let missing = message(Target::Path(fixture.path("files/missing.desktop")));
+    assert!(!missing.chars().any(char::is_control), "{missing:?}");
+    let path = format!("/missing/\\u{{1b}}\\n{}", "a".repeat(5000));
+    assert!(
+        missing.starts_with(&format!("{path}: type not found: ")),
+        "{missing:?}"
+    );
+    let no_url = message(Target::Path(
+        fixture.path(&format!("files/no-url\x1b{}.desktop", "c".repeat(100))),
+    ));
+    assert!(!no_url.chars().any(char::is_control), "{no_url:?}");
+    assert!(no_url.contains(&"c".repeat(100)), "{no_url:?}");
+    // A type, which has only safe characters and is short, is shown whole.
+    let scheme = format!("xkt-{}", "s".repeat(100));
+    let no_app = message(Target::Uri(format!("{scheme}:x")));
+    assert_eq!(
+        no_app,
+        format!("no application opens x-scheme-handler/{scheme}")
+    );
+}
+
+#[test]
+fn desktop_names_from_the_environment_are_shown_escaped_and_cut() {
+    let mut fixture = Fixture::new();
+    fixture.desktops = vec![format!("a/\x1b{}", "d".repeat(5000))];
+    let apps = fixture.mime_apps();
+    let found: Vec<String> = apps
+        .diagnostics()
+        .iter()
+        .map(|found| found.message.clone())
+        .filter(|message| message.starts_with("desktop name"))
+        .collect();
+    assert_eq!(
+        found,
+        [format!(
+            "desktop name \"a/\\u{{1b}}{}…\" cannot name a file; skipped",
+            "d".repeat(29)
+        )]
+    );
 }

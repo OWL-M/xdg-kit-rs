@@ -1,11 +1,14 @@
+use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::fs::DirBuilder;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 
+use crate::error::quoted;
 use crate::paths::{check_relative, normalize};
 use crate::runtime::{self, RuntimeDirProblem};
+use crate::work;
 use crate::{Diagnostic, Error};
 
 const DEFAULT_DATA_DIRS: &[&str] = &["/usr/local/share", "/usr/share"];
@@ -68,15 +71,21 @@ impl BaseDirs {
     ) -> Result<Self, Error> {
         let mut diagnostics = Vec::new();
         let home = home(vars, home_fallback, &mut diagnostics)?;
+        // A folder under home: each byte of home copied (the fixed name
+        // after it is bounded).
+        let under_home = |default: &str| {
+            work::count(home.as_os_str().len());
+            home.join(default)
+        };
         let single = |name: &str, default: &str, diagnostics: &mut Vec<Diagnostic>| {
-            single(vars, name, || home.join(default), diagnostics)
+            single(vars, name, || under_home(default), diagnostics)
         };
         Ok(Self {
             data_home: single("XDG_DATA_HOME", ".local/share", &mut diagnostics),
             config_home: single("XDG_CONFIG_HOME", ".config", &mut diagnostics),
             state_home: single("XDG_STATE_HOME", ".local/state", &mut diagnostics),
             cache_home: single("XDG_CACHE_HOME", ".cache", &mut diagnostics),
-            executable_home: home.join(".local/bin"),
+            executable_home: under_home(".local/bin"),
             data_dirs: list(vars, "XDG_DATA_DIRS", DEFAULT_DATA_DIRS, &mut diagnostics),
             config_dirs: list(
                 vars,
@@ -244,6 +253,16 @@ impl BaseDirs {
     }
 }
 
+/// Formats a diagnostic for an ignored relative path `value`. Reads only
+/// the prefix [`quoted`] can show: 32 characters and enough to check for
+/// more. Each character, including invalid UTF-8 bytes displayed as one
+/// character, takes at most four bytes.
+fn ignored(value: &OsStr) -> String {
+    let bytes = value.as_bytes();
+    let start = String::from_utf8_lossy(&bytes[..bytes.len().min(33 * 4)]);
+    format!("relative path {} ignored", quoted(&start))
+}
+
 fn home(
     vars: &dyn Fn(&str) -> Option<OsString>,
     fallback: Option<PathBuf>,
@@ -251,10 +270,12 @@ fn home(
 ) -> Result<PathBuf, Error> {
     match vars("HOME").filter(|value| !value.is_empty()) {
         Some(value) if Path::new(&value).is_absolute() => return Ok(normalize(Path::new(&value))),
-        Some(value) => diagnostics.push(Diagnostic::variable(
-            "HOME",
-            format!("relative path {} ignored", Path::new(&value).display()),
-        )),
+        Some(value) => {
+            let message = ignored(&value);
+            // Each byte of the message.
+            work::count(message.len());
+            diagnostics.push(Diagnostic::variable("HOME", message));
+        }
         None => {}
     }
     fallback
@@ -273,10 +294,10 @@ fn single(
     match vars(name).filter(|value| !value.is_empty()) {
         Some(value) if Path::new(&value).is_absolute() => normalize(Path::new(&value)),
         Some(value) => {
-            diagnostics.push(Diagnostic::variable(
-                name,
-                format!("relative path {} ignored", Path::new(&value).display()),
-            ));
+            let message = ignored(&value);
+            // Each byte of the message.
+            work::count(message.len());
+            diagnostics.push(Diagnostic::variable(name, message));
             default()
         }
         None => default(),
@@ -294,22 +315,27 @@ fn list(
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
+    let mut seen = HashSet::new();
     if let Some(value) = vars(name) {
         for item in value.as_bytes().split(|&byte| byte == b':') {
+            // The item, and each byte the split went over.
+            work::count(1 + item.len());
             let item = Path::new(OsStr::from_bytes(item));
             if item.as_os_str().is_empty() {
                 continue;
             }
             if item.is_absolute() {
                 let item = normalize(item);
-                if !dirs.contains(&item) {
+                // The check, and each byte copied, hashed and compared.
+                work::count(1 + 3 * item.as_os_str().len());
+                if seen.insert(item.clone()) {
                     dirs.push(item);
                 }
             } else {
-                diagnostics.push(Diagnostic::variable(
-                    name,
-                    format!("relative path {} ignored", item.display()),
-                ));
+                let message = ignored(item.as_os_str());
+                // Each byte of the message.
+                work::count(message.len());
+                diagnostics.push(Diagnostic::variable(name, message));
             }
         }
     }
@@ -438,6 +464,32 @@ mod tests {
     }
 
     #[test]
+    fn relative_values_are_shown_escaped_and_cut() {
+        let bad = format!("a\x1b\n{}", "b".repeat(5000));
+        let vars: HashMap<&str, OsString> = [
+            ("HOME", bad.clone()),
+            ("XDG_CACHE_HOME", bad.clone()),
+            ("XDG_DATA_DIRS", format!("{bad}:/opt/share")),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name, value.into()))
+        .collect();
+        let dirs = BaseDirs::build(
+            &|name| vars.get(name).cloned(),
+            Some(PathBuf::from("/home/u")),
+            runtime::current_uid(),
+        )
+        .unwrap();
+        let shown = format!("relative path a\\u{{1b}}\\n{}… ignored", "b".repeat(29));
+        let messages: Vec<_> = dirs
+            .diagnostics()
+            .iter()
+            .map(|d| d.message.as_str())
+            .collect();
+        assert_eq!(messages, [shown.as_str(); 3]);
+    }
+
+    #[test]
     fn a_list_left_without_items_takes_the_default() {
         let dirs = dirs(&[("HOME", b"/home/u"), ("XDG_CONFIG_DIRS", b"xdg:etc")]).unwrap();
         assert_eq!(dirs.config_dirs(), paths(&["/etc/xdg"]));
@@ -453,6 +505,95 @@ mod tests {
         .unwrap();
         assert_eq!(dirs.data_dirs(), paths(&["/b", "/a", "/usr/share"]));
         assert!(dirs.diagnostics().is_empty());
+    }
+
+    /// The bound for reading `HOME` and an `XDG_DATA_DIRS` of `items`
+    /// items in `list` bytes: twice the analysed cost. Per item two steps
+    /// (split off, the repeat check); per byte one to split it off, two
+    /// to normalize it, one to copy it and two to hash and compare it.
+    /// Home is normalized (two per byte) and copied under five folders.
+    fn list_bound(home: &[u8], items: usize, list: usize) -> usize {
+        2 * (2 * items + 6 * list + 7 * home.len())
+    }
+
+    #[test]
+    fn long_lists_are_read_in_linear_time() {
+        let home = b"/home/u";
+        work::assert_linear(
+            10_000,
+            |n| {
+                let list = (0..n)
+                    .map(|at| format!("/d{at}"))
+                    .collect::<Vec<_>>()
+                    .join(":");
+                let (dirs, steps) = work::steps(|| {
+                    dirs(&[("HOME", home), ("XDG_DATA_DIRS", list.as_bytes())]).unwrap()
+                });
+                assert_eq!(dirs.data_dirs().len(), n);
+                (steps, list.len())
+            },
+            |items, list| list_bound(home, items, list),
+        );
+    }
+
+    #[test]
+    fn a_long_list_item_is_read_in_linear_time() {
+        let home = b"/home/u";
+        work::assert_linear(
+            350_000,
+            |n| {
+                let long = format!("/{}", "ab/".repeat(n));
+                let (dirs, steps) = work::steps(|| {
+                    dirs(&[("HOME", home), ("XDG_DATA_DIRS", long.as_bytes())]).unwrap()
+                });
+                assert_eq!(dirs.data_dirs(), [Path::new(long.trim_end_matches('/'))]);
+                (steps, long.len())
+            },
+            // One item, whatever its parts.
+            |_, long| list_bound(home, 1, long),
+        );
+    }
+
+    #[test]
+    fn long_single_values_are_read_in_linear_time() {
+        // A relative home (reported) and a long home from the password
+        // database, copied under the folders left unset; an absolute config
+        // home; a relative cache home (reported); a relative list item
+        // (reported).
+        work::assert_linear(
+            200_000,
+            |n| {
+                let long = "ab/".repeat(n);
+                let fallback = PathBuf::from(format!("/{long}"));
+                let vars: HashMap<&str, OsString> = HashMap::from([
+                    ("HOME", OsString::from(&long)),
+                    ("XDG_CONFIG_HOME", OsString::from(format!("/c/{long}"))),
+                    ("XDG_CACHE_HOME", OsString::from(&long)),
+                    ("XDG_DATA_DIRS", OsString::from(format!("{long}:/a"))),
+                ]);
+                let get = |name: &str| vars.get(name).cloned();
+                let (dirs, steps) =
+                    work::steps(|| BaseDirs::build(&get, Some(fallback.clone()), 0).unwrap());
+                let home = normalize(&fallback);
+                assert_eq!(dirs.home(), home);
+                assert_eq!(dirs.data_home(), home.join(".local/share"));
+                assert_eq!(dirs.cache_home(), home.join(".cache"));
+                assert_eq!(
+                    dirs.config_home(),
+                    normalize(Path::new(&format!("/c/{long}")))
+                );
+                assert_eq!(dirs.data_dirs(), paths(&["/a"]));
+                assert_eq!(dirs.diagnostics().len(), 3);
+                (steps, long.len())
+            },
+            // Twice the analysed cost: a few steps per value, and the three
+            // messages, which read at most 132 bytes of the value and show
+            // at most 32 characters of it (about 60 bytes each); per byte of
+            // the long part 9: one to split the list, two to normalize the
+            // config home, and for the home two to normalize it and one for
+            // each of four copies.
+            |_, long| 2 * (200 + 9 * long),
+        );
     }
 
     #[test]
@@ -471,6 +612,29 @@ mod tests {
             dirs.data_files("mime/types").unwrap(),
             [data_home.join("mime/types")]
         );
+    }
+
+    #[test]
+    fn a_long_relative_value_is_shown_from_its_start() {
+        let message = |value: &[u8]| {
+            let dirs = dirs(&[("HOME", b"/home/u"), ("XDG_DATA_HOME", value)]).unwrap();
+            dirs.diagnostics()[0].message.clone()
+        };
+        // Bytes that are not UTF-8, and a character cut where reading
+        // stops, are shown as when the whole value is read.
+        for value in [
+            [b"a\xff\xfe".as_slice(), &"é".repeat(200).into_bytes()].concat(),
+            "\u{1f600}".repeat(33).into_bytes(),
+            format!("a{}", "\u{1f600}".repeat(40)).into_bytes(),
+            b"\xe2\x82".repeat(70),
+            "\u{1b}".repeat(33).into_bytes(),
+        ] {
+            let whole = format!(
+                "relative path {} ignored",
+                quoted(&String::from_utf8_lossy(&value))
+            );
+            assert_eq!(message(&value), whole, "{value:?}");
+        }
     }
 
     #[test]
@@ -501,9 +665,19 @@ mod tests {
         assert!(matches!(relative, Err(Error::NoHome)));
     }
 
+    /// Fails at once when `path`, under the temporary folder, holds a `:`,
+    /// which would split it in an XDG path list.
+    fn assert_listable(path: &Path) {
+        assert!(
+            !path.as_os_str().as_bytes().contains(&b':'),
+            "TMPDIR contains ':', which an XDG path list cannot hold; set TMPDIR to a path without ':'"
+        );
+    }
+
     #[test]
     fn lookups_go_in_order_of_importance_and_skip_what_is_missing() {
         let root = tempfile::tempdir().unwrap();
+        assert_listable(root.path());
         let base = |name: &str| root.path().join(name);
         for name in ["home-data", "sys-a", "sys-c"] {
             fs::create_dir_all(base(name).join("mime")).unwrap();

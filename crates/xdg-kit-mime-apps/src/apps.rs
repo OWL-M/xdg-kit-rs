@@ -11,6 +11,7 @@ use xdg_kit_basedir::{BaseDirs, FileStamp};
 use xdg_kit_desktop_entry::{AppEntry, AppIndex, Desktops, EntryType};
 use xdg_kit_mime::{MimeDatabase, MimeType};
 
+use crate::error::quoted;
 use crate::list::{Group, MIMEAPPS_LIST, MimeAppsList};
 use crate::{Diagnostic, MediaType, TypePattern};
 
@@ -114,7 +115,10 @@ impl MimeApps {
                     setup.push(Diagnostic::new(
                         None,
                         None,
-                        format!("desktop name {name:?} cannot name a file; skipped"),
+                        format!(
+                            "desktop name \"{}\" cannot name a file; skipped",
+                            quoted(name)
+                        ),
                     ));
                 }
                 usable

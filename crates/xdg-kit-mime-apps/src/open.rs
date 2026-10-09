@@ -11,6 +11,7 @@ use xdg_kit_desktop_entry::{
 use xdg_kit_mime::{MimeType, PathOptions};
 
 use crate::MimeApps;
+use crate::error::{quoted, shown_path};
 
 /// Why there is nothing to launch.
 #[derive(Debug)]
@@ -32,10 +33,11 @@ pub enum OpenError {
 impl fmt::Display for OpenError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Type(path, err) => write!(f, "{}: type not found: {err}", path.display()),
-            Self::BadUri(uri) => write!(f, "{uri:?} is not a URI that can be opened"),
+            Self::Type(path, err) => write!(f, "{}: type not found: {err}", shown_path(path)),
+            Self::BadUri(uri) => write!(f, "\"{}\" is not a URI that can be opened", quoted(uri)),
+            // A type has only safe characters, and is short.
             Self::NoApplication(mime) => write!(f, "no application opens {mime}"),
-            Self::LinkWithoutUrl(path) => write!(f, "{}: a link without URL", path.display()),
+            Self::LinkWithoutUrl(path) => write!(f, "{}: a link without URL", shown_path(path)),
             Self::Launch(err) => err.fmt(f),
         }
     }
@@ -188,6 +190,13 @@ fn file_uri_path(uri: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_type_is_shown_whole() {
+        let long = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+        let none = OpenError::NoApplication(MimeType::new(long).unwrap());
+        assert_eq!(none.to_string(), format!("no application opens {long}"));
+    }
 
     #[test]
     fn schemes_and_file_uris() {

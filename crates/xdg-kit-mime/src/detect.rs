@@ -131,9 +131,10 @@ impl NameMatches {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct PathOptions {
-    /// Type a symbolic link by what it points to; a broken link is
-    /// `inode/symlink`. When off, every link is `inode/symlink`. On by
-    /// default.
+    /// Type a symbolic link by what it points to; a broken link (one whose
+    /// target cannot be reached through it: missing, through a non-folder,
+    /// in a loop of links, or past a length limit) is `inode/symlink`. When
+    /// off, every link is `inode/symlink`. On by default.
     pub follow_links: bool,
     /// Report a folder on another device than its parent (and `/`) as
     /// `inode/mount-point`, at the cost of a `stat` of the parent. On by
@@ -430,8 +431,10 @@ impl MimeDatabase {
     /// # Errors
     ///
     /// If the file's metadata cannot be read, or its contents cannot be read
-    /// when needed to determine its type. A broken link is not an error:
-    /// it is `inode/symlink`.
+    /// when needed to determine its type. A broken link (as defined for
+    /// [`PathOptions::follow_links`]) is not an error: it is
+    /// `inode/symlink`. A link whose target cannot be looked up for another
+    /// reason, such as permission denied or an I/O error, is an error.
     pub fn type_for_path(
         &self,
         path: impl AsRef<Path>,
@@ -475,7 +478,10 @@ impl MimeDatabase {
             }
             match rustix::fs::statat(dir, path, AtFlags::empty()) {
                 Ok(target) => metadata = target,
-                Err(Errno::NOENT | Errno::LOOP) => return kind("inode/symlink"),
+                // The target cannot be reached through this path at all.
+                Err(Errno::NOENT | Errno::NOTDIR | Errno::LOOP | Errno::NAMETOOLONG) => {
+                    return kind("inode/symlink");
+                }
                 Err(err) => return Err(err.into()),
             }
         }

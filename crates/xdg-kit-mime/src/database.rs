@@ -823,7 +823,7 @@ mod tests {
         fs::create_dir_all(dir.path().join("text")).unwrap();
         fs::write(
             dir.path().join("text/plain.xml"),
-            "<mime-type><comment>Text</comment></mime-type>",
+            r#"<mime-type xmlns="http://www.freedesktop.org/standards/shared-mime-info"><comment>Text</comment></mime-type>"#,
         )
         .unwrap();
         let db = MimeDatabase::from_dirs(&[dir.path().to_owned()]);

@@ -94,12 +94,19 @@ pub(crate) fn before_1_0(version: Option<&str>) -> bool {
 /// The items of a written list. Before 1.0 a list without `;` may be
 /// separated by commas (spec "Deprecated Items").
 pub(crate) fn list_items(raw: &str, before_1_0: bool) -> Vec<String> {
-    if before_1_0 && !raw.contains(';') {
-        return raw
-            .split(',')
-            .filter(|item| !item.is_empty())
-            .map(crate::key_file::unescape)
-            .collect();
+    if before_1_0 {
+        // A step per character looked at for a `;`.
+        work::count(raw.len());
+        if !raw.contains(';') {
+            // And per character looked at for the commas.
+            work::count(raw.len());
+            return raw
+                .split(',')
+                .filter(|item| !item.is_empty())
+                .inspect(|_| work::count(1))
+                .map(crate::key_file::unescape)
+                .collect();
+        }
     }
     crate::key_file::split_list(raw)
 }
@@ -107,19 +114,25 @@ pub(crate) fn list_items(raw: &str, before_1_0: bool) -> Vec<String> {
 /// Whether `raw` is a list separated by commas, as only files before 1.0
 /// may write them.
 pub(crate) fn comma_list(raw: &str) -> bool {
+    work::count(2 * raw.len());
     !raw.contains(';') && raw.contains(',')
 }
 
 /// A D-Bus well-known name: two or more elements separated by dots, each
 /// `[A-Za-z0-9_-]` and not starting with a digit, at most 255 bytes.
 pub(crate) fn valid_dbus_name(name: &str) -> bool {
-    name.len() <= 255
-        && name.split('.').count() >= 2
+    if name.len() > 255 {
+        return false;
+    }
+    // Split twice; the element characters are counted as checked.
+    work::count(2 * name.len());
+    name.split('.').count() >= 2
         && name.split('.').all(|element| {
             !element.is_empty()
                 && !element.starts_with(|c: char| c.is_ascii_digit())
                 && element
                     .chars()
+                    .inspect(|_| work::count(1))
                     .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
         })
 }
@@ -376,8 +389,9 @@ impl DesktopEntry {
             .unwrap_or_default()
             .into_iter()
             .filter(|id| {
-                // The repeat check: one step, as the set is hashed.
-                work::count(1);
+                // The repeat check: a step, and the id copied, hashed and
+                // compared.
+                work::count(1 + 3 * id.len());
                 seen.insert(id.clone())
             })
             .collect()
@@ -446,7 +460,7 @@ impl DesktopEntry {
     pub fn action(&self, id: &str) -> Option<Action<'_>> {
         if !self.list("Actions").is_some_and(|ids| {
             ids.iter().any(|listed| {
-                work::count(1);
+                work::count(1 + listed.len().min(id.len()));
                 listed == id
             })
         }) {
@@ -471,6 +485,7 @@ impl DesktopEntry {
     /// The action `id`, known to be listed, when its group has a `Name`.
     fn listed_action(&self, id: &str) -> Option<Action<'_>> {
         let group = format!("{DESKTOP_ACTION}{id}");
+        work::count(group.len());
         self.file
             .raw(&group, "Name", None)
             .is_some()
@@ -636,24 +651,35 @@ mod tests {
     #[test]
     fn long_action_lists_are_read_in_linear_time() {
         use std::fmt::Write as _;
-        let mut ids = String::new();
-        for at in 0..10_000 {
-            let _ = write!(ids, "A{at};");
-        }
-        let entry = DesktopEntry::parse(
-            format!("[Desktop Entry]\nType=Application\nName=a\nExec=a\nActions={ids}\n[Desktop Action A1]\nName=One\n").as_bytes(),
+        work::assert_linear(
+            5_000,
+            |n| {
+                let mut ids = String::new();
+                for at in 0..n {
+                    let _ = write!(ids, "A{at};");
+                }
+                let text = format!(
+                    "[Desktop Entry]\nType=Application\nName=a\nExec=a\nActions={ids}\n[Desktop Action A1]\nName=One\n"
+                );
+                let entry = DesktopEntry::parse(text.as_bytes());
+                let ((), steps) = work::steps(|| {
+                    assert_eq!(entry.action_ids().len(), n);
+                    assert_eq!(entry.actions().len(), 1);
+                    assert_eq!(
+                        entry.action("A1").map(|a| a.id().to_owned()).as_deref(),
+                        Some("A1")
+                    );
+                });
+                (steps, text.len())
+            },
+            // A step per id split off the list, checked for repeats, looked
+            // up or compared, and per line a lookup visits, with each id
+            // copied, hashed and compared and each action's group name made
+            // and looked up: about 95 per id; and per character of the list
+            // checked, split and unescaped, each time it is read: about 8.5
+            // per byte. Twice that.
+            |ids, bytes| 190 * ids + 17 * bytes,
         );
-        let ((), steps) = work::steps(|| {
-            assert_eq!(entry.action_ids().len(), 10_000);
-            assert_eq!(entry.actions().len(), 1);
-            assert_eq!(
-                entry.action("A1").map(|a| a.id().to_owned()).as_deref(),
-                Some("A1")
-            );
-        });
-        // A step per id split off the list, checked for repeats, looked up
-        // or compared, and per line a lookup visits.
-        assert!(steps <= 7 * 10_000, "{steps} steps for 10,000 ids");
     }
 
     #[test]

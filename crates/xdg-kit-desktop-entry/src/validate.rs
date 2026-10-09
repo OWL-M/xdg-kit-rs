@@ -9,8 +9,9 @@ use crate::entry::{
     DESKTOP_ACTION, DESKTOP_ENTRY, KDE_DESKTOP_ENTRY, before_1_0, comma_list, list_items,
     valid_dbus_name,
 };
+use crate::error::quoted;
 use crate::exec::{CommandLine, ExecError, ExecProblem};
-use crate::key_file::{KeyFile, KeyNames, valid_group_name, valid_key_name, work};
+use crate::key_file::{Group, KeyFile, KeyNames, valid_group_name, valid_key_name, work};
 use crate::keys::{self, ACTION_KEYS, Applies, DESKTOP_KEYS, KeyDef, Status, ValueType};
 use crate::registry::{ADDITIONAL_CATEGORIES, DESKTOPS, MAIN_CATEGORIES, RESERVED_CATEGORIES};
 
@@ -81,10 +82,14 @@ struct Validator<'a> {
 
 impl Validator<'_> {
     fn push(&mut self, level: Level, line: Option<usize>, message: impl Into<String>) {
+        let message = message.into();
+        // A step per byte of the message, which is written with whatever
+        // input it shows.
+        work::count(message.len());
         self.issues.push(Issue {
             level,
             line,
-            message: message.into(),
+            message,
         });
     }
 
@@ -119,7 +124,7 @@ fn check_file(file: &KeyFile) -> Vec<Issue> {
     }
     check_lines(&mut v, &text);
     for diagnostic in file.diagnostics() {
-        work::count(1);
+        work::count(1 + diagnostic.message.len());
         v.error(diagnostic.line, diagnostic.message.clone());
     }
     let groups = file.groups();
@@ -150,7 +155,13 @@ fn check_file(file: &KeyFile) -> Vec<Issue> {
 /// Line-level rules the key-file layer accepts: carriage returns and
 /// leading spaces, which `desktop-file-validate` rejects.
 fn check_lines(v: &mut Validator<'_>, text: &[u8]) {
-    for (index, line) in text.split(|&byte| byte == b'\n').enumerate() {
+    for (index, line) in text
+        .split(|&byte| {
+            work::count(1);
+            byte == b'\n'
+        })
+        .enumerate()
+    {
         work::count(1);
         let number = Some(index + 1);
         if line.ends_with(b"\r") {
@@ -175,7 +186,8 @@ struct Main {
     /// A `Version` before 1.0, whose booleans may be `0` and `1` and whose
     /// lists may be separated by commas.
     before_1_0: bool,
-    implements: Vec<String>,
+    /// The interfaces `Implements` lists.
+    implements: std::collections::HashSet<String>,
     /// The ids `Actions` lists.
     actions: std::collections::HashSet<String>,
     dbus_activatable: bool,
@@ -193,7 +205,11 @@ impl Main {
         Self {
             entry_type: file.string(group, "Type"),
             before_1_0,
-            implements: list("Implements").unwrap_or_default(),
+            implements: list("Implements")
+                .unwrap_or_default()
+                .into_iter()
+                .inspect(|interface| work::count(1 + 2 * interface.len()))
+                .collect(),
             dbus_activatable: matches!(
                 file.raw(group, "DBusActivatable", None),
                 Some("true" | "1")
@@ -202,9 +218,12 @@ impl Main {
             actions: list("Actions")
                 .unwrap_or_default()
                 .into_iter()
-                .inspect(|_| work::count(1))
+                .inspect(|id| work::count(1 + 2 * id.len()))
                 .collect(),
-            path: file.path().map(ToOwned::to_owned),
+            path: file.path().map(|path| {
+                work::count(path.as_os_str().len());
+                path.to_owned()
+            }),
         }
     }
 
@@ -219,7 +238,9 @@ impl Main {
 }
 
 fn check_group(v: &mut Validator<'_>, group: &str, main: &Main) {
-    work::count(1);
+    // A step, and the name (or its action id) hashed and compared when
+    // looked for in `Actions` or `Implements`.
+    work::count(1 + 2 * group.len());
     let line = v.file.group_line(group);
     if !valid_group_name(group) {
         // Already reported by the key-file layer.
@@ -231,37 +252,48 @@ fn check_group(v: &mut Validator<'_>, group: &str, main: &Main) {
         if id.is_empty() {
             v.error(
                 line,
-                format!("[{group}] is an action group with no action id"),
+                format!("[{}] is an action group with no action id", quoted(group)),
             );
         } else if !valid_action_id(id) {
             v.error(
                 line,
                 format!(
-                    "[{group}] has an invalid action id: only letters, digits and '-' are allowed"
+                    "[{}] has an invalid action id: only letters, digits and '-' are allowed",
+                    quoted(group)
                 ),
             );
         } else if !main.actions.contains(id) {
             v.error(
                 line,
-                format!("[{group}] exists, but Actions does not list {id:?}"),
+                format!(
+                    "[{}] exists, but Actions does not list \"{}\"",
+                    quoted(group),
+                    quoted(id)
+                ),
             );
         }
         ACTION_KEYS
     } else if group.starts_with("X-") {
         return;
-    } else if main.implements.iter().any(|interface| interface == group) {
+    } else if main.implements.contains(group) {
         // Details of an interface the entry implements (spec "Interfaces").
         return;
     } else {
         v.error(
             line,
-            format!("[{group}] is not a group of the spec; groups extending the format start with \"X-\""),
+            format!(
+                "[{}] is not a group of the spec; groups extending the format start with \"X-\"",
+                quoted(group)
+            ),
         );
         return;
     };
-    for (key, locale) in v.file.keys(group) {
-        work::count(1);
-        check_key(v, group, key, locale, defs, main);
+    // Found once, so that the work per key does not grow with its name.
+    if let Some(found) = v.file.group(group) {
+        for (key, locale) in found.keys() {
+            work::count(1);
+            check_key(v, group, found, key, locale, defs, main);
+        }
     }
     check_required(v, group, main);
 }
@@ -275,9 +307,12 @@ fn valid_locale(locale: &str) -> bool {
         !part.is_empty()
             && part
                 .chars()
+                .inspect(|_| work::count(1))
                 .all(|c| c.is_ascii_alphanumeric() || c == '-' || extra.contains(&c))
     };
     let part = |part: &str| made_of(part, &[]);
+    // The three splits below each look at a character at most once.
+    work::count(3 * locale.len());
     let (rest, modifier) = locale
         .split_once('@')
         .map_or((locale, None), |(rest, modifier)| (rest, Some(modifier)));
@@ -293,34 +328,52 @@ fn valid_locale(locale: &str) -> bool {
 }
 
 fn valid_action_id(id: &str) -> bool {
-    !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    !id.is_empty()
+        && id
+            .chars()
+            .inspect(|_| work::count(1))
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
 fn check_key(
     v: &mut Validator<'_>,
     group: &str,
+    found: Group<'_>,
     key: &str,
     locale: Option<&str>,
     defs: &[KeyDef],
     main: &Main,
 ) {
-    let line = v.file.line_of(group, key, locale);
-    let shown = locale.map_or_else(|| key.to_owned(), |locale| format!("{key}[{locale}]"));
+    let line = found.line_of(key, locale);
     if !valid_key_name(key) {
         // The key-file layer reports it, unless the file takes other key
         // names.
         if v.file.key_names() != KeyNames::DesktopEntry && v.file.key_names().allows(key) {
+            let written =
+                locale.map_or_else(|| key.to_owned(), |locale| format!("{key}[{locale}]"));
+            work::count(written.len());
             v.error(
                 line,
-                format!("key {shown:?} has characters a key name may not have"),
+                format!(
+                    "key \"{}\" has characters a key name may not have",
+                    quoted(&written)
+                ),
             );
         }
         return;
     }
+    let shown = match locale {
+        Some(locale) => format!("{}[{}]", quoted(key), quoted(locale)),
+        None => quoted(key),
+    };
+    work::count(shown.len());
     if let Some(locale) = locale.filter(|locale| !valid_locale(locale)) {
         v.error(
             line,
-            format!("{shown}: {locale:?} is not a locale (lang_COUNTRY.ENCODING@MODIFIER)"),
+            format!(
+                "{shown}: \"{}\" is not a locale (lang_COUNTRY.ENCODING@MODIFIER)",
+                quoted(locale)
+            ),
         );
     }
     let Some(def) = keys::find(defs, key) else {
@@ -339,7 +392,7 @@ fn check_key(
             v.error(line, format!("{shown}: {key} is not a localized key"));
             return;
         }
-        if v.file.raw(group, key, None).is_none() {
+        if found.raw(key, None).is_none() {
             v.error(
                 line,
                 format!("{shown} is translated, but there is no untranslated {key}"),
@@ -371,7 +424,7 @@ fn check_key(
             );
         }
     }
-    let Some(raw) = v.file.raw(group, key, locale) else {
+    let Some(raw) = found.raw(key, locale) else {
         return;
     };
     check_value(v, line, &shown, def.value_type, raw, main.before_1_0);
@@ -387,7 +440,7 @@ fn known_type(value: &str) -> bool {
 /// Reading keeps any other as written. A backslash at the end is not
 /// counted here; see [`ends_in_backslash`].
 fn unknown_escapes(raw: &str, list: bool) -> impl Iterator<Item = char> {
-    let mut chars = raw.chars();
+    let mut chars = raw.chars().inspect(|_| work::count(1));
     std::iter::from_fn(move || {
         while let Some(c) = chars.next() {
             if c == '\\' {
@@ -405,7 +458,13 @@ fn unknown_escapes(raw: &str, list: bool) -> impl Iterator<Item = char> {
 /// Whether `raw` ends in a backslash that escapes nothing. Reading keeps
 /// it as one backslash.
 fn ends_in_backslash(raw: &str) -> bool {
-    raw.bytes().rev().take_while(|&b| b == b'\\').count() % 2 == 1
+    raw.bytes()
+        .rev()
+        .inspect(|_| work::count(1))
+        .take_while(|&b| b == b'\\')
+        .count()
+        % 2
+        == 1
 }
 
 /// The value type's rules: strings are printable ASCII and use only the
@@ -462,7 +521,11 @@ fn check_value(
     }
     match value_type {
         ValueType::String | ValueType::StringList => {
-            if let Some(bad) = raw.chars().find(|&c| !c.is_ascii() || c.is_ascii_control()) {
+            if let Some(bad) = raw
+                .chars()
+                .inspect(|_| work::count(1))
+                .find(|&c| !c.is_ascii() || c.is_ascii_control())
+            {
                 v.error(
                     line,
                     format!(
@@ -483,7 +546,10 @@ fn check_value(
             if !matches!(raw, "true" | "false") {
                 v.error(
                     line,
-                    format!("{key}: {raw:?} is not a boolean; use true or false"),
+                    format!(
+                        "{key}: \"{}\" is not a boolean; use true or false",
+                        quoted(raw)
+                    ),
                 );
             }
         }
@@ -516,7 +582,8 @@ fn check_meaning(
                     None => v.error(
                         line,
                         format!(
-                            "Type={value} is not a registered type (Application, Link, Directory)"
+                            "Type={} is not a registered type (Application, Link, Directory)",
+                            quoted(&value)
                         ),
                     ),
                 }
@@ -526,7 +593,10 @@ fn check_meaning(
             if !known_version(&value) {
                 v.error(
                     line,
-                    format!("Version={value} is not a known version of the spec"),
+                    format!(
+                        "Version={} is not a known version of the spec",
+                        quoted(&value)
+                    ),
                 );
             }
         }
@@ -545,34 +615,44 @@ fn check_meaning(
                 v.push(
                     Level::Warning,
                     line,
-                    format!("Path={value} is not an absolute path"),
+                    format!("Path={} is not an absolute path", quoted(&value)),
                 );
             }
         }
         "MimeType" => {
             for mime in main.items(raw) {
+                work::count(1);
                 if !looks_like_mime_type(&mime) {
                     v.push(
                         Level::FutureError,
                         line,
-                        format!("MimeType: {mime:?} is not a MIME type"),
+                        format!("MimeType: \"{}\" is not a MIME type", quoted(&mime)),
                     );
                 }
             }
         }
         "Categories" => check_categories(v, line, raw, main),
         "Keywords" => {
-            if main.items(raw).iter().any(String::is_empty) {
+            if main
+                .items(raw)
+                .iter()
+                .inspect(|_| work::count(1))
+                .any(String::is_empty)
+            {
                 v.error(line, "Keywords contains an empty keyword");
             }
         }
         "Actions" => check_actions(v, line, raw, main),
         "Implements" => {
             for interface in main.items(raw) {
+                work::count(1);
                 if !valid_interface_name(&interface) {
                     v.error(
                         line,
-                        format!("Implements: {interface:?} is not a D-Bus interface name"),
+                        format!(
+                            "Implements: \"{}\" is not a D-Bus interface name",
+                            quoted(&interface)
+                        ),
                     );
                 }
             }
@@ -580,7 +660,7 @@ fn check_meaning(
         "Encoding" if !matches!(value.as_str(), "UTF-8" | "Legacy-Mixed") => {
             v.error(
                 line,
-                format!("Encoding={value} is not UTF-8 or Legacy-Mixed"),
+                format!("Encoding={} is not UTF-8 or Legacy-Mixed", quoted(&value)),
             );
         }
         _ => {}
@@ -589,9 +669,14 @@ fn check_meaning(
 
 /// An icon is an absolute path or a name without a path or an extension.
 fn check_icon(v: &mut Validator<'_>, line: Option<usize>, value: &str) {
+    // Looked through for a `/`, then lowered.
+    work::count(2 * value.len());
     if value.starts_with('/') {
         if value.ends_with('/') {
-            v.error(line, format!("Icon={value} is a folder, not an icon"));
+            v.error(
+                line,
+                format!("Icon={} is a folder, not an icon", quoted(value)),
+            );
         }
         return;
     }
@@ -599,7 +684,8 @@ fn check_icon(v: &mut Validator<'_>, line: Option<usize>, value: &str) {
         v.error(
             line,
             format!(
-                "Icon={value} looks like a relative path; use an absolute path or an icon name"
+                "Icon={} looks like a relative path; use an absolute path or an icon name",
+                quoted(value)
             ),
         );
         return;
@@ -612,7 +698,10 @@ fn check_icon(v: &mut Validator<'_>, line: Option<usize>, value: &str) {
         v.push(
             Level::FutureError,
             line,
-            format!("Icon={value}: an icon name has no extension (Icon Theme spec)"),
+            format!(
+                "Icon={}: an icon name has no extension (Icon Theme spec)",
+                quoted(value)
+            ),
         );
     }
 }
@@ -638,6 +727,7 @@ fn check_exec(
         Err(err) => v.error(line, format!("Exec: {err}")),
         Ok(command) => {
             for problem in command.problems() {
+                work::count(1);
                 let level = match problem {
                     ExecProblem::Deprecated(_) => Level::Warning,
                     ExecProblem::InvalidEscapeInQuotes(c) if string_escapes.contains(c) => continue,
@@ -651,10 +741,12 @@ fn check_exec(
 
 /// `type/subtype`, both parts non-empty printable ASCII without spaces.
 fn looks_like_mime_type(value: &str) -> bool {
+    work::count(value.len());
     let part = |text: &str| {
         !text.is_empty()
             && text
                 .chars()
+                .inspect(|_| work::count(1))
                 .all(|c| c.is_ascii_graphic() && !"()<>@,;:\\\"/[]?=".contains(c))
     };
     value
@@ -674,25 +766,37 @@ fn check_show_in(
     // "The same desktop name may not appear in both OnlyShowIn and
     // NotShowIn of a group."
     if key == "OnlyShowIn" {
-        let not_show_in = v
+        let not_show_in: std::collections::HashSet<String> = v
             .file
             .raw(group, "NotShowIn", None)
             .map(|raw| main.items(raw))
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .into_iter()
+            .inspect(|desktop| work::count(1 + 2 * desktop.len()))
+            .collect();
         for desktop in main.items(raw) {
+            work::count(1 + 2 * desktop.len());
             if not_show_in.contains(&desktop) {
                 v.error(
                     line,
-                    format!("{desktop} is in both OnlyShowIn and NotShowIn of [{group}]"),
+                    format!(
+                        "{} is in both OnlyShowIn and NotShowIn of [{}]",
+                        quoted(&desktop),
+                        quoted(group)
+                    ),
                 );
             }
         }
     }
     for desktop in main.items(raw) {
+        work::count(1);
         if !DESKTOPS.contains(&desktop.as_str()) && !desktop.starts_with("X-") {
             v.error(
                 line,
-                format!("{key}: {desktop:?} is not a registered desktop; others start with \"X-\""),
+                format!(
+                    "{key}: \"{}\" is not a registered desktop; others start with \"X-\"",
+                    quoted(&desktop)
+                ),
             );
         }
     }
@@ -702,7 +806,7 @@ fn check_categories(v: &mut Validator<'_>, line: Option<usize>, raw: &str, main:
     let categories = main.items(raw);
     let present: std::collections::HashSet<&str> = categories
         .iter()
-        .inspect(|_| work::count(1))
+        .inspect(|category| work::count(1 + 2 * category.len()))
         .map(String::as_str)
         .collect();
     let has = |name: &str| {
@@ -747,7 +851,10 @@ fn check_categories(v: &mut Validator<'_>, line: Option<usize>, raw: &str, main:
         } else if !category.starts_with("X-") {
             v.error(
                 line,
-                format!("Categories: {category:?} is not registered; others start with \"X-\""),
+                format!(
+                    "Categories: \"{}\" is not registered; others start with \"X-\"",
+                    quoted(category)
+                ),
             );
         }
     }
@@ -765,18 +872,26 @@ fn check_categories(v: &mut Validator<'_>, line: Option<usize>, raw: &str, main:
 
 fn check_actions(v: &mut Validator<'_>, line: Option<usize>, raw: &str, main: &Main) {
     for id in main.items(raw) {
-        work::count(1);
+        // A step, and the id copied into the group name looked for.
+        work::count(1 + id.len());
         if id.is_empty() {
             v.error(line, "Actions contains an empty action");
         } else if !valid_action_id(&id) {
             v.error(
                 line,
-                format!("Actions: {id:?} is not a valid action id (letters, digits and '-')"),
+                format!(
+                    "Actions: \"{}\" is not a valid action id (letters, digits and '-')",
+                    quoted(&id)
+                ),
             );
         } else if !v.file.has_group(&format!("{DESKTOP_ACTION}{id}")) {
             v.error(
                 line,
-                format!("Actions lists {id:?}, but there is no [{DESKTOP_ACTION}{id}] group"),
+                format!(
+                    "Actions lists \"{}\", but there is no [{DESKTOP_ACTION}{}] group",
+                    quoted(&id),
+                    quoted(&id)
+                ),
             );
         }
     }
@@ -784,7 +899,10 @@ fn check_actions(v: &mut Validator<'_>, line: Option<usize>, raw: &str, main: &M
 
 /// A D-Bus interface name: like a bus name, but `-` is not allowed.
 fn valid_interface_name(name: &str) -> bool {
-    valid_dbus_name(name) && !name.contains('-')
+    valid_dbus_name(name) && {
+        work::count(name.len());
+        !name.contains('-')
+    }
 }
 
 fn check_required(v: &mut Validator<'_>, group: &str, main: &Main) {
@@ -804,19 +922,25 @@ fn check_required(v: &mut Validator<'_>, group: &str, main: &Main) {
         missing.push("Name");
     }
     for key in missing {
-        v.error(line, format!("[{group}] needs the key {key}"));
+        v.error(line, format!("[{}] needs the key {key}", quoted(group)));
     }
     let application = main.is("Application");
     if application && !main.dbus_activatable && !has("Exec") {
         v.error(
             line,
-            format!("[{group}] needs Exec, as DBusActivatable is not true"),
+            format!(
+                "[{}] needs Exec, as DBusActivatable is not true",
+                quoted(group)
+            ),
         );
     } else if application && !has("Exec") {
         v.push(
             Level::Warning,
             line,
-            format!("[{group}] should have Exec for launchers that do not know DBusActivatable"),
+            format!(
+                "[{}] should have Exec for launchers that do not know DBusActivatable",
+                quoted(group)
+            ),
         );
     }
 }
@@ -828,6 +952,14 @@ fn check_names(v: &mut Validator<'_>) {
     let comment = file.raw(main, "Comment", None);
     let generic = file.raw(main, "GenericName", None);
     let line = file.line_of(main, "Comment", None);
+    // Each compared with the others.
+    work::count(
+        2 * [name, comment, generic]
+            .iter()
+            .flatten()
+            .map(|text| text.len())
+            .sum::<usize>(),
+    );
     if comment.is_some() && (comment == name || comment == generic) {
         v.push(Level::Warning, line, "Comment repeats Name or GenericName");
     }
@@ -902,6 +1034,79 @@ mod tests {
         // An unknown type is reported once, not again for each key.
         let errors = errors("[Desktop Entry]\nType=Thing\nName=Foo\nExec=foo\nURL=x\n");
         assert_eq!(errors.len(), 1, "{errors:?}");
+    }
+
+    #[test]
+    fn names_of_safe_characters_are_cut_too() {
+        let long = "a".repeat(5000);
+        let start = "[Desktop Entry]\nType=Application\nName=a\nExec=a\n";
+        for rest in [
+            format!("Actions={long};\n"),
+            format!("[Desktop Action {long}]\nExec=a\n"),
+            format!("[{long}]\n"),
+            format!("{long}=a\n"),
+            format!("OnlyShowIn=X-{long};\nNotShowIn=X-{long};\n"),
+        ] {
+            let issues = validate(&KeyFile::parse(format!("{start}{rest}").as_bytes()));
+            assert!(!issues.is_empty(), "{rest:?}");
+            for issue in issues {
+                let shown: String = issue.message.chars().take(100).collect();
+                assert!(issue.message.chars().count() <= 150, "{shown:?}…");
+            }
+        }
+    }
+
+    #[test]
+    fn text_from_the_file_is_shown_escaped_and_cut() {
+        // An escape character, a line feed once unescaped, and length.
+        let bad = format!("\x1b\\n{}", "a".repeat(5000));
+        let start = "[Desktop Entry]\nType=Application\nName=a\nExec=a\n";
+        let lines = [
+            format!("Version={bad}"),
+            format!("Icon=a/{bad}"),
+            format!("Icon=/{bad}/"),
+            format!("Icon={bad}.png"),
+            format!("Path={bad}"),
+            format!("MimeType={bad};"),
+            format!("Implements={bad};"),
+            format!("Encoding={bad}"),
+            format!("OnlyShowIn={bad};\nNotShowIn={bad};"),
+            format!("Categories={bad};"),
+            format!("Actions={bad};"),
+            format!("Terminal={bad}"),
+            format!("Name[{bad}]=a"),
+            format!("Foo[{bad}]=a"),
+            format!("Exec[{bad}]=a"),
+            format!("Comment[{bad}]=a"),
+            format!("Keywords[{bad}]=\\q;"),
+            format!("X{bad}=a"),
+            format!("X.{}=a", "a".repeat(5000)),
+        ];
+        let mut texts: Vec<String> = lines
+            .iter()
+            .map(|line| format!("{start}{line}\n"))
+            .collect();
+        texts.push(format!("[Desktop Entry]\nType={bad}\nName=a\n"));
+        for text in &texts {
+            for file in [
+                KeyFile::parse(text.as_bytes()),
+                KeyFile::parse_with(text.as_bytes(), KeyNames::Any),
+            ] {
+                let issues = validate(&file);
+                assert!(!issues.is_empty(), "{text:?}");
+                for issue in issues {
+                    crate::error::assert_shown_safely(&issue.message);
+                    crate::error::assert_shown_safely(&issue.to_string());
+                }
+            }
+        }
+        let messages: Vec<String> = validate(&KeyFile::parse(texts[0].as_bytes()))
+            .into_iter()
+            .map(|issue| issue.message)
+            .collect();
+        let shown = format!("Version=\\u{{1b}}\\n{}…", "a".repeat(30));
+        let expected = format!("{shown} is not a known version of the spec");
+        assert!(messages.contains(&expected), "{messages:?}");
     }
 
     #[test]
@@ -1323,25 +1528,37 @@ mod tests {
     #[test]
     fn many_actions_are_checked_in_linear_time() {
         use std::fmt::Write as _;
-        let mut text = String::from("[Desktop Entry]\nType=Application\nName=a\nExec=a\nActions=");
-        for at in 0..20_000 {
-            let _ = write!(text, "A{at};");
-        }
-        text.push('\n');
-        for at in 0..20_000 {
-            let _ = write!(text, "[Desktop Action A{at}]\nName=n\nExec=a\n");
-        }
-        let file = KeyFile::parse(text.as_bytes());
-        let (issues, steps) = work::steps(|| validate(&file));
-        let errors: Vec<_> = issues
-            .iter()
-            .filter(|issue| issue.level == Level::Error)
-            .collect();
-        assert!(errors.is_empty(), "{errors:?}");
-        // A step per line written out and checked, per group, key or
-        // action id checked or listed, per line a lookup visits, and per
-        // block whose first line is worked out: about 25 per action.
-        assert!(steps <= 26 * 20_000, "{steps} steps for 20,000 actions");
+        work::assert_linear(
+            10_000,
+            |n| {
+                let mut text =
+                    String::from("[Desktop Entry]\nType=Application\nName=a\nExec=a\nActions=");
+                for at in 0..n {
+                    let _ = write!(text, "A{at};");
+                }
+                text.push('\n');
+                for at in 0..n {
+                    let _ = write!(text, "[Desktop Action A{at}]\nName=n\nExec=a\n");
+                }
+                let file = KeyFile::parse(text.as_bytes());
+                let (issues, steps) = work::steps(|| validate(&file));
+                let errors: Vec<_> = issues
+                    .iter()
+                    .filter(|issue| issue.level == Level::Error)
+                    .collect();
+                assert!(errors.is_empty(), "{errors:?}");
+                (steps, text.len())
+            },
+            // A step per line written out and checked, per group, key or
+            // action id checked or listed, per line a lookup visits, per
+            // block whose first line is worked out, and per argument, piece
+            // or problem of a command line, with the action's group name
+            // (about 20 bytes) hashed and compared for each lookup of the
+            // group, not for each of its keys: about 517 per action; and per
+            // character split off, checked for UTF-8, looked through,
+            // unescaped or parsed: about 4 per byte. Twice that.
+            |actions, bytes| 1034 * actions + 8 * bytes,
+        );
     }
 
     #[test]
@@ -1361,17 +1578,153 @@ mod tests {
 
     #[test]
     fn long_category_lists_are_checked_in_linear_time() {
-        let mut value = "Building;".repeat(10_000);
-        value.push_str("Development;");
-        let file = KeyFile::parse(
-            format!("[Desktop Entry]\nType=Application\nName=a\nExec=a\nCategories={value}\n")
-                .as_bytes(),
+        work::assert_linear(
+            5_000,
+            |n| {
+                let mut value = "Building;".repeat(n);
+                value.push_str("Development;");
+                let text = format!(
+                    "[Desktop Entry]\nType=Application\nName=a\nExec=a\nCategories={value}\n"
+                );
+                let file = KeyFile::parse(text.as_bytes());
+                let (issues, steps) = work::steps(|| validate(&file));
+                assert!(issues.is_empty(), "{issues:?}");
+                (steps, text.len())
+            },
+            // A step per category split off the list, gathered and checked,
+            // and per category looked for, with each hashed: about 28 per
+            // category; and per character of the value split off, checked or
+            // unescaped, each time it is read: about 7 per byte. Twice that.
+            |categories, bytes| 57 * categories + 14 * bytes,
         );
-        let (issues, steps) = work::steps(|| validate(&file));
-        assert!(issues.is_empty(), "{issues:?}");
-        // A step per category split off the list, gathered and checked,
-        // and per category looked for.
-        assert!(steps <= 5 * 10_000, "{steps} steps for 10,000 categories");
+    }
+
+    #[test]
+    fn very_long_values_are_read_and_checked_in_linear_time() {
+        work::assert_linear(
+            5_000,
+            |n| {
+                // About 100 n bytes each (1 MB at n = 10,000): a name, a
+                // command line with quoted arguments, escapes and field codes,
+                // and a list.
+                let name = "Foo Viewer ".repeat(10 * n);
+                let exec = r#""a\\\\b" c%%d "#.repeat(8 * n);
+                let mut categories = "Building;".repeat(11 * n);
+                categories.push_str("Development;");
+                let text = format!(
+                    "[Desktop Entry]\nType=Application\nName={name}\nExec=a {exec}\nCategories={categories}\n"
+                );
+                let (issues, steps) = work::steps(|| validate(&KeyFile::parse(text.as_bytes())));
+                assert!(issues.is_empty(), "{issues:?}");
+                assert!(
+                    steps >= text.len(),
+                    "{steps} steps for {} bytes",
+                    text.len()
+                );
+                (steps, text.len())
+            },
+            // Every character is counted, so that a loop over them going
+            // quadratic shows: each value is checked for UTF-8, looked through
+            // and unescaped several times over, the list split and the command
+            // line parsed, the values copied and the lines indexed: about 13.7
+            // steps per byte, items included. Twice that.
+            |_, bytes| 28 * bytes,
+        );
+    }
+
+    #[test]
+    fn many_interfaces_are_checked_in_linear_time() {
+        use std::fmt::Write as _;
+        work::assert_linear(
+            5_000,
+            |n| {
+                let mut text =
+                    String::from("[Desktop Entry]\nType=Application\nName=a\nExec=a\nImplements=");
+                for at in 0..n {
+                    let _ = write!(text, "org.example.I{at};");
+                }
+                text.push('\n');
+                for at in 0..n {
+                    let _ = writeln!(text, "[org.example.I{at}]");
+                }
+                let file = KeyFile::parse(text.as_bytes());
+                let (issues, steps) = work::steps(|| validate(&file));
+                assert!(issues.is_empty(), "{issues:?}");
+                (steps, text.len())
+            },
+            // A step per interface split off the list, gathered and checked,
+            // per line written out and checked, and per group checked or
+            // looked up, with each name hashed and compared as it is
+            // gathered, indexed and looked for: about 144 per interface; and
+            // per character of the list and the headers checked, split off or
+            // unescaped: about 7.5 per byte. Twice that.
+            |interfaces, bytes| 289 * interfaces + 15 * bytes,
+        );
+    }
+
+    #[test]
+    fn long_show_in_lists_are_checked_in_linear_time() {
+        use std::fmt::Write as _;
+        work::assert_linear(
+            5_000,
+            |n| {
+                let mut text =
+                    String::from("[Desktop Entry]\nType=Application\nName=a\nExec=a\nOnlyShowIn=");
+                for at in 0..n {
+                    let _ = write!(text, "X-Only{at};");
+                }
+                text.push_str("\nNotShowIn=");
+                for at in 0..n {
+                    let _ = write!(text, "X-Not{at};");
+                }
+                text.push('\n');
+                let file = KeyFile::parse(text.as_bytes());
+                let (issues, steps) = work::steps(|| validate(&file));
+                assert!(issues.is_empty(), "{issues:?}");
+                (steps, text.len())
+            },
+            // A step per desktop split off a list (the lists are split for
+            // each check), gathered and checked, with each name hashed and
+            // compared: about 63 per pair; and per character of the lists
+            // checked, split off or unescaped, each time they are read: about
+            // 11 per byte. Twice that.
+            |pairs, bytes| 127 * pairs + 22 * bytes,
+        );
+    }
+
+    #[test]
+    fn many_keys_under_a_long_action_id_are_checked_in_linear_time() {
+        use std::fmt::Write as _;
+        work::assert_linear(
+            2_000,
+            |n| {
+                // An action id as long as its group has keys, so that work
+                // per key that grew with the group's name would grow
+                // quadratically: extension keys, looked up for their lines,
+                // and translations, looked up for their lines and values and
+                // for the untranslated value.
+                let id = "A".repeat(n);
+                let mut text = format!(
+                    "[Desktop Entry]\nType=Application\nName=a\nExec=a\nActions={id};\n\
+                     [Desktop Action {id}]\nName=n\nExec=a\n"
+                );
+                for at in 0..n / 2 {
+                    let _ = write!(text, "X-K{at}=v\nName[l{at}]=v\n");
+                }
+                let file = KeyFile::parse(text.as_bytes());
+                let (issues, steps) = work::steps(|| validate(&file));
+                assert!(issues.is_empty(), "{issues:?}");
+                (steps, text.len())
+            },
+            // A step per line written out and checked and per key checked,
+            // listed or looked up, with each key copied, hashed and compared
+            // to index it and for each lookup of it, and the group's name
+            // hashed and compared a few times for the group, not for each
+            // key; and per character split off, checked for UTF-8, looked
+            // through or unescaped: about 9.7 per byte, items included.
+            // Twice that.
+            |_, bytes| 20 * bytes,
+        );
     }
 
     #[test]

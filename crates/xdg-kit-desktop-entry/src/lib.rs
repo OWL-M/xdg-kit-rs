@@ -46,3 +46,22 @@ pub use launch::{
 };
 pub use validate::{Issue, Level, validate};
 pub use xdg_kit_locale::Locales;
+
+/// Not public API: the work counter of this crate's counted tests, compiled
+/// in by the hidden `__count-work` feature for the workspace's own tests
+/// (`xdg-kit-mime-apps` counts on the same counter, so that its counted
+/// tests include the work done here). It may change or go at any time.
+#[cfg(feature = "__count-work")]
+#[doc(hidden)]
+pub mod __count_work {
+    /// Counts `steps` steps on this thread's counter.
+    pub fn count(steps: usize) {
+        crate::key_file::work::count(steps);
+    }
+
+    /// The steps counted on this thread so far, here and by [`count`].
+    #[must_use]
+    pub fn total() -> usize {
+        crate::key_file::work::total()
+    }
+}

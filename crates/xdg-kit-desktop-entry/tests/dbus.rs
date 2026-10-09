@@ -3,8 +3,10 @@
 //! this test binary again with `DBUS_SESSION_BUS_ADDRESS` pointing at that
 //! bus. The library reads the session bus from the environment. The inner
 //! test serves `org.freedesktop.Application` and launches through the crate.
+//! The bus listens on a Linux abstract socket, so no path of the temporary
+//! folder goes into its address.
 
-#![cfg(feature = "dbus")]
+#![cfg(all(feature = "dbus", target_os = "linux"))]
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
@@ -17,8 +19,15 @@ use zbus::zvariant::OwnedValue;
 #[test]
 fn activation_calls_reach_the_application() {
     let dir = tempfile::tempdir().unwrap();
-    let socket = dir.path().join("bus");
-    let address = format!("unix:path={}", socket.display());
+    // Unique to this run: the process and the time.
+    let address = format!(
+        "unix:abstract=xdg-kit-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
     // A configuration of its own: `--session` reads /etc/dbus-1, which the
     // Nix build sandbox does not have.
     let config = dir.path().join("bus.conf");
@@ -54,9 +63,7 @@ fn activation_calls_reach_the_application() {
     BufReader::new(stdout).read_line(&mut printed).unwrap();
     assert!(
         !printed.is_empty(),
-        "dbus-daemon did not start (its message is above; a socket path over \
-         about 100 bytes, from a long TMPDIR, is one cause): {}",
-        socket.display()
+        "dbus-daemon did not start (its message is above): {address}"
     );
     let output = Command::new(std::env::current_exe().unwrap())
         .args([
