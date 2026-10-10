@@ -146,17 +146,25 @@ pub enum LaunchError {
     NoExec,
     /// The `Exec` command line cannot be used.
     Exec(ExecError),
-    /// The program takes local files and this target is not one: copy it
-    /// to a local file and launch with that path.
+    /// The program takes local files and this target is a URI with a
+    /// scheme other than `file`: copy it to a local file and launch with
+    /// that path.
     NeedsLocalCopy(String),
     /// `Terminal=true`, but no terminal command was given.
     NeedsTerminal,
     /// A path given as a target cannot be passed: it has a NUL byte, or
     /// cannot be made absolute.
     BadPath(PathBuf),
-    /// A URI given as a target cannot be passed: it has no scheme or a NUL
-    /// byte, or it is a `file:` URI with a host, without an absolute path,
-    /// or with a bad `%` escape or an escaped NUL byte.
+    /// A URI target cannot be passed. Every URI passed through `%u`, `%U`,
+    /// `%f`, `%F` or D-Bus is first checked for a scheme and the absence of
+    /// NUL bytes.
+    ///
+    /// Conversion to a local path (`%f`, `%F`) also requires a `file:` URI;
+    /// other schemes return [`LaunchError::NeedsLocalCopy`]. Its host must
+    /// be absent or `localhost`, and its path must be absolute. The path
+    /// before any `?` or `#` must contain valid `%` escapes and no escaped
+    /// NUL byte. Targets that are not passed (no file field code, or an
+    /// action called over D-Bus) are not checked.
     BadUri(String),
     /// Starting `program` failed. The programs started before it are still
     /// running: their handles are in `started`, to be waited on.
@@ -229,8 +237,8 @@ impl std::error::Error for LaunchError {
 /// feature) gives a D-Bus call; otherwise the `Exec` command line is
 /// expanded: `%f`/`%u` take one target per command, `%F`/`%U` all of them
 /// in one; `%f`/`%F` need local files (a `file:` URI is turned into its
-/// path, any other URI is [`LaunchError::NeedsLocalCopy`]); `%u`/`%U` get
-/// URIs (paths become `file:` URIs).
+/// path, a URI with another scheme is [`LaunchError::NeedsLocalCopy`]);
+/// `%u`/`%U` get URIs (paths become `file:` URIs).
 ///
 /// # Errors
 ///
@@ -315,7 +323,7 @@ fn exec_plan(
     let line = CommandLine::parse(&exec).map_err(LaunchError::Exec)?;
     let (groups, targets_ignored) = target_groups(&line, targets)?;
     let icon = entry.icon(&options.locales);
-    let name = entry.name(&options.locales).unwrap_or_default();
+    let name = entry.name(&options.locales);
     // Absolute: `Path=` changes the folder the program starts in.
     let location = entry
         .path()
@@ -341,9 +349,17 @@ fn exec_plan(
         let mut args = line.expand(&Values {
             files,
             icon: icon.as_deref(),
-            name: &name,
+            name: name.as_deref(),
             location,
         });
+        // The application's own command, before a terminal is put in front
+        // of it, starts with its program as written: parsing refuses an
+        // empty program and a field code in it, and only later arguments
+        // can vanish. So a terminal is never run with no program.
+        debug_assert!(
+            args.first().is_some_and(|program| !program.is_empty()),
+            "parsing refuses an empty program and field codes in it"
+        );
         if entry.terminal() {
             let terminal = options
                 .terminal
@@ -351,9 +367,6 @@ fn exec_plan(
                 .filter(|terminal| !terminal.is_empty())
                 .ok_or(LaunchError::NeedsTerminal)?;
             args.splice(0..0, terminal.iter().cloned());
-        }
-        if args.is_empty() {
-            return Err(LaunchError::Exec(ExecError::Empty));
         }
         let program = args.remove(0);
         commands.push(PlannedCommand {
@@ -415,18 +428,7 @@ fn keep_in_uri(byte: u8) -> bool {
 fn to_uri(target: &Target) -> Result<String, LaunchError> {
     match target {
         Target::Uri(uri) => {
-            // A scheme (RFC 3986: a letter, then letters, digits, `+-.`) and
-            // `:`, so a "URI" such as `--help` is not passed as an option.
-            let scheme = uri.split_once(':').map(|(scheme, _)| scheme);
-            let valid = scheme.is_some_and(|scheme| {
-                scheme.starts_with(|c: char| c.is_ascii_alphabetic())
-                    && scheme
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
-            });
-            if !valid || uri.contains('\0') {
-                return Err(LaunchError::BadUri(uri.clone()));
-            }
+            check_uri(uri)?;
             Ok(uri.clone())
         }
         Target::Path(path) => {
@@ -444,14 +446,32 @@ fn to_uri(target: &Target) -> Result<String, LaunchError> {
     }
 }
 
-/// A target as a local path; a `file:` URI is decoded, any other URI needs
-/// a local copy.
+/// Checks that `uri` is one: a scheme (RFC 3986: a letter, then letters,
+/// digits, `+-.`) and `:`, so that a "URI" such as `--help` is not passed
+/// as an option, and no NUL byte.
+fn check_uri(uri: &str) -> Result<(), LaunchError> {
+    let scheme = uri.split_once(':').map(|(scheme, _)| scheme);
+    let valid = scheme.is_some_and(|scheme| {
+        scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    });
+    if !valid || uri.contains('\0') {
+        return Err(LaunchError::BadUri(uri.to_owned()));
+    }
+    Ok(())
+}
+
+/// A target as a local path; a `file:` URI is decoded, a URI with another
+/// scheme needs a local copy, and one that is not a URI is refused.
 fn to_local(target: &Target) -> Result<OsString, LaunchError> {
     match target {
         // Absolute, so that a `Path=` working folder does not change which
         // file a relative path names.
         Target::Path(path) => absolute(path).map(PathBuf::into_os_string),
         Target::Uri(uri) => {
+            check_uri(uri)?;
             let Some(rest) = uri
                 .get(..5)
                 .filter(|scheme| scheme.eq_ignore_ascii_case("file:"))
@@ -944,6 +964,108 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_name_code_vanishes_only_when_there_is_no_name() {
+        let found = |keys: &str, locales: &[&str]| {
+            let entry = DesktopEntry::parse(
+                format!("[Desktop Entry]\nType=Application\n{keys}Exec=app %c x %u\n").as_bytes(),
+            );
+            let options = LaunchOptions {
+                locales: Locales::new(locales),
+                ..LaunchOptions::default()
+            };
+            commands(&prepare_launch(&entry, &[path("/t/a")], &options).unwrap())
+        };
+        // As `GLib` gives (its name is the translated lookup's result).
+        assert_eq!(found("", &[]), [vec!["app", "x", "file:///t/a"]], "no Name");
+        assert_eq!(
+            found("Name[de]=Foo\n", &[]),
+            [vec!["app", "x", "file:///t/a"]],
+            "no Name for these languages"
+        );
+        assert_eq!(
+            found("Name[de]=Foo\n", &["de_DE"]),
+            [vec!["app", "Foo", "x", "file:///t/a"]]
+        );
+        assert_eq!(
+            found("Name=\n", &[]),
+            [vec!["app", "", "x", "file:///t/a"]],
+            "an empty Name"
+        );
+        assert_eq!(
+            found("Name=\nName[de]=Foo\n", &["fr"]),
+            [vec!["app", "", "x", "file:///t/a"]]
+        );
+    }
+
+    #[test]
+    fn a_target_that_is_not_a_uri_is_a_bad_uri_for_local_files_too() {
+        for code in ["%f", "%F", "%u", "%U"] {
+            for bad in [
+                "--help",
+                "",
+                ":x",
+                "1a:b",
+                "f\u{ef}le:///a",
+                "x:\0",
+                "file:///a?\0",
+            ] {
+                let found = plan(&format!("Exec=view {code}"), &[uri(bad)]);
+                assert!(
+                    matches!(&found, Err(LaunchError::BadUri(u)) if u == bad),
+                    "{bad:?} for {code}: {found:?}"
+                );
+            }
+        }
+        for code in ["%f", "%F"] {
+            assert!(matches!(
+                plan(&format!("Exec=view {code}"), &[uri("x-y+z.w:q")]),
+                Err(LaunchError::NeedsLocalCopy(u)) if u == "x-y+z.w:q"
+            ));
+        }
+    }
+
+    #[test]
+    fn a_field_code_as_the_program_cannot_launch() {
+        let terminal = LaunchOptions {
+            terminal: Some(vec!["foot".into(), "--".into()]),
+            ..LaunchOptions::default()
+        };
+        let mut launched = Vec::new();
+        let targets = [path("/usr/bin/true")];
+        for (name, exec) in [
+            ("Foo", "%f"),
+            ("Foo", "%U"),
+            ("Foo", "%k%k"),
+            ("Foo", "%i"),
+            ("", "%c"),
+            ("", "%c%k"),
+            ("true", "%c"),
+            ("Foo", "%f --x"),
+            ("Foo", "%k --x"),
+        ] {
+            for terminal_key in ["", "Terminal=true\n"] {
+                for options in [&LaunchOptions::default(), &terminal] {
+                    let entry = DesktopEntry::parse(
+                        format!(
+                            "[Desktop Entry]\nType=Application\nName={name}\nExec={exec}\n{terminal_key}"
+                        )
+                        .as_bytes(),
+                    );
+                    let found = prepare_launch(&entry, &targets, options);
+                    if !matches!(found, Err(LaunchError::Exec(ExecError::FieldCodeInProgram))) {
+                        launched.push(format!(
+                            "Exec={exec} Name={name:?} {terminal_key:?} with terminal {:?}: {:?}",
+                            options.terminal,
+                            found.map(|plan| commands(&plan))
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(launched.is_empty(), "{launched:#?}");
+    }
+
     #[cfg(feature = "dbus")]
     #[test]
     fn dbus_activatable_entries_become_calls() {
@@ -1033,11 +1155,20 @@ mod tests {
         std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
         std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
             .unwrap();
-        let both = plan(
-            "Exec=%f",
-            &[Target::Path(script), path("/nonexistent/program")],
-        )
-        .unwrap();
+        let command = |program: &Path| PlannedCommand {
+            program: program.into(),
+            args: Vec::new(),
+            env: Vec::new(),
+            env_remove: Vec::new(),
+            working_dir: None,
+        };
+        let both = LaunchPlan {
+            launch: Launch::Commands(vec![
+                command(&script),
+                command(Path::new("/nonexistent/program")),
+            ]),
+            targets_ignored: false,
+        };
         match both.spawn() {
             Err(LaunchError::Spawn {
                 program, started, ..

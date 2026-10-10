@@ -3,8 +3,9 @@
 //!
 //! [`CommandLine::parse`] takes a value with string escapes already
 //! decoded, as returned by [`DesktopEntry::exec`](crate::DesktopEntry::exec).
-//! Parsing returns an [`ExecError`] for a missing or empty program, an
-//! unknown field code (including inside quotes), or an unclosed quote.
+//! Parsing returns an [`ExecError`] for a missing or empty program, a
+//! field code in the program, an unknown field code (including inside
+//! quotes), or an unclosed quote.
 //! These make the command unusable under the spec. Other violations,
 //! such as an unquoted reserved character or a field code inside quotes,
 //! produce an [`ExecProblem`]. [`validate`](crate::validate()) reports these,
@@ -33,6 +34,8 @@ struct Arg {
     pieces: Vec<Piece>,
     /// Quoted in whole: no field codes are expanded.
     quoted: bool,
+    /// Had a quote anywhere, even `""`: the argument never vanishes.
+    had_quote: bool,
 }
 
 impl Arg {
@@ -56,6 +59,11 @@ pub enum ExecError {
     IncompleteFieldCode,
     /// A field code the spec does not list (`%x`).
     UnknownFieldCode(char),
+    /// A field code in the program's name (`%f`, `%k --x`, `a%c`): the
+    /// spec's command line starts with an executable program, and a target
+    /// or other value must not be run as one. Inside quotes, a field code
+    /// is text, and is no such error.
+    FieldCodeInProgram,
 }
 
 impl fmt::Display for ExecError {
@@ -73,6 +81,9 @@ impl fmt::Display for ExecError {
             }
             Self::UnknownFieldCode(code) => {
                 write!(f, "% before {code:?} is not a field code the spec lists")
+            }
+            Self::FieldCodeInProgram => {
+                write!(f, "the program's name may not contain a field code")
             }
         }
     }
@@ -178,7 +189,9 @@ pub(crate) struct Values<'a> {
     /// needs; at most one for `%f` and `%u`.
     pub(crate) files: &'a [OsString],
     pub(crate) icon: Option<&'a str>,
-    pub(crate) name: &'a str,
+    /// The name for `%c`: the translated `Name`, `None` when the entry has
+    /// none for these languages and no untranslated one.
+    pub(crate) name: Option<&'a str>,
     pub(crate) location: &'a OsStr,
 }
 
@@ -204,9 +217,11 @@ impl CommandLine {
             let mut arg = Arg {
                 pieces: Vec::new(),
                 quoted: false,
+                had_quote: false,
             };
             let mut text = String::new();
             let mut started_quoted = false;
+            let mut had_quote = false;
             let mut had_deprecated = false;
             while let Some(&c) = chars.peek() {
                 if c == ' ' {
@@ -214,7 +229,8 @@ impl CommandLine {
                 }
                 chars.next();
                 if c == '"' {
-                    if !arg.pieces.is_empty() || !text.is_empty() {
+                    had_quote = true;
+                    if !arg.pieces.is_empty() || !text.is_empty() || had_deprecated {
                         problems.push(ExecProblem::PartlyQuoted);
                     } else {
                         started_quoted = true;
@@ -250,33 +266,23 @@ impl CommandLine {
                 }
                 text.push(c);
             }
-            if had_deprecated && !started_quoted && arg.pieces.is_empty() && text.is_empty() {
-                // An argument that was only deprecated codes is removed. A
-                // quoted one stays, empty, as `""` does.
+            if had_deprecated && !had_quote && arg.pieces.is_empty() && text.is_empty() {
+                // An argument that was only deprecated codes is removed. One
+                // with a quote anywhere stays, empty, as `""` does.
                 continue;
             }
             if !text.is_empty() || arg.pieces.is_empty() {
                 arg.pieces.push(Piece::Text(text));
             }
             arg.quoted = started_quoted;
+            arg.had_quote = had_quote;
             args.push(arg);
         }
         // An empty program, as `""` gives, is no program.
         let Some(program) = args.first().filter(|program| !program.is_empty()) else {
             return Err(ExecError::Empty);
         };
-        if program.pieces.iter().any(|piece| {
-            // A step for the piece, and per character looked through for a
-            // `=`.
-            work::count(1);
-            let Piece::Text(text) = piece else {
-                return false;
-            };
-            work::count(text.len());
-            text.contains('=')
-        }) {
-            problems.push(ExecProblem::EqualsInProgram);
-        }
+        check_program(program, &mut problems)?;
         let mut file_codes = 0;
         for arg in &args {
             for piece in &arg.pieces {
@@ -321,14 +327,25 @@ impl CommandLine {
 
     /// The arguments with the field codes expanded. Each replacement is one
     /// argument (or, for `%F`, `%U` and `%i`, several) and is not expanded
-    /// again; an argument made only of field codes that expand to nothing
-    /// is dropped.
+    /// again.
+    ///
+    /// The spec allows `%f`, `%F`, `%u` and `%U` to vanish when there are no
+    /// files, `%i` when there is no icon, and `%k` when there is no location.
+    /// An argument containing only these codes and no quotes is dropped if
+    /// it expands to nothing. The same applies to `%c` when the entry has
+    /// no name (`name` is `None`). A name that is present but empty produces
+    /// an empty argument.
+    ///
+    /// Any quote preserves the argument, even `""` beside a code (`""%c`,
+    /// `%f""`). If it expands to nothing, it remains an empty argument.
+    /// These rules match `GLib`.
     pub(crate) fn expand(&self, values: &Values<'_>) -> Vec<OsString> {
         let mut out = Vec::new();
         for arg in &self.args {
             if let [Piece::Code(code)] = arg.pieces.as_slice()
                 && !arg.quoted
             {
+                let before = out.len();
                 match code {
                     'F' | 'U' => out.extend(values.files.iter().cloned()),
                     'f' | 'u' => out.extend(values.files.first().cloned()),
@@ -338,9 +355,12 @@ impl CommandLine {
                             out.push(icon.into());
                         }
                     }
-                    'c' if !values.name.is_empty() => out.push(values.name.into()),
+                    'c' => out.extend(values.name.map(OsString::from)),
                     'k' if !values.location.is_empty() => out.push(values.location.into()),
                     _ => {}
+                }
+                if arg.had_quote && out.len() == before {
+                    out.push(OsString::new());
                 }
                 continue;
             }
@@ -354,16 +374,49 @@ impl CommandLine {
                                 text.push(first);
                             }
                         }
-                        'c' => text.push(values.name),
+                        'c' => {
+                            if let Some(name) = values.name {
+                                text.push(name);
+                            }
+                        }
                         'k' => text.push(values.location),
                         _ => {}
                     },
                 }
             }
+            let may_vanish = !arg.had_quote
+                && arg.pieces.iter().all(|piece| match piece {
+                    Piece::Code('f' | 'F' | 'u' | 'U' | 'i' | 'k') => true,
+                    Piece::Code('c') => values.name.is_none(),
+                    _ => false,
+                });
+            if may_vanish && text.is_empty() {
+                continue;
+            }
             out.push(text);
         }
         out
     }
+}
+
+/// Checks the program's name: no field code, and no `=`.
+fn check_program(program: &Arg, problems: &mut Vec<ExecProblem>) -> Result<(), ExecError> {
+    let mut equals = false;
+    for piece in &program.pieces {
+        // A step for the piece, and per character looked through for a `=`.
+        work::count(1);
+        match piece {
+            Piece::Code(_) => return Err(ExecError::FieldCodeInProgram),
+            Piece::Text(text) => {
+                work::count(text.len());
+                equals |= text.contains('=');
+            }
+        }
+    }
+    if equals {
+        problems.push(ExecProblem::EqualsInProgram);
+    }
+    Ok(())
 }
 
 /// Reads a quoted argument after its opening `"` up to the closing one.
@@ -465,7 +518,7 @@ mod tests {
         line.expand(&Values {
             files: &files,
             icon: Some("fooview"),
-            name: "Foo Viewer",
+            name: Some("Foo Viewer"),
             location: OsStr::new("/usr/share/applications/foo.desktop"),
         })
         .into_iter()
@@ -502,6 +555,113 @@ mod tests {
             "deprecated codes dropped"
         );
         assert_eq!(expand("app %d%f x%m", &["/f"]), ["app", "/f", "x"]);
+    }
+
+    #[test]
+    fn an_argument_of_field_codes_that_expand_to_nothing_is_dropped() {
+        let expand_bare = |exec: &str, name: Option<&str>| -> Vec<String> {
+            CommandLine::parse(exec)
+                .unwrap()
+                .expand(&Values {
+                    files: &[],
+                    icon: None,
+                    name,
+                    location: OsStr::new(""),
+                })
+                .into_iter()
+                .map(|arg| arg.into_string().unwrap())
+                .collect()
+        };
+        assert_eq!(expand_bare("app %k%k", Some("Foo")), ["app"]);
+        assert_eq!(expand_bare("app %f%k", Some("Foo")), ["app"]);
+        assert_eq!(expand_bare("app %i%k", Some("Foo")), ["app"]);
+        assert_eq!(expand_bare("app %U%i", Some("Foo")), ["app"]);
+        assert_eq!(expand_bare("app %c%k", Some("Foo")), ["app", "Foo"]);
+        assert_eq!(expand_bare("app x%k", Some("Foo")), ["app", "x"]);
+        assert_eq!(
+            expand_bare(r#"app """#, Some("Foo")),
+            ["app", ""],
+            "written empty"
+        );
+    }
+
+    #[test]
+    fn an_empty_name_stays_an_empty_argument() {
+        let expand_bare = |exec: &str| -> Vec<String> {
+            CommandLine::parse(exec)
+                .unwrap()
+                .expand(&Values {
+                    files: &[],
+                    icon: None,
+                    name: Some(""),
+                    location: OsStr::new(""),
+                })
+                .into_iter()
+                .map(|arg| arg.into_string().unwrap())
+                .collect()
+        };
+        assert_eq!(expand_bare("app %c x"), ["app", "", "x"]);
+        assert_eq!(expand_bare("app %c%k x"), ["app", "", "x"]);
+        assert_eq!(expand_bare("app %k%c"), ["app", ""]);
+        assert_eq!(expand_bare("app %f%c"), ["app", ""]);
+        assert_eq!(expand_bare("app %c"), ["app", ""]);
+    }
+
+    #[test]
+    fn no_name_at_all_vanishes() {
+        let expand_bare = |exec: &str| -> Vec<String> {
+            CommandLine::parse(exec)
+                .unwrap()
+                .expand(&Values {
+                    files: &[],
+                    icon: None,
+                    name: None,
+                    location: OsStr::new(""),
+                })
+                .into_iter()
+                .map(|arg| arg.into_string().unwrap())
+                .collect()
+        };
+        assert_eq!(expand_bare("app %c x"), ["app", "x"]);
+        assert_eq!(expand_bare("app %c%k x"), ["app", "x"]);
+        assert_eq!(expand_bare("app %k%c"), ["app"]);
+        assert_eq!(expand_bare("app %f%c"), ["app"]);
+        assert_eq!(expand_bare("app %c"), ["app"]);
+        assert_eq!(expand_bare("app x%c"), ["app", "x"]);
+        assert_eq!(expand_bare(r#"app "%c""#), ["app", "%c"], "quoted");
+    }
+
+    #[test]
+    fn an_argument_that_had_a_quote_never_vanishes() {
+        let expand_bare = |exec: &str| -> Vec<String> {
+            CommandLine::parse(exec)
+                .unwrap()
+                .expand(&Values {
+                    files: &[],
+                    icon: None,
+                    name: None,
+                    location: OsStr::new(""),
+                })
+                .into_iter()
+                .map(|arg| arg.into_string().unwrap())
+                .collect()
+        };
+        for exec in [
+            r#"app ""%c y"#,
+            r#"app %c"" y"#,
+            r#"app %f"" y"#,
+            r#"app ""%f y"#,
+            r#"app %i"" y"#,
+            r#"app %k"" y"#,
+            r#"app ""%U%k y"#,
+            r#"app %c%k"" y"#,
+        ] {
+            assert_eq!(expand_bare(exec), ["app", "", "y"], "{exec}");
+        }
+        // Without a quote they still vanish.
+        for exec in ["app %c y", "app %f y", "app %i y", "app %k y", "app %c%k y"] {
+            assert_eq!(expand_bare(exec), ["app", "y"], "{exec}");
+        }
     }
 
     #[test]
@@ -568,6 +728,57 @@ mod tests {
         assert_eq!(CommandLine::parse(r#""""#), Err(ExecError::Empty));
         assert_eq!(CommandLine::parse(r#""" foo"#), Err(ExecError::Empty));
         assert_eq!(expand(r#"foo """#, &[]), ["foo", ""], "a later one is kept");
+    }
+
+    #[test]
+    fn a_field_code_in_the_program_is_refused() {
+        for exec in [
+            "%f", "%F", "%u", "%U", "%i", "%c", "%k", "%k --x", "%k%k", "%f%k", "a%f", "%cb x",
+            "%d %f", "%d%k",
+        ] {
+            assert_eq!(
+                CommandLine::parse(exec),
+                Err(ExecError::FieldCodeInProgram),
+                "{exec}"
+            );
+        }
+        assert_eq!(
+            ExecError::FieldCodeInProgram.to_string(),
+            "the program's name may not contain a field code"
+        );
+        // Inside quotes a field code is text, left as written.
+        let line = CommandLine::parse(r#""%f" x"#).unwrap();
+        assert_eq!(line.problems(), [ExecProblem::FieldCodeInQuotes]);
+        assert_eq!(expand(r#""%f" x"#, &["/f"]), ["%f", "x"]);
+        assert_eq!(expand("%%f %f", &["/f"]), ["%f", "/f"]);
+        assert_eq!(expand("%dapp %f", &["/f"]), ["app", "/f"]);
+    }
+
+    #[test]
+    fn an_argument_that_had_a_quote_stays_whichever_side_the_code_is_on() {
+        for (exec, problems) in [
+            (
+                r#"foo ""%d x"#,
+                [ExecProblem::PartlyQuoted, ExecProblem::Deprecated('d')],
+            ),
+            (
+                r#"foo %d"" x"#,
+                [ExecProblem::Deprecated('d'), ExecProblem::PartlyQuoted],
+            ),
+        ] {
+            let line = CommandLine::parse(exec).unwrap();
+            assert_eq!(line.problems(), problems, "{exec}");
+            assert_eq!(expand(exec, &[]), ["foo", "", "x"], "{exec}");
+        }
+        assert_eq!(
+            expand(r#"foo %d"x" y"#, &[]),
+            ["foo", "x", "y"],
+            "text after the code"
+        );
+        // As the program, the argument is an empty one.
+        for exec in [r#"""%d foo"#, r#"%d"" foo"#, r#"""%d %u"#, r#"%d"" %u"#] {
+            assert_eq!(CommandLine::parse(exec), Err(ExecError::Empty), "{exec}");
+        }
     }
 
     #[test]

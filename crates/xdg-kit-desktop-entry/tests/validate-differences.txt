@@ -12,6 +12,7 @@ exec-code-in-quotes.desktop	invalid	valid	the spec: field codes must not be used
 exec-empty-program.desktop	invalid	valid	the spec: the Exec key must contain a command line, which starts with a program; the tool accepts "", an empty one
 exec-empty.desktop	invalid	valid	the spec: the Exec key must contain a command line, which starts with a program; the tool accepts an empty value
 exec-equals-in-program.desktop	invalid	valid	the spec: the program's name may not contain '='; the tool does not check it
+exec-field-code-in-program.desktop	invalid	valid	the spec: a command line consists of an executable program optionally followed by arguments, and a field code is expanded by the launcher, so it is no program's name; the tool accepts %f as the program, which would run a target file
 exec-files-not-standalone.desktop	invalid	valid	the spec: %F may only be used as an argument on its own; the tool does not check it
 exec-icon-not-standalone.desktop	invalid	valid	the latest spec text (xdg-specs da38d5a): %i may only be used as an argument on its own; the tool does not check it
 exec-partly-quoted.desktop	invalid	valid	the spec: arguments may be quoted in whole, and one with a reserved character (here a space) must be; the tool does not check it
@@ -29,3 +30,4 @@ string-escaped-semicolon.desktop	invalid	valid	the spec: \; is an escape only in
 string-invalid-escape.desktop	invalid	valid	the spec: the escapes of a string are \s, \n, \t, \r and \\, and \q is none of them; the tool checks no string escapes
 string-not-ascii.desktop	invalid	valid	the spec: string values are ASCII; the tool accepts non-ASCII in StartupWMClass
 string-trailing-backslash.desktop	invalid	valid	the spec: the escapes of a string are \s, \n, \t, \r and \\, and a backslash at the end escapes nothing; the tool checks no string escapes
+value-not-utf8.desktop	invalid	valid	the spec: desktop entry files are encoded in UTF-8, and only comment lines may contain any character; for this X- key the tool only warns that the file has lines that are not UTF-8

@@ -711,16 +711,21 @@ fn parse_treemagic(bytes: &[u8], folder: &mut Folder, problems: &mut Problems<'_
         let line_start = cursor.at + HEADER.len();
         if cursor.peek() == Some(b'[') {
             finish(rule.take(), folder, problems);
-            if let Some((priority, Ok(mime))) = cursor
-                .section()
-                .map(|(priority, mime)| (priority, MimeType::new(&mime)))
-            {
-                let found = TreeRule {
-                    priority: priority.min(100),
-                    mime,
-                    matchlets: Vec::new(),
-                };
-                rule = Some((found, Section::new(line_start)));
+            if let Some((priority, mime)) = cursor.section() {
+                match MimeType::new(&mime) {
+                    Ok(mime) => {
+                        let found = TreeRule {
+                            priority: priority.min(100),
+                            mime,
+                            matchlets: Vec::new(),
+                        };
+                        rule = Some((found, Section::new(line_start)));
+                    }
+                    Err(err) => {
+                        report(problems, line_start, &format!("{err}, section skipped"));
+                        rule = None;
+                    }
+                }
             } else {
                 report(problems, line_start, "bad section header, section skipped");
                 rule = None;
@@ -1034,6 +1039,42 @@ mod tests {
         let child = &top.children[0];
         assert!(child.executable && child.match_case);
         assert_eq!(child.mimetype, Some(m("image/jpeg")));
+    }
+
+    #[test]
+    fn a_refused_type_skips_only_its_own_section() {
+        // Right after the refused header, or after its own lines.
+        for bytes in [
+            b"MIME-TreeMagic\0\n[50:bad]\n[60:x-content/good]\n>\"dcim\"=directory\n".as_slice(),
+            b"MIME-TreeMagic\0\n[50:bad]\n>\"x\"=directory\n[60:x-content/good]\n>\"dcim\"=directory\n",
+        ] {
+            let (folder, diagnostics) = folder_from("treemagic", bytes);
+            let rules: Vec<_> = folder
+                .tree
+                .iter()
+                .map(|rule| (rule.mime.as_str(), rule.matchlets[0].path.as_str()))
+                .collect();
+            assert_eq!(rules, [("x-content/good", "dcim")]);
+            assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+            assert!(
+                diagnostics[0].message.ends_with(", section skipped"),
+                "{diagnostics:?}"
+            );
+        }
+        // The `magic` reader does the same.
+        for bytes in [
+            b"MIME-Magic\0\n[50:bad]\n[60:a/good]\n>0=\x00\x01G\n".as_slice(),
+            b"MIME-Magic\0\n[50:bad]\n>0=\x00\x01X\n[60:a/good]\n>0=\x00\x01G\n",
+        ] {
+            let (folder, diagnostics) = folder_from("magic", bytes);
+            let rules: Vec<_> = folder
+                .magic
+                .iter()
+                .map(|rule| (rule.mime.as_str(), rule.matchlets[0].value.as_slice()))
+                .collect();
+            assert_eq!(rules, [("a/good", b"G".as_slice())]);
+            assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        }
     }
 
     #[test]

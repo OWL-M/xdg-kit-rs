@@ -16,6 +16,8 @@
 //! with ASCII classes, and only against ASCII patterns: it never matches a
 //! pattern with other characters.
 
+use crate::work;
+
 /// Whether `name` matches `pattern`.
 #[cfg(any(test, fuzzing))]
 pub(crate) fn matches(pattern: &str, name: &[u8]) -> bool {
@@ -33,6 +35,8 @@ pub(crate) struct Pattern {
 
 impl Pattern {
     pub(crate) fn new(pattern: &str) -> Self {
+        // Each byte decoded and copied, then checked for ASCII.
+        work::count(2 * pattern.len());
         let chars: Vec<char> = pattern.chars().collect();
         Self {
             chars: parse(&chars),
@@ -193,8 +197,10 @@ impl Symbol for u8 {
 
 fn parse<T: Symbol>(pattern: &[T]) -> Vec<Item<T>> {
     let mut items = Vec::new();
+    let mut sets = None;
     let mut at = 0;
     while let Some(&symbol) = pattern.get(at) {
+        work::count(1);
         at += 1;
         let item = if symbol.is(b'*') {
             Item::Star
@@ -209,7 +215,7 @@ fn parse<T: Symbol>(pattern: &[T]) -> Vec<Item<T>> {
                 None => Item::Never,
             }
         } else if symbol.is(b'[') {
-            match bracket(&pattern[at..]) {
+            match sets.get_or_insert_with(|| Sets::new(pattern)).bracket(at) {
                 Some((item, used)) => {
                     at += used;
                     item
@@ -224,48 +230,144 @@ fn parse<T: Symbol>(pattern: &[T]) -> Vec<Item<T>> {
     items
 }
 
-/// The set that `rest` (what follows a `[`) starts and how many symbols it
-/// takes, or `None` when no `]` closes it (the `[` then stands for itself).
-fn bracket<T: Symbol>(rest: &[T]) -> Option<(Item<T>, usize)> {
-    let negated = rest.first().is_some_and(|&c| c.is(b'!') || c.is(b'^'));
-    let mut at = usize::from(negated);
-    let mut members = Vec::new();
-    let mut first = true;
-    loop {
-        let &symbol = rest.get(at)?;
-        if symbol.is(b']') && !first {
-            return Some((Item::Set { members, negated }, at + 1));
+/// Reads the `[...]` sets in time linear in the pattern's length,
+/// regardless of how many `[` remain unclosed.
+struct Sets<'a, T> {
+    pattern: &'a [T],
+    /// Positions visited while reading sets. Reaching a visited position
+    /// would repeat a previous set's scan, which found no closing `]`.
+    /// A closed set, or one that can never match, consumes the pattern past
+    /// this position, so later sets start after it.
+    passed: Vec<bool>,
+    /// From each place, where the next `.]` starts (the pattern's length if
+    /// there is none).
+    dot_close: Vec<usize>,
+}
+
+impl<'a, T: Symbol> Sets<'a, T> {
+    fn new(pattern: &'a [T]) -> Self {
+        // Each place marked unpassed, and looked at for a `.]`.
+        work::count(2 * (pattern.len() + 1));
+        let mut dot_close = vec![pattern.len(); pattern.len() + 1];
+        for at in (0..pattern.len().saturating_sub(1)).rev() {
+            dot_close[at] = if pattern[at].is(b'.') && pattern[at + 1].is(b']') {
+                at
+            } else {
+                dot_close[at + 1]
+            };
         }
-        first = false;
-        let (low, used) = match element(&rest[at..]) {
-            Element::Symbol(low, used) => (low, used),
-            Element::Member(member, used) => {
-                members.push(member);
-                at += used;
-                continue;
+        Self {
+            pattern,
+            passed: vec![false; pattern.len() + 1],
+            dot_close,
+        }
+    }
+
+    /// The set that starts at `start` (just after a `[`) and how many
+    /// symbols it takes, or `None` when no `]` closes it (the `[` then
+    /// stands for itself).
+    fn bracket(&mut self, start: usize) -> Option<(Item<T>, usize)> {
+        let rest = &self.pattern[start..];
+        let negated = rest.first().is_some_and(|&c| c.is(b'!') || c.is(b'^'));
+        let mut at = start + usize::from(negated);
+        let mut members = Vec::new();
+        let mut first = true;
+        loop {
+            work::count(1);
+            if self.passed[at] {
+                return None;
             }
-            Element::Never => return Some((Item::Never, rest.len())),
-        };
-        at += used;
-        // A range, unless the `-` is last in the set.
-        let dash = rest.get(at).is_some_and(|c| c.is(b'-'));
-        let after = rest.get(at + 1);
-        if dash && after.is_some_and(|c| !c.is(b']')) {
-            match element(&rest[at + 1..]) {
-                Element::Symbol(high, used) => {
-                    members.push(Member::Range(low, high));
-                    at += 1 + used;
-                }
-                Element::Member(..) => {
-                    // A class cannot end a range.
-                    members.push(Member::Invalid);
-                    at += 1;
+            self.passed[at] = true;
+            let &symbol = self.pattern.get(at)?;
+            if symbol.is(b']') && !first {
+                return Some((Item::Set { members, negated }, at + 1 - start));
+            }
+            first = false;
+            let (low, used) = match self.element(at) {
+                Element::Symbol(low, used) => (low, used),
+                Element::Member(member, used) => {
+                    members.push(member);
+                    at += used;
+                    continue;
                 }
                 Element::Never => return Some((Item::Never, rest.len())),
+            };
+            at += used;
+            // A range, unless the `-` is last in the set.
+            let dash = self.pattern.get(at).is_some_and(|c| c.is(b'-'));
+            let after = self.pattern.get(at + 1);
+            if dash && after.is_some_and(|c| !c.is(b']')) {
+                match self.element(at + 1) {
+                    Element::Symbol(high, used) => {
+                        members.push(Member::Range(low, high));
+                        at += 1 + used;
+                    }
+                    Element::Member(..) => {
+                        // A class cannot end a range.
+                        members.push(Member::Invalid);
+                        at += 1;
+                    }
+                    Element::Never => return Some((Item::Never, rest.len())),
+                }
+            } else {
+                members.push(Member::One(low));
             }
-        } else {
-            members.push(Member::One(low));
         }
+    }
+
+    /// The set element at `at`, which is in the pattern.
+    fn element(&self, at: usize) -> Element<T> {
+        let rest = &self.pattern[at..];
+        let symbol = rest[0];
+        if symbol.is(b'\\') {
+            return match rest.get(1) {
+                Some(&next) => Element::Symbol(next, 2),
+                None => Element::Never,
+            };
+        }
+        if symbol.is(b'[') {
+            match rest.get(1) {
+                Some(c) if c.is(b':') => {
+                    // Lowercase letters (glibc stops at `z`) then `:]`; anything
+                    // else makes the `[` an ordinary member.
+                    let mut name = String::new();
+                    for (offset, &c) in rest[2..].iter().enumerate() {
+                        // The symbol read, and copied into the name.
+                        work::count(2);
+                        if c.is(b':') && rest.get(2 + offset + 1).is_some_and(|c| c.is(b']')) {
+                            let member = Class::named(&name).map_or(Member::Invalid, Member::Class);
+                            return Element::Member(member, 2 + offset + 2);
+                        }
+                        match c.ascii() {
+                            Some(letter @ 'a'..='y') => name.push(letter),
+                            _ => break,
+                        }
+                    }
+                }
+                Some(c) if c.is(b'=') => {
+                    if let (Some(&inner), Some(close), Some(end)) =
+                        (rest.get(2), rest.get(3), rest.get(4))
+                        && close.is(b'=')
+                        && end.is(b']')
+                    {
+                        return Element::Symbol(inner, 5);
+                    }
+                }
+                Some(c) if c.is(b'.') => {
+                    // Up to `.]`; only a single symbol names an element.
+                    let close = self.dot_close[at + 2];
+                    if close == self.pattern.len() {
+                        return Element::Never;
+                    }
+                    return match close - (at + 2) {
+                        1 => Element::Symbol(rest[2], 5),
+                        inner => Element::Member(Member::Invalid, 2 + inner + 2),
+                    };
+                }
+                _ => {}
+            }
+        }
+        Element::Symbol(symbol, 1)
     }
 }
 
@@ -277,60 +379,6 @@ enum Element<T> {
     Member(Member<T>, usize),
     /// The pattern can never match from here.
     Never,
-}
-
-/// The set element at the start of `rest`, which is not empty.
-fn element<T: Symbol>(rest: &[T]) -> Element<T> {
-    let symbol = rest[0];
-    if symbol.is(b'\\') {
-        return match rest.get(1) {
-            Some(&next) => Element::Symbol(next, 2),
-            None => Element::Never,
-        };
-    }
-    if symbol.is(b'[') {
-        match rest.get(1) {
-            Some(c) if c.is(b':') => {
-                // Lowercase letters (glibc stops at `z`) then `:]`; anything
-                // else makes the `[` an ordinary member.
-                let mut name = String::new();
-                for (offset, &c) in rest[2..].iter().enumerate() {
-                    if c.is(b':') && rest.get(2 + offset + 1).is_some_and(|c| c.is(b']')) {
-                        let member = Class::named(&name).map_or(Member::Invalid, Member::Class);
-                        return Element::Member(member, 2 + offset + 2);
-                    }
-                    match c.ascii() {
-                        Some(letter @ 'a'..='y') => name.push(letter),
-                        _ => break,
-                    }
-                }
-            }
-            Some(c) if c.is(b'=') => {
-                if let (Some(&inner), Some(close), Some(end)) =
-                    (rest.get(2), rest.get(3), rest.get(4))
-                    && close.is(b'=')
-                    && end.is(b']')
-                {
-                    return Element::Symbol(inner, 5);
-                }
-            }
-            Some(c) if c.is(b'.') => {
-                // Up to `.]`; only a single symbol names an element.
-                let Some(close) = rest[2..]
-                    .windows(2)
-                    .position(|pair| pair[0].is(b'.') && pair[1].is(b']'))
-                else {
-                    return Element::Never;
-                };
-                return match close {
-                    1 => Element::Symbol(rest[2], 5),
-                    _ => Element::Member(Member::Invalid, 2 + close + 2),
-                };
-            }
-            _ => {}
-        }
-    }
-    Element::Symbol(symbol, 1)
 }
 
 fn set_matches<T: Symbol>(members: &[Member<T>], negated: bool, symbol: T) -> bool {
@@ -391,7 +439,8 @@ fn match_items<T: Symbol>(pattern: &[Item<T>], name: &[T]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::matches;
+    use super::{Pattern, matches};
+    use crate::work;
 
     fn m(pattern: &str, name: &str) -> bool {
         matches(pattern, name.as_bytes())
@@ -467,5 +516,45 @@ mod tests {
     fn many_stars_stay_fast() {
         let name = "a".repeat(2000);
         assert!(!m("*a*a*a*a*a*a*a*a*b", &name));
+    }
+
+    /// The bound for parsing a pattern of `bytes` bytes at `per` steps a
+    /// byte: twice the analysed cost. Each byte is decoded and copied and
+    /// checked for ASCII (two), and in each of the two parses (characters
+    /// and bytes) marked unpassed and looked at for a `.]` (two) and read
+    /// (one): eight, and the steps the brackets take on top.
+    fn parse_bound(per: usize, bytes: usize) -> usize {
+        2 * (10 + per * bytes)
+    }
+
+    #[test]
+    fn unclosed_brackets_are_parsed_in_linear_time() {
+        // Unclosed brackets alone, of ranges, and with collating elements
+        // or a class name each failed bracket would read again. Each with
+        // its steps per byte: the first failed bracket passes each place
+        // once, and each later one stops at the first place passed. Per
+        // byte in each parse: two for `[` (a pass and a stop each); two
+        // thirds for `[a-` (a range a step); one and a half for `[.` (a
+        // collating element jumps to the end); two and a half for the
+        // class name (a pass and a stop per `[`, and each letter read and
+        // copied once).
+        type Shape = fn(usize) -> String;
+        let shapes: [(Shape, usize); 4] = [
+            (|n| "[".repeat(n), 12),
+            (|n| "[a-".repeat(n), 10),
+            (|n| format!("[{}.]", "[.".repeat(n)), 11),
+            (|n| format!("{}[:{}", "[".repeat(n), "a".repeat(n)), 13),
+        ];
+        for (shape, per) in shapes {
+            work::assert_linear(
+                5000,
+                |n| {
+                    let pattern = shape(n);
+                    let ((), steps) = work::steps(|| drop(Pattern::new(&pattern)));
+                    (steps, pattern.len())
+                },
+                |_, bytes| parse_bound(per, bytes),
+            );
+        }
     }
 }

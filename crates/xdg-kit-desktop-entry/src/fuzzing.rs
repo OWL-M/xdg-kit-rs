@@ -96,7 +96,9 @@ fn assert_like_reparse(file: &KeyFile) {
 
 /// Parses `text` as an `Exec` value and expands it, both as given and with
 /// the key file's escapes undone (as a launch reads it; the seeds are the
-/// text written after `Exec=`).
+/// text written after `Exec=`). Tests every combination of present and
+/// absent files, icon, name and location, including the empty expansion
+/// of every code that can vanish.
 pub fn exec(text: &str) {
     exec_value(text);
     exec_value(&crate::key_file::unescape(text));
@@ -106,12 +108,16 @@ fn exec_value(text: &str) {
     if let Ok(line) = CommandLine::parse(text) {
         let files = [OsString::from("/a b"), OsString::from("file:///c")];
         let _ = line.file_code();
-        let _ = line.expand(&Values {
-            files: &files,
-            icon: Some("icon"),
-            name: "Name",
-            location: "/x.desktop".as_ref(),
-        });
+        // One bit per value: set, it is absent (no files, no icon, no name,
+        // an empty location).
+        for absent in 0..16_u8 {
+            let _ = line.expand(&Values {
+                files: if absent & 1 == 0 { &files } else { &[] },
+                icon: (absent & 2 == 0).then_some("icon"),
+                name: (absent & 4 == 0).then_some("Name"),
+                location: if absent & 8 == 0 { "/x.desktop" } else { "" }.as_ref(),
+            });
+        }
     }
 }
 

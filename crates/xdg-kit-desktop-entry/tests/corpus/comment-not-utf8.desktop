@@ -1,0 +1,5 @@
+[Desktop Entry]
+# A comment in Latin-1, not UTF-8: café
+Type=Application
+Name=Foo
+Exec=foo %U

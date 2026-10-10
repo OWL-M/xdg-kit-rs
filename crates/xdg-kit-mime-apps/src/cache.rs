@@ -761,12 +761,26 @@ fn add(
     Ok(())
 }
 
+/// The status of the opened file `file` (named `name`), read again when
+/// interrupted by a signal, as [`fstat`] reads a folder's.
+fn fstat_file(file: BorrowedFd<'_>, name: &OsStr) -> rustix::io::Result<rustix::fs::Stat> {
+    #[cfg(not(test))]
+    let _ = name;
+    rustix::io::retry_on_intr(|| {
+        #[cfg(test)]
+        if let Some(errno) = tests::named_fault(&tests::UNFSTATABLE_FILE, name) {
+            return Err(errno);
+        }
+        rustix::fs::fstat(file)
+    })
+}
+
 /// Reads the regular file `name` in `folder`, as
 /// [`xdg_kit_basedir::read_regular_file`] reads one by path: opened without
 /// waiting (its type was checked before), checked again to be a regular
-/// file, and at most [`MAX_FILE_LEN`] bytes long. Opened again when
-/// interrupted by a signal. `None` when it is not a regular file (replaced
-/// since its type was checked) or is longer.
+/// file, and at most [`MAX_FILE_LEN`] bytes long. Opened and checked again
+/// when interrupted by a signal. `None` when it is not a regular file
+/// (replaced since its type was checked) or is longer.
 ///
 /// # Errors
 ///
@@ -780,11 +794,12 @@ fn read_regular_file(folder: BorrowedFd<'_>, name: &OsStr) -> io::Result<Option<
         }
         rustix::fs::openat(folder, name, flags, Mode::empty())
     })?);
-    let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.len() > MAX_FILE_LEN {
+    let stat = fstat_file(file.as_fd(), name)?;
+    let len = u64::try_from(stat.st_size).unwrap_or(0);
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile || len > MAX_FILE_LEN {
         return Ok(None);
     }
-    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
+    let mut bytes = Vec::with_capacity(usize::try_from(len).unwrap_or(0));
     // One byte more, to notice a file grown past the limit since.
     file.take(MAX_FILE_LEN + 1).read_to_end(&mut bytes)?;
     Ok((bytes.len() as u64 <= MAX_FILE_LEN).then_some(bytes))
@@ -802,6 +817,31 @@ mod tests {
 
     /// A change a test makes to the tree when the walk looks at a name.
     type Change = Box<dyn FnMut(&OsStr)>;
+
+    /// Temporarily changes a file or folder's mode and restores its usual
+    /// mode on drop, including during a panic. Restoration happens before
+    /// the containing temporary folder is removed, so failed tests leave
+    /// no files that cannot be removed.
+    struct TempMode<'a> {
+        path: &'a Path,
+        usual: u32,
+    }
+
+    impl<'a> TempMode<'a> {
+        /// Gives `path` the mode `mode`, and `usual` back when dropped.
+        fn set(path: &'a Path, mode: u32, usual: u32) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+            Self { path, usual }
+        }
+    }
+
+    impl Drop for TempMode<'_> {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(self.path, fs::Permissions::from_mode(self.usual));
+        }
+    }
 
     thread_local! {
         /// Folders opened again by [`reopen`] on this thread.
@@ -824,6 +864,10 @@ mod tests {
         /// thread, in any folder, and the error it gives, as if opening the
         /// file failed so.
         pub(super) static UNREADABLE: RefCell<Option<(OsString, Errno)>> = const { RefCell::new(None) };
+        /// The name whose opened file [`read_regular_file`] fails to read
+        /// the status of on this thread, in any folder, and the error it
+        /// gives.
+        pub(super) static UNFSTATABLE_FILE: RefCell<Option<(OsString, Errno)>> = const { RefCell::new(None) };
         /// The folder whose status [`fstat`] fails to read on this
         /// thread, and the error it gives.
         pub(super) static UNFSTATABLE: RefCell<Option<(rustix::fs::Stat, Errno)>> = const { RefCell::new(None) };
@@ -840,8 +884,8 @@ mod tests {
         static INTERRUPTED: Cell<usize> = const { Cell::new(0) };
     }
 
-    /// The error that `fault` ([`UNSTATABLE`] or [`UNREADABLE`]) gives for
-    /// `name`, if it names it ([`once`]).
+    /// The error that `fault` ([`UNSTATABLE`], [`UNREADABLE`] or
+    /// [`UNFSTATABLE_FILE`]) gives for `name`, if it names it ([`once`]).
     pub(super) fn named_fault(
         fault: &'static std::thread::LocalKey<RefCell<Option<(OsString, Errno)>>>,
         name: &OsStr,
@@ -1102,7 +1146,6 @@ mod tests {
 
     #[test]
     fn a_folder_that_can_now_only_be_searched_is_still_a_way_through() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join("a/b")).unwrap();
         fs::write(dir.path().join("a/b/e.desktop"), ENTRY).unwrap();
@@ -1113,12 +1156,12 @@ mod tests {
         let mut window = Window::new(MOST_OPEN);
         // Meanwhile `a` can be searched, but no longer read.
         let a = dir.path().join("a");
-        fs::set_permissions(&a, fs::Permissions::from_mode(0o111)).unwrap();
+        let search_only = TempMode::set(&a, 0o111, 0o755);
         let enforced = fs::read_dir(&a).is_err();
         let found = reopen(first.as_fd(), &mut stack, &mut window)
             .map(|b| b.map(|b| rustix::fs::statat(b, "e.desktop", AtFlags::empty()).is_ok()))
             .map_err(|err| err.raw_os_error());
-        fs::set_permissions(&a, fs::Permissions::from_mode(0o755)).unwrap();
+        drop(search_only);
         if !enforced {
             eprintln!("folder permissions are not enforced here (root?): not checked");
         } else if LOOKUPS_ONLY.is_some() {
@@ -1151,7 +1194,6 @@ mod tests {
 
     #[test]
     fn a_folder_opened_but_not_listed_fails_the_walk() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("a.desktop"), ENTRY).unwrap();
         fs::create_dir_all(dir.path().join("sub/deeper")).unwrap();
@@ -1195,10 +1237,10 @@ mod tests {
         }
         // A folder that cannot be opened is still skipped.
         let sub = dir.path().join("sub");
-        fs::set_permissions(&sub, fs::Permissions::from_mode(0o000)).unwrap();
+        let closed = TempMode::set(&sub, 0o000, 0o755);
         let enforced = fs::read_dir(&sub).is_err();
         let listed = mimeinfo_cache(dir.path());
-        fs::set_permissions(&sub, fs::Permissions::from_mode(0o755)).unwrap();
+        drop(closed);
         if enforced {
             assert_eq!(
                 String::from_utf8(listed.unwrap()).unwrap(),
@@ -1366,7 +1408,6 @@ mod tests {
 
     #[test]
     fn a_folder_opened_again_is_skipped_only_for_some_errors() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join("a/b")).unwrap();
         fs::write(dir.path().join("a/b/e.desktop"), ENTRY).unwrap();
@@ -1403,10 +1444,10 @@ mod tests {
         // (`EACCES`), and is skipped.
         let a = dir.path().join("a");
         let stack = back_at_b();
-        fs::set_permissions(&a, fs::Permissions::from_mode(0o000)).unwrap();
+        let closed = TempMode::set(&a, 0o000, 0o755);
         let enforced = fs::read_dir(&a).is_err();
         let found = reopened(stack);
-        fs::set_permissions(&a, fs::Permissions::from_mode(0o755)).unwrap();
+        drop(closed);
         if enforced {
             assert_eq!(found, Ok(None));
         } else {
@@ -1789,6 +1830,7 @@ mod tests {
             (&UNSTATABLE, "deeper"),
             (&UNSTATABLE, "b.desktop"),
             (&UNREADABLE, "b.desktop"),
+            (&UNFSTATABLE_FILE, "b.desktop"),
         ] {
             fail_name(fault, Some((name, Errno::INTR)));
             assert_eq!(made(), Ok(all.clone()), "{name}");
@@ -1847,8 +1889,9 @@ mod tests {
     }
 
     /// Makes [`stat_at`] (with `fault` [`UNSTATABLE`]) or
-    /// [`read_regular_file`] (with [`UNREADABLE`]) fail for `name` with
-    /// `errno`; with `None`, for no name.
+    /// [`read_regular_file`] (with [`UNREADABLE`], or [`UNFSTATABLE_FILE`]
+    /// for the status of the file opened) fail for `name` with `errno`;
+    /// with `None`, for no name.
     fn fail_name(
         fault: &'static std::thread::LocalKey<RefCell<Option<(OsString, Errno)>>>,
         name: Option<(&str, Errno)>,
@@ -1918,7 +1961,6 @@ mod tests {
 
     #[test]
     fn a_name_that_cannot_be_looked_at_fails_the_walk_unless_skipped() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = three_entries();
         fails_unless_skipped(
             dir.path(),
@@ -1935,10 +1977,10 @@ mod tests {
         // A folder that can be listed but not searched: each name in it
         // cannot be looked at (`EACCES`), and is skipped.
         let sub = dir.path().join("sub");
-        fs::set_permissions(&sub, fs::Permissions::from_mode(0o400)).unwrap();
+        let list_only = TempMode::set(&sub, 0o400, 0o755);
         let enforced = fs::metadata(sub.join("b.desktop")).is_err();
         let made = mimeinfo_cache(dir.path());
-        fs::set_permissions(&sub, fs::Permissions::from_mode(0o755)).unwrap();
+        drop(list_only);
         if enforced {
             assert_eq!(
                 String::from_utf8(made.unwrap()).unwrap(),
@@ -1951,7 +1993,6 @@ mod tests {
 
     #[test]
     fn an_entry_that_cannot_be_read_fails_the_walk_unless_skipped() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = three_entries();
         fails_unless_skipped(
             dir.path(),
@@ -1959,12 +2000,19 @@ mod tests {
             "b.desktop",
             "[MIME Cache]\ntext/plain=a.desktop;sub-deeper-c.desktop;\n",
         );
+        // A file opened but whose status cannot be read.
+        fails_unless_skipped(
+            dir.path(),
+            &UNFSTATABLE_FILE,
+            "b.desktop",
+            "[MIME Cache]\ntext/plain=a.desktop;sub-deeper-c.desktop;\n",
+        );
         // A file that cannot be opened (`EACCES`) is skipped.
         let b = dir.path().join("sub/b.desktop");
-        fs::set_permissions(&b, fs::Permissions::from_mode(0o000)).unwrap();
+        let closed = TempMode::set(&b, 0o000, 0o644);
         let enforced = fs::read(&b).is_err();
         let made = mimeinfo_cache(dir.path());
-        fs::set_permissions(&b, fs::Permissions::from_mode(0o644)).unwrap();
+        drop(closed);
         if enforced {
             assert_eq!(
                 String::from_utf8(made.unwrap()).unwrap(),

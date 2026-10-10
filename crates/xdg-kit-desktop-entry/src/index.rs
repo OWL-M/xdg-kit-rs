@@ -1,6 +1,8 @@
 //! The installed desktop entries by desktop file ID (Desktop Entry spec
 //! "Desktop File ID").
 
+use std::borrow::Borrow;
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs;
@@ -12,6 +14,7 @@ use std::sync::Arc;
 use xdg_kit_basedir::{BaseDirs, FileStamp};
 
 use crate::error::{quoted, shown_path};
+use crate::key_file::work;
 use crate::{DesktopEntry, Desktops, Diagnostic, EntryType};
 
 /// Deepest folder nesting followed below an `applications` folder.
@@ -104,6 +107,41 @@ struct Found {
     entry: Arc<DesktopEntry>,
 }
 
+/// A desktop file ID in a sorted map or set, ordered as its text. In
+/// counted tests each comparison counts the bytes it looks at: those the
+/// two IDs share at the start, and one more. Outside counting this costs
+/// nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SortedId(String);
+
+impl Ord for SortedId {
+    fn cmp(&self, other: &Self) -> Ordering {
+        compared(self.0.as_bytes(), other.0.as_bytes())
+    }
+}
+
+/// `a` against `b` in byte order. Counted tests count the bytes looked at:
+/// those the two share at the start, and one more. Outside counting this
+/// costs nothing.
+fn compared(a: &[u8], b: &[u8]) -> Ordering {
+    work::count_with(|| 1 + a.iter().zip(b).take_while(|(x, y)| x == y).count());
+    a.cmp(b)
+}
+
+impl PartialOrd for SortedId {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// For [`AppIndex::dir_holds`], which no counted path takes: a lookup by
+/// `str` compares as `str` does, uncounted.
+impl Borrow<str> for SortedId {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
 /// The target information that determines whether the walk follows a
 /// link: its type, device and inode, or the absence of a target. Unlike a
 /// [`FileStamp`], this stays unchanged when the target is edited in place.
@@ -141,12 +179,17 @@ pub struct AppIndex {
     /// that pointing one elsewhere is noticed.
     links: Vec<(PathBuf, LinkStamp)>,
     /// The winning file of each ID, as an index into `found`; `None` when
-    /// it says `Hidden=true` (the entry is deleted).
-    by_id: BTreeMap<String, Option<usize>>,
+    /// it says `Hidden=true` (the entry is deleted). Sorted by ID, for
+    /// [`AppIndex::iter`].
+    by_id: BTreeMap<SortedId, Option<usize>>,
+    /// The same as `by_id`, for looking an ID up: hashing costs the ID's
+    /// length, where the sorted map compares it with several IDs, each
+    /// compared up to where they differ.
+    lookup: HashMap<String, Option<usize>>,
     /// The IDs each root holds (by index into `roots`), shadowed ones
     /// included; files that could not be read or are ignored for their
     /// encoding or type are not counted, shadowed or not.
-    held: Vec<BTreeSet<String>>,
+    held: Vec<BTreeSet<SortedId>>,
     /// Files a more important folder shadows, read and stamped so that
     /// `held` stays right and a change to one is noticed.
     shadowed: Vec<(PathBuf, FileStamp, Arc<DesktopEntry>)>,
@@ -169,9 +212,13 @@ impl AppIndex {
     #[must_use]
     pub fn from_dirs(dirs: impl IntoIterator<Item = impl Into<PathBuf>>) -> Self {
         let mut roots: Vec<(PathBuf, FileStamp)> = Vec::new();
+        let mut seen = HashSet::new();
         for dir in dirs {
             let dir = dir.into();
-            if !roots.iter().any(|(known, _)| *known == dir) {
+            // The repeat check: a step, and the path copied, hashed and
+            // compared.
+            work::count(1 + 3 * dir.as_os_str().len());
+            if seen.insert(dir.clone()) {
                 let stamp = FileStamp::of(&dir);
                 roots.push((dir, stamp));
             }
@@ -190,6 +237,7 @@ impl AppIndex {
             ignored: Vec::new(),
             links: Vec::new(),
             by_id: BTreeMap::new(),
+            lookup: HashMap::new(),
             held: vec![BTreeSet::new(); roots.len()],
             shadowed: Vec::new(),
             diagnostics: Vec::new(),
@@ -202,6 +250,8 @@ impl AppIndex {
                 match roots_seen.entry((metadata.dev(), metadata.ino())) {
                     std::collections::hash_map::Entry::Occupied(first) => {
                         let held = index.held[*first.get()].clone();
+                        // A step per ID copied, and one per byte.
+                        work::count_with(|| held.iter().map(|id| 1 + id.0.len()).sum());
                         index.held[root_index] = held;
                         continue;
                     }
@@ -216,12 +266,17 @@ impl AppIndex {
             index.walk(root, Path::new(""), 0, &mut visited, &mut files);
             // Byte order of the relative paths, so `foo-bar.desktop` comes
             // before `foo/bar.desktop`.
-            files.sort_by(|a, b| a.0.as_os_str().as_bytes().cmp(b.0.as_os_str().as_bytes()));
+            files.sort_by(|a, b| compared(a.0.as_os_str().as_bytes(), b.0.as_os_str().as_bytes()));
             let mut ids_here: HashMap<String, PathBuf> = HashMap::new();
             for (relative, path) in files {
                 let id = desktop_file_id(&relative);
+                // A step, and the ID hashed and compared.
+                work::count(1 + 2 * id.len());
                 if let Some(first) = ids_here.get(&id) {
-                    index.diagnostics.push(Diagnostic::new(
+                    // The first path checked as UTF-8 and escaped (2 per
+                    // byte); the ID's first 32 characters, bounded.
+                    work::count(2 * first.as_os_str().len());
+                    index.report(Diagnostic::new(
                         Some(path.clone()),
                         None,
                         format!(
@@ -232,17 +287,25 @@ impl AppIndex {
                     ));
                     continue;
                 }
+                // A step, the ID copied, hashed and compared, and the path
+                // copied.
+                work::count(1 + 3 * id.len() + path.as_os_str().len());
                 ids_here.insert(id.clone(), path.clone());
                 // A more important folder has this ID: the file is read only
-                // to know whether the folder holds it.
-                let shadowed = index.by_id.contains_key(&id);
+                // to know whether the folder holds it. A step, and the ID
+                // hashed and compared.
+                work::count(1 + 2 * id.len());
+                let shadowed = index.lookup.contains_key(&id);
                 let stamp = FileStamp::of(&path);
+                // A step, and the path hashed and compared (counted even when
+                // the cache is empty).
+                work::count(1 + 2 * path.as_os_str().len());
                 let entry = match cache.get(&path) {
                     Some((cached, entry)) if *cached == stamp => Arc::clone(entry),
                     _ => match DesktopEntry::read(&path) {
                         Ok(entry) => Arc::new(entry),
                         Err(err) => {
-                            index.diagnostics.push(Diagnostic::new(
+                            index.report(Diagnostic::new(
                                 Some(path.clone()),
                                 None,
                                 format!("cannot be read: {err}"),
@@ -253,12 +316,14 @@ impl AppIndex {
                     },
                 };
                 if !shadowed {
-                    index
-                        .diagnostics
-                        .extend(entry.key_file().diagnostics().iter().cloned());
+                    for diagnostic in entry.key_file().diagnostics() {
+                        index.report(diagnostic.clone());
+                    }
                 }
                 if let Some(reason) = ignored_because(&entry) {
-                    index.diagnostics.push(Diagnostic::new(
+                    // The reason written.
+                    work::count(reason.len());
+                    index.report(Diagnostic::new(
                         Some(path.clone()),
                         None,
                         format!("{reason}; the file is ignored"),
@@ -267,25 +332,56 @@ impl AppIndex {
                     continue;
                 }
                 if shadowed {
-                    index.held[root_index].insert(id);
+                    index.held[root_index].insert(SortedId(id));
                     index.shadowed.push((path, stamp, entry));
                     continue;
                 }
-                let hidden = entry.hidden();
-                index.found.push(Found {
-                    root: root_index,
-                    id: id.clone(),
-                    path,
-                    stamp,
-                    entry,
-                });
-                let at = index.found.len() - 1;
-                index.held[root_index].insert(id.clone());
-                index.by_id.insert(id, (!hidden).then_some(at));
+                index.keep(root_index, id, path, stamp, entry);
             }
         }
         index.roots = roots;
         index
+    }
+
+    /// Adds `diagnostic`, counting it as made: a step, its path copied and
+    /// its message written.
+    fn report(&mut self, diagnostic: Diagnostic) {
+        work::count_with(|| {
+            1 + diagnostic
+                .path
+                .as_ref()
+                .map_or(0, |path| path.as_os_str().len())
+                + diagnostic.message.len()
+        });
+        self.diagnostics.push(diagnostic);
+    }
+
+    /// Keeps `entry`, read from `path` in the root `root`, as the winning
+    /// file of `id`.
+    fn keep(
+        &mut self,
+        root: usize,
+        id: String,
+        path: PathBuf,
+        stamp: FileStamp,
+        entry: Arc<DesktopEntry>,
+    ) {
+        let at = (!entry.hidden()).then_some(self.found.len());
+        // The ID copied for the entry and for the folder's set.
+        work::count(2 * id.len());
+        self.found.push(Found {
+            root,
+            id: id.clone(),
+            path,
+            stamp,
+            entry,
+        });
+        self.held[root].insert(SortedId(id.clone()));
+        // The ID put in the lookup map too: a step, and the ID copied,
+        // hashed and compared.
+        work::count(1 + 3 * id.len());
+        self.lookup.insert(id.clone(), at);
+        self.by_id.insert(SortedId(id), at);
     }
 
     /// Collects the `.desktop` files under `dir` as (path relative to the
@@ -308,13 +404,16 @@ impl AppIndex {
         if !visited.insert((metadata.dev(), metadata.ino())) {
             // A folder reached again (a link) is not walked, but what it
             // leads to changes when a link on the way is pointed elsewhere,
-            // so `refresh` notices.
+            // so `refresh` notices. A step, and the path copied.
+            work::count(1 + dir.as_os_str().len());
             self.links.push((dir.to_owned(), LinkStamp::of(dir)));
             return;
         }
+        // A step, and the path copied.
+        work::count(1 + dir.as_os_str().len());
         self.folders.push((dir.to_owned(), FileStamp::of(dir)));
         if depth > MAX_DEPTH {
-            self.diagnostics.push(Diagnostic::new(
+            self.report(Diagnostic::new(
                 Some(dir.to_owned()),
                 None,
                 "folders nested too deep; not scanned further",
@@ -325,13 +424,21 @@ impl AppIndex {
             return;
         };
         // In name order, so a folder reached under two names gets the same
-        // one every time.
-        let mut entries: Vec<_> = entries.flatten().collect();
-        entries.sort_by_key(std::fs::DirEntry::file_name);
-        for entry in entries {
-            let name = entry.file_name();
+        // one every time. Each name copied once (a step, and one per byte).
+        let mut entries: Vec<_> = entries
+            .flatten()
+            .map(|entry| {
+                let name = entry.file_name();
+                work::count(1 + name.len());
+                (name, entry)
+            })
+            .collect();
+        entries.sort_by(|(a, _), (b, _)| compared(a.as_bytes(), b.as_bytes()));
+        for (name, entry) in entries {
             let path = entry.path();
             let relative = relative.join(&name);
+            // Both paths made: one per byte of each.
+            work::count(path.as_os_str().len() + relative.as_os_str().len());
             match fs::metadata(&path) {
                 Ok(metadata) if metadata.is_dir() => {
                     self.walk(&path, &relative, depth + 1, visited, files);
@@ -364,29 +471,49 @@ impl AppIndex {
     /// is detected; editing its target in place is not.
     #[must_use]
     pub fn refresh(&self) -> Option<Self> {
+        // A step per path checked, up to the first that changed; the stat
+        // is file I/O.
         let changed = self
             .roots
             .iter()
             .chain(&self.folders)
             .chain(&self.ignored)
+            .inspect(|_| work::count(1))
             .any(|(path, stamp)| FileStamp::of(path) != *stamp)
             || self
                 .links
                 .iter()
+                .inspect(|_| work::count(1))
                 .any(|(path, stamp)| LinkStamp::of(path) != *stamp)
             || self
                 .found
                 .iter()
+                .inspect(|_| work::count(1))
                 .any(|found| FileStamp::of(&found.path) != found.stamp)
             || self
                 .shadowed
                 .iter()
+                .inspect(|_| work::count(1))
                 .any(|(path, stamp, _)| FileStamp::of(path) != *stamp);
         if !changed {
             return None;
         }
-        let cache = self
-            .found
+        let cache = self.cache();
+        let roots = self
+            .roots
+            .iter()
+            .map(|(path, _)| {
+                // A step, and the path copied.
+                work::count(1 + path.as_os_str().len());
+                (path.clone(), FileStamp::of(path))
+            })
+            .collect();
+        Some(Self::scan(roots, &cache))
+    }
+
+    /// The entries read, by path with their stamps, for a rebuild to reuse.
+    fn cache(&self) -> HashMap<PathBuf, (FileStamp, Arc<DesktopEntry>)> {
+        self.found
             .iter()
             .map(|found| (&found.path, &found.stamp, &found.entry))
             .chain(
@@ -394,14 +521,13 @@ impl AppIndex {
                     .iter()
                     .map(|(path, stamp, entry)| (path, stamp, entry)),
             )
-            .map(|(path, stamp, entry)| (path.clone(), (stamp.clone(), Arc::clone(entry))))
-            .collect();
-        let roots = self
-            .roots
-            .iter()
-            .map(|(path, _)| (path.clone(), FileStamp::of(path)))
-            .collect();
-        Some(Self::scan(roots, &cache))
+            .map(|(path, stamp, entry)| {
+                // A step, and the path copied, hashed and compared (the
+                // stamp is of fixed size, the entry an `Arc`).
+                work::count(1 + 3 * path.as_os_str().len());
+                (path.clone(), (stamp.clone(), Arc::clone(entry)))
+            })
+            .collect()
     }
 
     /// The desktop entry with desktop file ID `id`, unless its winning file
@@ -409,12 +535,23 @@ impl AppIndex {
     /// application (see [`DesktopEntry::entry_type`]).
     #[must_use]
     pub fn get(&self, id: &str) -> Option<AppEntry> {
-        let at = (*self.by_id.get(id)?)?;
+        let at = (*self.find(id)?)?;
         Some(self.app(at))
+    }
+
+    /// The winning file of `id`, as [`AppIndex::by_id`] has it, looked up
+    /// in [`AppIndex::lookup`].
+    fn find(&self, id: &str) -> Option<&Option<usize>> {
+        // A step, and the ID hashed and compared.
+        work::count(1 + 2 * id.len());
+        self.lookup.get(id)
     }
 
     fn app(&self, at: usize) -> AppEntry {
         let found = &self.found[at];
+        // A step, and one per byte of the ID and path copied (the entry is
+        // an `Arc`).
+        work::count(1 + found.id.len() + found.path.as_os_str().len());
         AppEntry {
             id: found.id.clone(),
             path: found.path.clone(),
@@ -427,12 +564,16 @@ impl AppIndex {
     pub fn iter(&self) -> impl Iterator<Item = AppEntry> + '_ {
         self.by_id
             .values()
+            // A step per ID, hidden ones too.
+            .inspect(|_| work::count(1))
             .filter_map(|at| at.map(|at| self.app(at)))
     }
 
     /// The `applications` folders, most important first.
     #[must_use]
     pub fn dirs(&self) -> Vec<&Path> {
+        // A step per folder listed.
+        work::count(self.roots.len());
         self.roots.iter().map(|(path, _)| path.as_path()).collect()
     }
 
@@ -458,14 +599,18 @@ impl AppIndex {
     /// The desktop file IDs the folder `dir` holds, as for
     /// [`AppIndex::dir_holds`], in order.
     pub fn dir_ids(&self, dir: usize) -> impl Iterator<Item = &str> {
-        self.held.get(dir).into_iter().flatten().map(String::as_str)
+        self.held
+            .get(dir)
+            .into_iter()
+            .flatten()
+            .map(|id| id.0.as_str())
     }
 
     /// The folder (index into [`AppIndex::dirs`]) the desktop entry `id`
     /// came from.
     #[must_use]
     pub fn dir_of(&self, id: &str) -> Option<usize> {
-        let at = (*self.by_id.get(id)?)?;
+        let at = (*self.find(id)?)?;
         Some(self.found[at].root)
     }
 }
@@ -497,11 +642,15 @@ fn ignored_because(entry: &DesktopEntry) -> Option<String> {
 /// The desktop file ID of a file at `relative` under `applications`: its
 /// components joined by `-`.
 fn desktop_file_id(relative: &Path) -> String {
-    relative
+    let id = relative
         .iter()
         .map(|part| part.to_string_lossy())
         .collect::<Vec<_>>()
-        .join("-")
+        .join("-");
+    // A step; each byte of the path split into parts and checked as UTF-8
+    // (2), and each byte of the ID written.
+    work::count(1 + 2 * relative.as_os_str().len() + id.len());
+    id
 }
 
 #[cfg(test)]
@@ -532,6 +681,354 @@ mod tests {
         assert_eq!(foo.entry().exec().as_deref(), Some("high"));
         assert_eq!(index.dir_of("org.foo.desktop"), Some(0));
         assert_eq!(index.dir_of("kde-konsole.desktop"), Some(1));
+    }
+
+    #[test]
+    fn many_folders_are_told_apart_in_linear_time() {
+        let dir = tempfile::tempdir().unwrap();
+        work::assert_linear(
+            2_000,
+            |n| {
+                // `n` folders that do not exist, a long one among them, each
+                // given twice.
+                let long = dir.path().join("d/".repeat(n)).join("applications");
+                let dirs: Vec<PathBuf> = (0..n)
+                    .map(|at| dir.path().join(format!("m{at}/applications")))
+                    .chain([long])
+                    .collect();
+                let bytes = 2 * dirs.iter().map(|d| d.as_os_str().len()).sum::<usize>();
+                let (index, steps) =
+                    work::steps(|| AppIndex::from_dirs(dirs.iter().chain(&dirs).cloned()));
+                let roots: Vec<_> = index.roots.iter().map(|(root, _)| root).collect();
+                assert_eq!(roots, dirs.iter().collect::<Vec<_>>(), "the first kept");
+                (steps, bytes)
+            },
+            // A step per folder given (twice per item) checked for repeats,
+            // and per character of each copied, hashed and compared: 3 per
+            // byte. Twice that.
+            |items, bytes| 4 * items + 6 * bytes,
+        );
+    }
+
+    #[test]
+    fn entries_given_out_count_their_lookups_and_copies() {
+        let dir = tempfile::tempdir().unwrap();
+        work::assert_linear(
+            200,
+            |n| {
+                // `n` entries in a folder of their own, one with a long name.
+                let root = dir.path().join(n.to_string());
+                for at in 0..n {
+                    write(
+                        &root.join(format!("org.example.App{at}.desktop")),
+                        &app("a"),
+                    );
+                }
+                write(
+                    &root.join(format!("{}.desktop", "l".repeat(200))),
+                    &app("a"),
+                );
+                let index = AppIndex::from_dirs([&root]);
+                let ids: Vec<String> = index.iter().map(|app| app.id().to_owned()).collect();
+                assert_eq!(ids.len(), n + 1);
+                // The ID and path of each, copied by `iter` and by `get`, and
+                // the ID looked up (hashed and compared) by `get` and by
+                // `dir_of`.
+                let bytes: usize = index
+                    .iter()
+                    .map(|app| 2 * (app.id().len() + app.path().as_os_str().len()))
+                    .chain(ids.iter().map(|id| 4 * id.len()))
+                    .sum();
+                let ((), steps) = work::steps(|| {
+                    assert_eq!(index.dirs(), [root.as_path()]);
+                    assert_eq!(index.iter().count(), n + 1);
+                    for id in &ids {
+                        assert!(index.get(id).is_some());
+                        assert_eq!(index.dir_of(id), Some(0));
+                    }
+                });
+                assert!(steps >= bytes, "{steps} steps for {bytes} bytes");
+                (steps, bytes)
+            },
+            // A step per folder listed; per entry `iter` visits, per entry
+            // given out by `iter` and by `get`, per lookup by `get` and by
+            // `dir_of`, and per byte of an ID and path copied or of an ID
+            // hashed and compared (2 each): 5 per entry and 1 per byte
+            // counted in `bytes`. Twice that.
+            |items, bytes| 2 + 10 * (items + 1) + 2 * bytes,
+        );
+    }
+
+    #[test]
+    fn ids_sharing_a_long_prefix_are_looked_up_in_linear_time() {
+        let dir = tempfile::tempdir().unwrap();
+        work::assert_linear(
+            200,
+            |n| {
+                // `n` entries whose IDs share a 200-byte prefix, so a lookup
+                // that compares IDs in a sorted map walks it at every step.
+                let root = dir.path().join(n.to_string());
+                let prefix = "l".repeat(200);
+                let ids: Vec<String> = (0..n).map(|at| format!("{prefix}{at}.desktop")).collect();
+                for id in &ids {
+                    write(&root.join(id), &app("a"));
+                }
+                let index = AppIndex::from_dirs([&root]);
+                let bytes: usize = ids.iter().map(String::len).sum();
+                let ((), steps) = work::steps(|| {
+                    for id in &ids {
+                        assert!(index.find(id).is_some());
+                    }
+                });
+                (steps, bytes)
+            },
+            // A step per lookup, and per byte of its ID hashed and compared
+            // (2). Twice that.
+            |items, bytes| 2 * (items + 2 * bytes),
+        );
+    }
+
+    /// The bytes `a` and `b` share at the start.
+    fn shared(a: &str, b: &str) -> usize {
+        a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count()
+    }
+
+    /// The least a sort or sorted structure of `items` compares: each item
+    /// after the first once, each comparison the bytes they share at the
+    /// start (at least those neighbours in order share) and one more.
+    fn least_compared(items: &[String]) -> usize {
+        let mut sorted = items.to_vec();
+        sorted.sort();
+        sorted
+            .windows(2)
+            .map(|pair| shared(&pair[0], &pair[1]) + 1)
+            .min()
+            .map_or(0, |each| (sorted.len() - 1) * each)
+    }
+
+    /// What indexing `files` (path relative to the root, contents) under
+    /// the folder `root` costs, the key file's own work left out (reading
+    /// each file `scan` reads, and looking up its encoding, type and
+    /// `Hidden`: the first file of each ID in byte order of the relative
+    /// paths, as an ID clash is never read), and the bytes of the full
+    /// paths. `ids` are the IDs indexed. Checks that at least what every
+    /// file costs is counted, whatever becomes of it: its name copied and
+    /// its paths made by the walk (a step, and 1 per byte of the name and
+    /// of both paths), its ID made (a step, 2 per byte of the relative path
+    /// and 1 of the ID) and looked up (a step, 2 per byte), and the least
+    /// the sort of the files and the sorted map and set of the IDs compare.
+    fn scan_cost(root: &Path, files: &[(String, &str)], ids: &[String]) -> (usize, usize) {
+        for (relative, text) in files {
+            write(&root.join(relative), text);
+        }
+        let (index, built) = work::steps(|| AppIndex::from_dirs([root]));
+        let mut read: Vec<&str> = files
+            .iter()
+            .map(|(relative, _)| relative.as_str())
+            .collect();
+        read.sort_unstable();
+        let mut ids_read = HashSet::new();
+        read.retain(|relative| ids_read.insert(relative.replace('/', "-")));
+        let key_file: usize = read
+            .iter()
+            .map(|relative| {
+                work::steps(|| {
+                    let entry = DesktopEntry::read(root.join(relative)).unwrap();
+                    if ignored_because(&entry).is_none() {
+                        let _ = entry.hidden();
+                    }
+                })
+                .1
+            })
+            .sum();
+        assert_eq!(index.iter().count(), ids.len());
+        let steps = built - key_file;
+        let path = |relative: &str| root.join(relative).as_os_str().len();
+        let each: usize = files
+            .iter()
+            .map(|(relative, _)| {
+                let name = relative.rsplit('/').next().unwrap().len();
+                let id = relative.len();
+                3 + name + path(relative) + 3 * relative.len() + 3 * id
+            })
+            .sum();
+        let relatives: Vec<String> = files.iter().map(|(relative, _)| relative.clone()).collect();
+        let least = each + least_compared(&relatives) + 2 * least_compared(ids);
+        assert!(steps >= least, "{steps} steps, at least {least} expected");
+        let path_bytes = files.iter().map(|(relative, _)| path(relative)).sum();
+        (steps, path_bytes)
+    }
+
+    #[test]
+    fn ids_sharing_a_long_prefix_are_indexed_in_n_log_n_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = "l".repeat(200);
+        let folder = "d".repeat(200);
+        let junk = "[Desktop Entry]\nName=a\njunk\n";
+        let application = app("a");
+        // The IDs (or relative paths) share 200 bytes at the start, so each
+        // comparison looks at about all of them: sorting is not linear. A
+        // B-tree searches each node from its first key (up to 11) and is
+        // about log6(n) deep, so an insert compares an ID with about
+        // 2 (log2(n) + 1) others (15 at 200, measured); a sort compares
+        // each item with about log2(n) + 1 others, and once when the items
+        // come in order. Per byte of the relative paths that is `sorting`
+        // times log2(n) + 1. The growth per doubling is then about 2.2,
+        // under the 2.5 allowed.
+        for case in ["long names", "a long folder", "diagnostics"] {
+            let dir = dir.path().join(case.replace(' ', "-"));
+            let layout = |n: usize| -> (Vec<(String, &str)>, Vec<String>) {
+                match case {
+                    "long names" => (0..n)
+                        .map(|at| {
+                            let name = format!("{prefix}{at}.desktop");
+                            ((name.clone(), application.as_str()), name)
+                        })
+                        .unzip(),
+                    "a long folder" => (0..n)
+                        .map(|at| {
+                            (
+                                (format!("{folder}/{at}.desktop"), application.as_str()),
+                                format!("{folder}-{at}.desktop"),
+                            )
+                        })
+                        .unzip(),
+                    // Each ID twice, `a-x` and `a/x`: the first has no type
+                    // and a line that is not an entry, the second (after it
+                    // in byte order) is an ID clash, never read; three
+                    // diagnostics per ID.
+                    _ => (
+                        (0..n)
+                            .flat_map(|at| {
+                                [
+                                    (format!("{prefix}{at}-x.desktop"), junk),
+                                    (format!("{prefix}{at}/x.desktop"), application.as_str()),
+                                ]
+                            })
+                            .collect(),
+                        Vec::new(),
+                    ),
+                }
+            };
+            let paths = |n: usize| -> (usize, usize) {
+                let (files, _) = layout(n);
+                let root = dir.join(n.to_string());
+                let bytes = files
+                    .iter()
+                    .map(|(relative, _)| root.join(relative).as_os_str().len())
+                    .sum();
+                (files.len(), bytes)
+            };
+            work::assert_linear(
+                200,
+                |n| {
+                    let (files, ids) = layout(n);
+                    let (steps, _) = scan_cost(&dir.join(n.to_string()), &files, &ids);
+                    let relative_bytes = files.iter().map(|(relative, _)| relative.len()).sum();
+                    (steps, relative_bytes)
+                },
+                |items, relative_bytes| {
+                    let (files, path_bytes) = paths(items);
+                    let log = usize::try_from(items.ilog2()).unwrap() + 1;
+                    let (linear, sorting) = match case {
+                        // Per file a step for each of the walk, the ID made,
+                        // looked up and put in the folder's map, the
+                        // shadowing check, the cache lookup and keeping it
+                        // (7); per byte of the relative path 17 (the walk
+                        // 2, the ID made 3, looked up 2 twice, put in two
+                        // maps 3 twice, copied twice); per byte of the full
+                        // path 4 (made by the walk, put in the folder's
+                        // map, hashed for the cache). Sorted: the IDs in
+                        // two B-trees (4); the names sorted by the walk in
+                        // read order (1), unless short; the files then in
+                        // order (about 0).
+                        "long names" => (7 * files + 17 * relative_bytes + 4 * path_bytes, 5),
+                        "a long folder" => (7 * files + 17 * relative_bytes + 4 * path_bytes, 4),
+                        // Per ID, with two files of `a` bytes of relative
+                        // path and `p` of full path each: about 200 steps
+                        // (the walk's three entries and folder, the IDs
+                        // made and looked up, and the three messages
+                        // besides their paths: 58, 28 and 111 bytes); 20
+                        // per byte of `a` (the walk 5: both names and
+                        // relative paths and the inner file's; the IDs made
+                        // 6 and looked up 4; the first put in the folder's
+                        // map 3 and checked for shadowing 2); 14 per byte
+                        // of `p` (the walk 4: both entries, the folder kept
+                        // and the inner file; the folder's map 1; the cache
+                        // 2; the key file's message for the first's line
+                        // made with its path 1; the messages 4, the first's
+                        // two and the clash's with both paths; the first's
+                        // path made readable for it 2). Per file, half
+                        // that. Sorted: the walk's names in read order (1)
+                        // and the files out of order (1); no ID is indexed.
+                        _ => (100 * files + 10 * relative_bytes + 7 * path_bytes, 2),
+                    };
+                    // Twice the analysed cost.
+                    2 * (linear + sorting * log * relative_bytes)
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn many_paths_are_refreshed_in_linear_time() {
+        let dir = tempfile::tempdir().unwrap();
+        for changed in [false, true] {
+            let dir = dir.path().join(if changed { "changed" } else { "same" });
+            let root_bytes = |n: usize| dir.join(n.to_string()).as_os_str().len();
+            work::assert_linear(
+                200,
+                |n| {
+                    let root = dir.join(n.to_string());
+                    let prefix = "l".repeat(200);
+                    let mut ids: Vec<String> =
+                        (0..n).map(|at| format!("{prefix}{at}.desktop")).collect();
+                    for id in &ids {
+                        write(&root.join(id), &app("a"));
+                    }
+                    ids.sort();
+                    let index = AppIndex::from_dirs([&root]);
+                    // The last file checked, the last in byte order.
+                    let last = root.join(ids.last().unwrap());
+                    if changed {
+                        write(&last, &app("changed"));
+                    }
+                    let (fresh, steps) = work::steps(|| index.refresh());
+                    assert_eq!(fresh.is_some(), changed);
+                    // The refresh's own work: when it rebuilds, what the new
+                    // scan counts (with the same entries reused, whose
+                    // lookups in the key file may cost less the second
+                    // time) is left out.
+                    let own = if changed {
+                        let cache = index.cache();
+                        let roots = vec![(root.clone(), FileStamp::of(&root))];
+                        steps - work::steps(|| AppIndex::scan(roots, &cache)).1
+                    } else {
+                        steps
+                    };
+                    let path_bytes = ids.iter().map(|id| root.join(id).as_os_str().len()).sum();
+                    // At least each path checked and, when it rebuilds,
+                    // each file's path put in the cache.
+                    let at_least = n + 2 + if changed { n + 3 * path_bytes } else { 0 };
+                    assert!(own >= at_least, "{own} steps, at least {at_least} expected");
+                    (own, path_bytes)
+                },
+                // The analysed cost: a step per path checked (the root, its
+                // folder and each file, up to the last). When it rebuilds,
+                // each file's path also put in the cache (a step, and
+                // copied, hashed and compared: 3 per byte), and the root
+                // copied (a step, and 1 per byte). Twice that.
+                |items, path_bytes| {
+                    let checked = items + 2;
+                    let rebuilt = if changed {
+                        items + 3 * path_bytes + 1 + root_bytes(items)
+                    } else {
+                        0
+                    };
+                    2 * (checked + rebuilt)
+                },
+            );
+        }
     }
 
     #[test]

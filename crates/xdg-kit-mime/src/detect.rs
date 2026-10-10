@@ -15,6 +15,7 @@ use rustix::io::Errno;
 use crate::database::{IndexedGlob, lowercase};
 use crate::fnmatch::Name;
 use crate::model::Matchlet;
+use crate::work::count;
 use crate::{MimeDatabase, MimeType};
 
 /// How sure a [`Detection`] is.
@@ -226,6 +227,9 @@ impl MimeDatabase {
     pub fn type_for_name(&self, name: impl AsRef<OsStr>) -> NameMatches {
         let bytes = name.as_ref().as_bytes();
         let name = bytes.rsplit(|&byte| byte == b'/').next().unwrap_or(bytes);
+        // Finding the last `/`, then lowercasing (checking and copying),
+        // then checking UTF-8 again.
+        count(4 * name.len() + 1);
         let lower = lowercase(name);
         // A name that is not UTF-8 only matches ASCII patterns.
         let utf8 = std::str::from_utf8(name).is_ok();
@@ -235,31 +239,39 @@ impl MimeDatabase {
 
         let mut found: Vec<usize> = Vec::new();
         for key in [name, lower.as_slice()] {
+            // Checked as UTF-8, then hashed and compared.
+            count(3 * key.len());
             let Ok(key) = std::str::from_utf8(key) else {
                 continue;
             };
             for &at in globs.literal.get(key).into_iter().flatten() {
-                if compared(&globs.all[at]) == globs.all[at].compared.as_bytes()
-                    && !found.contains(&at)
-                {
+                count(1 + key.len());
+                if compared(&globs.all[at]) == globs.all[at].compared.as_bytes() {
                     found.push(at);
                 }
             }
         }
         if found.is_empty() {
             for source in [name, lower.as_slice()] {
-                for start in 0..=source.len() {
-                    let Ok(tail) = std::str::from_utf8(&source[start..]) else {
+                // Only the tails as long as some pattern's tail can match.
+                for &len in globs
+                    .suffix_lens
+                    .iter()
+                    .take_while(|&&len| len <= source.len())
+                {
+                    count(1 + len);
+                    let Ok(tail) = std::str::from_utf8(&source[source.len() - len..]) else {
                         continue;
                     };
                     if !utf8 && !tail.is_ascii() {
                         continue;
                     }
+                    // Checked as ASCII, then hashed and compared.
+                    count(3 * len);
                     for &at in globs.suffix.get(tail).into_iter().flatten() {
                         let glob = &globs.all[at];
-                        if compared(glob).ends_with(&glob.compared.as_bytes()[1..])
-                            && !found.contains(&at)
-                        {
+                        count(1 + len);
+                        if compared(glob).ends_with(&glob.compared.as_bytes()[1..]) {
                             found.push(at);
                         }
                     }
@@ -267,6 +279,8 @@ impl MimeDatabase {
             }
         }
         if found.is_empty() {
+            // Each name checked as UTF-8 and split into characters.
+            count(2 * (name.len() + lower.len()) + globs.full.len());
             let (name, lower) = (Name::new(name), Name::new(&lower));
             found = globs
                 .full
@@ -283,6 +297,7 @@ impl MimeDatabase {
         }
 
         found.sort_by(|&a, &b| {
+            count(1);
             let (a, b) = (&globs.all[a], &globs.all[b]);
             b.weight
                 .cmp(&a.weight)
@@ -290,11 +305,18 @@ impl MimeDatabase {
                 .then(a.folder.cmp(&b.folder))
                 .then(a.order.cmp(&b.order))
         });
+        // A pattern found under both the name and the name lowercased is
+        // kept once: the order ends on folder and place in it, which no two
+        // patterns share, so the two are next to each other.
+        count(found.len());
+        found.dedup();
         NameMatches {
             matches: found
                 .into_iter()
                 .map(|at| {
                     let glob = &globs.all[at];
+                    // The pattern copied.
+                    count(1 + glob.pattern.len());
                     NameMatch {
                         mime: self.canonical(&glob.mime),
                         weight: glob.weight,
@@ -348,8 +370,18 @@ impl MimeDatabase {
 
     /// The type of content: magic, then (for XML) the root element, then
     /// text-or-binary from the first 128 bytes. Empty data is
-    /// `application/x-zerosize`. No I/O; the first
-    /// [`MimeDatabase::sniff_len`] bytes of a file are enough.
+    /// `application/x-zerosize`. Performs no I/O.
+    ///
+    /// For a file whose reported size is nonzero, supplying the first
+    /// [`MimeDatabase::sniff_len`] bytes gives the content-based type used
+    /// by [`MimeDatabase::type_for_path`]. For a regular file with a reported
+    /// size of 0 (as for most files under `/proc`), `type_for_path` reads
+    /// nothing. It returns `application/x-zerosize` from the size alone
+    /// unless all matching name patterns give one type, or an extended
+    /// attribute decides the type when that option is enabled.
+    ///
+    /// The prefix is not always enough: it misses magic matches beyond
+    /// 64 KiB and XML root elements beyond the prefix.
     #[must_use]
     pub fn type_for_data(&self, data: &[u8]) -> Detection {
         if data.is_empty() {
@@ -374,8 +406,17 @@ impl MimeDatabase {
     /// type (magic, else text-or-binary) decides: a name match that is that
     /// type or a subclass of it wins (certain when magic gave the type, a
     /// guess when text-or-binary did), else the best name match (a guess),
-    /// else the content's type. No I/O; the first
-    /// [`MimeDatabase::sniff_len`] bytes of a file are enough.
+    /// else the content's type. Performs no I/O.
+    ///
+    /// For a regular file whose reported size is nonzero, supplying its
+    /// name and first [`MimeDatabase::sniff_len`] bytes gives the same
+    /// result as [`MimeDatabase::type_for_path`] without the extended
+    /// attribute. For a reported size of 0 (as for most files under `/proc`),
+    /// `type_for_path` returns `application/x-zerosize` from the size alone
+    /// when the name does not decide.
+    ///
+    /// The prefix is not always enough: it misses magic matches beyond
+    /// 64 KiB and XML root elements beyond the prefix.
     #[must_use]
     pub fn type_for_name_and_data(&self, name: impl AsRef<OsStr>, data: &[u8]) -> Detection {
         let names = self.type_for_name(name);
@@ -608,6 +649,7 @@ mod tests {
     use std::fs;
 
     use super::*;
+    use crate::work::{assert_linear, steps};
 
     fn matchlet(start: u32, range: u32, value: &[u8], mask: Option<&[u8]>) -> Matchlet {
         Matchlet {
@@ -743,6 +785,79 @@ mod tests {
         for entry in fs::read_dir("/").unwrap() {
             agree(Path::new("/"), &entry.unwrap().file_name());
         }
+    }
+
+    /// A database of one folder whose `globs2` holds `lines`, and the
+    /// file's length.
+    fn globs_database(lines: impl Iterator<Item = String>) -> (MimeDatabase, usize) {
+        let text: String = lines.map(|line| line + "\n").collect();
+        let db = MimeDatabase::from_files(&[vec![("globs2", text.as_bytes())]]);
+        (db, text.len())
+    }
+
+    #[test]
+    fn the_rules_a_name_matches_are_gathered_in_linear_work() {
+        // `n` patterns `same` (or `*.same`), each of its own type: each is
+        // found under the name and the name lowercased, then sorted, once.
+        // Per pattern: two finds (a step and the name compared each), a few
+        // steps sorting, a step dropping the second and the pattern copied
+        // (about 21, or 25 for `*.same`), then its type made canonical (a
+        // step and two per byte: `text/x-t` and up to four digits, about
+        // 24).
+        for (pattern, name, per) in [("same", "same", 45), ("*.same", "X.same", 49)] {
+            let run = |n: usize| {
+                let (db, bytes) =
+                    globs_database((0..n).map(|at| format!("50:text/x-t{at}:{pattern}")));
+                let (found, steps) = steps(|| db.type_for_name(name));
+                assert_eq!(found.matches().len(), n, "{pattern}");
+                (steps, bytes)
+            };
+            assert_linear(1_000, run, |items, _| 2 * (per * items + 100));
+        }
+    }
+
+    #[test]
+    fn a_long_name_is_matched_in_linear_work() {
+        // Few short suffixes: a long name is looked up by its tails of
+        // their lengths only.
+        let (db, _) = globs_database((0..50).map(|at| format!("50:text/x-t{at}:*.e{at}")));
+        let run = |n: usize| {
+            let name = "a".repeat(n);
+            let (found, steps) = steps(|| db.type_for_name(&name));
+            assert!(found.is_empty());
+            (steps, n)
+        };
+        // The name read, lowercased, looked up whole and split for the
+        // other patterns: a few steps per byte.
+        assert_linear(10_000, run, |_, bytes| 2 * (14 * bytes + 100));
+        // Long suffixes, eight of them, each a tail of the name: checked,
+        // looked up and compared for each of the name and its lowercased
+        // copy, about ten steps per byte of the suffixes.
+        let run = |n: usize| {
+            let (db, bytes) = globs_database(
+                (1..=8).map(|at| format!("50:text/x-t{at}:*{}.x", "a".repeat(at * n / 8))),
+            );
+            let name = format!("{}.x", "a".repeat(n));
+            let (found, steps) = steps(|| db.type_for_name(&name));
+            assert_eq!(found.matches().len(), 8);
+            (steps, bytes + name.len())
+        };
+        assert_linear(10_000, run, |_, bytes| 2 * (11 * bytes + 100));
+    }
+
+    #[test]
+    fn the_patterns_of_a_type_are_listed_in_linear_work() {
+        // One type with `n` patterns, each kept once.
+        let run = |n: usize| {
+            let (db, bytes) = globs_database((0..n).map(|at| format!("50:text/x-a:*.p{at}")));
+            let mime = MimeType::new("text/x-a").unwrap();
+            let (patterns, steps) = steps(|| db.patterns_for(&mime));
+            assert_eq!(patterns.len(), n);
+            (steps, bytes)
+        };
+        // Per pattern: a step, the pattern hashed, compared and copied;
+        // each line of the file is over three times its pattern.
+        assert_linear(1_000, run, |items, bytes| 2 * (items + bytes));
     }
 
     #[test]

@@ -20,10 +20,10 @@ impl MediaType {
     /// digit, followed by letters, digits or `!#$&^_.+-`.
     #[must_use]
     pub fn new(text: &str) -> Option<Self> {
-        // Copied into a type, which checks it (looking for the `/`, then
-        // through each name) and copies it again, then lowered into a copy:
-        // five steps per character.
-        work::count(5 * text.len());
+        // Copied into the text of a type, then lowered into a copy: two
+        // steps per character. Making the type is a call into
+        // `xdg-kit-mime`, which counts its own checks: a step.
+        work::count(1 + 2 * text.len());
         // A media type is valid when it makes a valid type.
         MimeType::new(&format!("{text}/x")).ok()?;
         Some(Self(text.to_ascii_lowercase()))
@@ -74,9 +74,9 @@ impl TypePattern {
         if let Some(media) = text.strip_suffix("/*") {
             return MediaType::new(media).map(Self::Media);
         }
-        // `MimeType::new` looks for the `/`, checks each name, and copies
-        // the text: three steps per character.
-        work::count(3 * text.len());
+        // `MimeType::new` is a call into `xdg-kit-mime`, which counts its
+        // own checks and copy: a step.
+        work::count(1);
         MimeType::new(text).ok().map(Self::Exact)
     }
 
@@ -85,8 +85,25 @@ impl TypePattern {
     #[must_use]
     pub fn canonical(&self, database: &MimeDatabase) -> Self {
         match self {
-            Self::Exact(mime) => Self::Exact(database.canonical(mime)),
-            Self::Media(_) | Self::Any => self.clone(),
+            Self::Exact(mime) => {
+                // One call into `xdg-kit-mime`, which counts its own work;
+                // the type it gives is an `Arc`.
+                work::count(1);
+                Self::Exact(database.canonical(mime))
+            }
+            Self::Media(_) | Self::Any => {
+                work::count(self.clone_steps());
+                self.clone()
+            }
+        }
+    }
+
+    /// The steps of a clone: a step, and a media wildcard's name copied
+    /// byte by byte (a type is an `Arc`; `*/*` holds no text).
+    pub(crate) fn clone_steps(&self) -> usize {
+        match self {
+            Self::Media(media) => 1 + media.as_str().len(),
+            Self::Exact(_) | Self::Any => 1,
         }
     }
 

@@ -2,9 +2,10 @@
 //! written without losing anything.
 //!
 //! Every line is kept as it was written: comments, blank lines, group
-//! headers and entries, and the bytes of a line that is not UTF-8. A file
-//! written back unchanged is byte-identical; changing a value rewrites only
-//! the value part of its line.
+//! headers and entries, and the bytes of a line that is not UTF-8. A
+//! comment may hold any bytes: one that is not UTF-8 gets no diagnostic. A
+//! file written back unchanged is byte-identical; changing a value rewrites
+//! only the value part of its line.
 //!
 //! The spec forbids duplicate groups and keys. Reading follows `GLib`'s
 //! `gkeyfile.c`: a repeated group continues the first one, and a repeated
@@ -29,6 +30,8 @@ use crate::error::quoted;
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Kind {
     Blank,
+    /// A line whose first byte after spaces and tabs is `#`, whatever its
+    /// other bytes are: they need not be UTF-8.
     Comment,
     Group(String),
     /// `key[locale]=value`; the value starts at byte `value_start`.
@@ -36,6 +39,9 @@ enum Kind {
         key: String,
         locale: Option<String>,
         value_start: usize,
+        /// The entry's id, which it keeps while it is in the file, so that
+        /// the index finds its place by it ([`Index::places`]).
+        id: u64,
     },
     /// Not UTF-8, or neither of the above.
     Invalid,
@@ -86,7 +92,7 @@ impl Line {
 
 /// A line's block, by its number ([`Block::number`]), and its position
 /// within that block.
-type Place = (usize, usize);
+type Place = (u64, usize);
 
 /// A group header and the lines up to the next header, or the lines
 /// before the first header.
@@ -105,11 +111,7 @@ struct Block {
     /// are numbered in file order, and the places of lines name blocks by
     /// it, so that letting go of removed groups' blocks moves no place
     /// (see [`KeyFile::reclaim`]). The first block's is 0.
-    number: usize,
-    /// The number of the first block of its group, which names the group
-    /// in the index ([`Index`]); 0 for the lines before the first group and
-    /// for a removed group's block.
-    group: usize,
+    number: u64,
     /// The lines up to the last entry, or the header when there is none.
     lines: Vec<Line>,
     /// How many of `lines` are removed ones.
@@ -130,9 +132,9 @@ struct Block {
     live: Counts,
     /// The number of the nearest earlier block that is not a removed
     /// group's.
-    previous: Option<usize>,
+    previous: Option<u64>,
     /// The number of the nearest later block that is not a removed group's.
-    next: Option<usize>,
+    next: Option<u64>,
 }
 
 impl Block {
@@ -277,20 +279,27 @@ fn depth(len: usize) -> usize {
 /// removing the lines of one locale is constant work for distinct locales,
 /// and log n among the n variants that share a postfix once their
 /// `.ENCODING` parts are stripped.
+///
+/// Lines are identified by entry IDs; [`Index::places`] tracks their
+/// positions, so moving a line needs no change here. A key's IDs stay in
+/// file order: reading assigns them in that order, new entries follow the
+/// key's other lines with an ID larger than any previous one, and lines
+/// move only past removed lines.
 #[derive(Debug, Clone, Default)]
 struct KeyLines {
-    /// The lines of each locale (`None`: untranslated), in file order; as a
-    /// repeated key's last value counts, the last one is the one read.
-    lines: HashMap<Option<String>, Vec<Place>>,
-    /// The lines of each locale postfix with an `.ENCODING` part, under the
-    /// postfix without it.
-    encoded: HashMap<String, BTreeSet<Place>>,
+    /// The ids of the lines of each locale (`None`: untranslated), in file
+    /// order; as a repeated key's last value counts, the last one is the
+    /// one read.
+    lines: HashMap<Option<String>, Vec<u64>>,
+    /// The ids of the lines of each locale postfix with an `.ENCODING`
+    /// part, under the postfix without it.
+    encoded: HashMap<String, BTreeSet<u64>>,
 }
 
 impl KeyLines {
-    /// Adds the line at `place` for `locale`; it comes after the key's
-    /// other lines.
-    fn add(&mut self, locale: Option<&str>, place: Place) {
+    /// Adds the line of the entry `id` for `locale`; it comes after the
+    /// key's other lines.
+    fn add(&mut self, locale: Option<&str>, id: u64) {
         // Looked through for a `.`, then copied, hashed and compared as a
         // key (see [`work`]).
         work::count(4 * locale.map_or(0, str::len));
@@ -299,65 +308,66 @@ impl KeyLines {
             // The postfix without its encoding hashed and compared as a key,
             // and the place added to its set.
             work::count(2 * stripped.len());
-            let places = self.encoded.entry(stripped).or_default();
-            work::count(depth(places.len()));
-            places.insert(place);
+            let ids = self.encoded.entry(stripped).or_default();
+            work::count(depth(ids.len()));
+            ids.insert(id);
         }
         self.lines
             .entry(locale.map(str::to_owned))
             .or_default()
-            .push(place);
+            .push(id);
     }
 
-    /// The place of the last line of `locale`.
-    fn last(&self, locale: Option<&str>) -> Option<Place> {
+    /// The id of the last line of `locale`.
+    fn last(&self, locale: Option<&str>) -> Option<u64> {
         // Copied, hashed and compared.
         work::count(3 * locale.map_or(0, str::len));
         self.lines
             .get(&locale.map(str::to_owned))
-            .and_then(|places| places.last())
+            .and_then(|ids| ids.last())
             .copied()
     }
 
-    /// The place of the line holding the value of `locale`: the last one,
-    /// as a repeated key's last value counts.
-    fn find(&self, locale: Option<&str>) -> Option<Place> {
-        let place = self.last(locale);
+    /// The id of the line holding the value of `locale`: the last one, as
+    /// a repeated key's last value counts.
+    fn find(&self, locale: Option<&str>) -> Option<u64> {
+        let id = self.last(locale);
         work::count(1);
-        place
+        id
     }
 
-    /// The place of the last line whose locale postfix is `wanted` once its
+    /// The id of the last line whose locale postfix is `wanted` once its
     /// `.ENCODING` part is stripped, `wanted` having none.
-    fn last_encoded(&self, wanted: &str) -> Option<Place> {
+    fn last_encoded(&self, wanted: &str) -> Option<u64> {
         // Hashed and compared.
         work::count(2 * wanted.len());
-        let places = self.encoded.get(wanted)?;
-        work::count(depth(places.len()));
-        places.last().copied()
+        let ids = self.encoded.get(wanted)?;
+        work::count(depth(ids.len()));
+        ids.last().copied()
     }
 
     /// The steps of copying them: one per locale or postfix, per byte of
-    /// one and per place.
+    /// one and per id.
     fn copy_steps(&self) -> usize {
         let lines: usize = self
             .lines
             .iter()
-            .map(|(locale, places)| 1 + locale.as_ref().map_or(0, String::len) + places.len())
+            .map(|(locale, ids)| 1 + locale.as_ref().map_or(0, String::len) + ids.len())
             .sum();
         let encoded: usize = self
             .encoded
             .iter()
-            .map(|(postfix, places)| 1 + postfix.len() + places.len())
+            .map(|(postfix, ids)| 1 + postfix.len() + ids.len())
             .sum();
         lines + encoded
     }
 
-    /// Takes out the lines of `locale` and returns their places.
-    fn remove(&mut self, locale: Option<&str>) -> Vec<Place> {
+    /// Takes out the lines of `locale` and returns their ids, in file
+    /// order.
+    fn remove(&mut self, locale: Option<&str>) -> Vec<u64> {
         // Copied, hashed and compared.
         work::count(3 * locale.map_or(0, str::len));
-        let places = self
+        let ids = self
             .lines
             .remove(&locale.map(str::to_owned))
             .unwrap_or_default();
@@ -367,40 +377,21 @@ impl KeyLines {
             // encoding hashed and compared, twice when its set empties.
             work::count(locale.len() + 4 * stripped.len());
             if let Some(set) = self.encoded.get_mut(stripped.as_ref()) {
-                for place in &places {
+                for id in &ids {
                     work::count(depth(set.len()));
-                    set.remove(place);
+                    set.remove(id);
                 }
                 if set.is_empty() {
                     self.encoded.remove(stripped.as_ref());
                 }
             }
         }
-        places
+        ids
     }
 
-    /// Notes that the line of `locale` at `from` is now at `to`, before
-    /// it; the key's lines before `from` are all before `to`.
-    fn moved(&mut self, locale: Option<&str>, from: Place, to: Place) {
-        // Copied, hashed and compared; then the place looked for.
-        work::count(3 * locale.map_or(0, str::len));
-        if let Some(places) = self.lines.get_mut(&locale.map(str::to_owned)) {
-            work::count(depth(places.len()));
-            if let Ok(at) = places.binary_search(&from) {
-                places[at] = to;
-            }
-        }
-        if let Some(locale) = locale.filter(|locale| locale.contains('.')) {
-            let stripped = strip_encoding(locale);
-            // Looked through for a `.`, the postfix without its encoding
-            // hashed and compared, and the place moved in its set.
-            work::count(locale.len() + 2 * stripped.len());
-            if let Some(set) = self.encoded.get_mut(stripped.as_ref()) {
-                work::count(2 * depth(set.len()));
-                set.remove(&from);
-                set.insert(to);
-            }
-        }
+    /// Every id of the key's lines.
+    fn ids(&self) -> impl Iterator<Item = u64> {
+        self.lines.values().flatten().copied()
     }
 }
 
@@ -423,19 +414,30 @@ impl Bytes for (String, Option<String>) {
 
 /// Items in the order they were added, each once. Removing one leaves a
 /// gap, and the gaps are dropped when they outnumber the items, so adding
-/// and removing are constant amortized work.
+/// and removing take constant amortized work. Each item's position is
+/// tracked by its number, so removing gaps can move items without hashing
+/// them again.
 #[derive(Debug, Clone)]
 struct Listed<T> {
-    items: Vec<Option<T>>,
-    /// Where each item is in `items`.
-    at: HashMap<T, usize>,
+    /// The items with their numbers, and gaps.
+    items: Vec<Option<(u64, T)>>,
+    /// Each item's number.
+    numbers: HashMap<T, u64>,
+    /// Where each item is in `items`, by its number.
+    at: HashMap<u64, usize>,
+    /// The number the next item gets. Numbers are never reused. Running
+    /// out of them would take `u64::MAX` items added in the life of the
+    /// list, which cannot happen; it would panic rather than wrap.
+    next: u64,
 }
 
 impl<T> Default for Listed<T> {
     fn default() -> Self {
         Self {
             items: Vec::new(),
+            numbers: HashMap::new(),
             at: HashMap::new(),
+            next: 0,
         }
     }
 }
@@ -443,57 +445,64 @@ impl<T> Default for Listed<T> {
 impl<T: Bytes + Clone + Eq + Hash> Listed<T> {
     /// Adds `item` at the end unless it is listed; whether it was new.
     fn insert(&mut self, item: T) -> bool {
-        // Hashed and compared; when new, copied, hashed and compared again.
+        // Hashed and compared; when new, copied, hashed and compared again,
+        // and its number hashed.
         work::count(2 * item.bytes());
-        if self.at.contains_key(&item) {
+        if self.numbers.contains_key(&item) {
             return false;
         }
-        work::count(3 * item.bytes());
-        self.at.insert(item.clone(), self.items.len());
-        self.items.push(Some(item));
+        work::count(3 * item.bytes() + 1);
+        let number = self.next;
+        self.next = number
+            .checked_add(1)
+            .expect("the key file's list numbers are exhausted");
+        self.numbers.insert(item.clone(), number);
+        self.at.insert(number, self.items.len());
+        self.items.push(Some((number, item)));
         true
     }
 
     fn remove(&mut self, item: &T) {
         // Hashed and compared.
         work::count(2 * item.bytes());
-        let Some(at) = self.at.remove(item) else {
+        let Some(number) = self.numbers.remove(item) else {
             return;
         };
-        self.items[at] = None;
+        // Its number hashed.
+        work::count(1);
+        if let Some(at) = self.at.remove(&number) {
+            self.items[at] = None;
+        }
         if 2 * self.at.len() < self.items.len() {
-            // A step per item or gap; each item kept hashed and compared to
-            // note its new place.
-            work::count(self.items.len());
+            // A step per item or gap, and per item kept for its number
+            // hashed to note its new place.
+            work::count(self.items.len() + self.at.len());
             self.items.retain(Option::is_some);
-            for (at, item) in self.items.iter().flatten().enumerate() {
-                work::count(2 * item.bytes());
-                if let Some(place) = self.at.get_mut(item) {
-                    *place = at;
-                }
+            for (at, (number, _)) in self.items.iter().flatten().enumerate() {
+                self.at.insert(*number, at);
             }
         }
     }
 
-    /// The steps of copying them: one per item or gap, and per item and
-    /// byte of one again for where it is.
+    /// The steps of copying them: one per item or gap, per item and byte of
+    /// one again for its number, and one per item for where it is.
     fn copy_steps(&self) -> usize {
         self.items.len()
             + self
-                .at
+                .numbers
                 .keys()
-                .map(|item| 1 + 2 * item.bytes())
+                .map(|item| 2 + 2 * item.bytes())
                 .sum::<usize>()
     }
 
     /// The items in order, with a step per item or gap.
     fn iter(&self) -> impl Iterator<Item = &T> {
         work::count(self.items.len());
-        self.items.iter().flatten()
+        self.items.iter().flatten().map(|(_, item)| item)
     }
 
     fn is_empty(&self) -> bool {
-        self.at.is_empty()
+        self.numbers.is_empty()
     }
 }
 
@@ -502,7 +511,9 @@ impl<T: Bytes + Clone + Eq + Hash> Listed<T> {
 ///
 /// Past `headers`, a group is named by the number of its first block, which
 /// it keeps while it is in the file (block numbers are never reused), so
-/// that the work per entry does not grow with the group's name.
+/// that the work per entry does not grow with the group's name. Past
+/// `entries`, an entry is named by its id, so that moving its line does
+/// not grow with its key or locale.
 #[derive(Debug, Clone, Default)]
 struct Index {
     /// Group names, each once, in the order they first appear.
@@ -510,16 +521,54 @@ struct Index {
     /// The numbers of the blocks of each group's headers, in file order. The
     /// first names the group; a new entry goes at the end of the `lines` of
     /// the last.
-    headers: HashMap<String, Vec<usize>>,
+    headers: HashMap<String, Vec<u64>>,
     /// Each group's keys with their locales, each once, in order.
-    keys: HashMap<usize, Listed<(String, Option<String>)>>,
+    keys: HashMap<u64, Listed<(String, Option<String>)>>,
     /// The lines of each (group, key), by locale.
-    entries: HashMap<(usize, String), KeyLines>,
+    entries: HashMap<(u64, String), KeyLines>,
+    /// The place of each indexed entry, by its id ([`Kind::Entry`]):
+    /// moving a line updates its place here in constant work, without its
+    /// key or locale.
+    places: HashMap<u64, Place>,
+    /// The id the next entry gets. Ids are never reused. Running out of
+    /// them would take `u64::MAX` entries read or added in the life of the
+    /// file, which cannot happen; it would panic rather than wrap.
+    next_id: u64,
 }
 
 impl Index {
+    /// A new entry's id: larger than any given before.
+    fn new_id(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id = id
+            .checked_add(1)
+            .expect("the key file's entry ids are exhausted");
+        id
+    }
+
+    /// The place of the entry `id`, with a step for the number hashed.
+    fn place(&self, id: u64) -> Place {
+        work::count(1);
+        self.places[&id]
+    }
+
+    /// Notes that the entry `id` is at `place`, with a step for the number
+    /// hashed.
+    fn set_place(&mut self, id: u64, place: Place) {
+        work::count(1);
+        self.places.insert(id, place);
+    }
+
+    /// Forgets the entry `id` and returns its place, with a step for the
+    /// number hashed.
+    fn take_place(&mut self, id: u64) -> Option<Place> {
+        work::count(1);
+        self.places.remove(&id)
+    }
+
     /// The steps of copying it: one per group, key and entry, per byte of
-    /// their names and per block number, and the key lists' and key lines'.
+    /// their names and per block number, the key lists' and key lines', and
+    /// one per entry's place.
     fn copy_steps(&self) -> usize {
         let headers: usize = self
             .headers
@@ -532,7 +581,7 @@ impl Index {
             .iter()
             .map(|((_, key), lines)| 1 + key.len() + lines.copy_steps())
             .sum();
-        self.groups.copy_steps() + headers + keys + entries
+        self.groups.copy_steps() + headers + keys + entries + self.places.len()
     }
 }
 
@@ -549,9 +598,12 @@ pub struct KeyFile {
     /// lines of its own block, now and then ([`KeyFile::tidy`]).
     blocks: Vec<Block>,
     /// Where in `blocks` each block is, by its number.
-    slots: HashMap<usize, usize>,
-    /// The number the next block added gets.
-    next_number: usize,
+    slots: HashMap<u64, usize>,
+    /// The number the next block added gets. Numbers are never reused.
+    /// Running out of them would take `u64::MAX` blocks read or added in
+    /// the life of the file, which cannot happen; it would panic rather
+    /// than wrap.
+    next_number: u64,
     /// How many of `blocks` are removed groups' blocks.
     dead: usize,
     /// Whether the text ended with a line feed.
@@ -926,13 +978,12 @@ impl KeyFile {
         let mut index = Index::default();
         let count = self.blocks.len();
         self.slots = HashMap::with_capacity(count);
-        for (number, block) in self.blocks.iter_mut().enumerate() {
+        for (slot, (number, block)) in (0..).zip(self.blocks.iter_mut()).enumerate() {
             // A step per block.
             work::count(1);
             block.number = number;
-            self.slots.insert(number, number);
+            self.slots.insert(number, slot);
             let Block {
-                group: block_group,
                 lines,
                 tail,
                 problems,
@@ -943,7 +994,7 @@ impl KeyFile {
                 ..
             } = block;
             *previous = number.checked_sub(1);
-            *next = Some(number + 1).filter(|&next| next < count);
+            *next = (slot + 1 < count).then_some(number + 1);
             // The tail starts after the last entry, or after the header.
             let split = lines
                 .iter()
@@ -964,20 +1015,20 @@ impl KeyFile {
                 }
             }
             let mut group = None;
-            for (at, line) in lines.iter().enumerate() {
+            for (at, line) in lines.iter_mut().enumerate() {
                 work::count(1);
                 if let Some(problem) = &line.problem {
                     work::count(problem.len());
                     problems.push((at, problem.clone()));
                 }
-                match &line.kind {
+                match &mut line.kind {
                     Kind::Group(name) => {
                         // Hashed and compared; when new, copied, hashed and
                         // compared again (the group list counts its own).
                         work::count(2 * name.len());
                         if let Some(found) = index.headers.get_mut(name) {
                             found.push(number);
-                            *block_group = found[0];
+                            group = Some(found[0]);
                             let problem = format!(
                                 "group [{}] appears again; its entries join the first one",
                                 quoted(name)
@@ -988,11 +1039,14 @@ impl KeyFile {
                             work::count(3 * name.len());
                             index.headers.insert(name.clone(), vec![number]);
                             index.groups.insert(name.clone());
-                            *block_group = number;
+                            group = Some(number);
                         }
-                        group = Some(*block_group);
                     }
-                    Kind::Entry { key, locale, .. } => {
+                    Kind::Entry {
+                        key, locale, id, ..
+                    } => {
+                        // Every entry gets an id, so that ids are unique.
+                        *id = index.new_id();
                         let Some(group) = group else {
                             problems.push((at, "entry before the first group; ignored".to_owned()));
                             continue;
@@ -1013,14 +1067,15 @@ impl KeyFile {
                             .entries
                             .entry((group, key.clone()))
                             .or_default()
-                            .add(locale.as_deref(), (number, at));
+                            .add(locale.as_deref(), *id);
+                        index.set_place(*id, (number, at));
                     }
                     Kind::Blank | Kind::Comment | Kind::Invalid | Kind::Removed => {}
                 }
             }
         }
         self.index = index;
-        self.next_number = count;
+        self.next_number = self.blocks.last().map_or(0, |block| block.number + 1);
         self.dead = 0;
         self.sizes = Counts::default();
         for block in &self.blocks {
@@ -1030,17 +1085,17 @@ impl KeyFile {
     }
 
     /// Where in `blocks` the block numbered `number` is.
-    fn slot(&self, number: usize) -> usize {
+    fn slot(&self, number: u64) -> usize {
         self.slots[&number]
     }
 
     /// The block numbered `number`.
-    fn block(&self, number: usize) -> &Block {
+    fn block(&self, number: u64) -> &Block {
         &self.blocks[self.slot(number)]
     }
 
     /// The block numbered `number`.
-    fn block_mut(&mut self, number: usize) -> &mut Block {
+    fn block_mut(&mut self, number: u64) -> &mut Block {
         let slot = self.slot(number);
         &mut self.blocks[slot]
     }
@@ -1156,6 +1211,22 @@ impl KeyFile {
         })
     }
 
+    /// The lines (counted from 1) of the comments that are not UTF-8, which
+    /// reading keeps without a diagnostic and `validate` warns about; with a
+    /// step per line and per byte of a comment checked.
+    pub(crate) fn comments_not_utf8(&self) -> Vec<usize> {
+        self.lines()
+            .enumerate()
+            .filter(|(_, line)| {
+                line.kind == Kind::Comment && {
+                    work::count(line.raw.len());
+                    std::str::from_utf8(line.content()).is_err()
+                }
+            })
+            .map(|(at, _)| at + 1)
+            .collect()
+    }
+
     /// The group names, each once, in the order they first appear.
     #[must_use]
     pub fn groups(&self) -> Vec<&str> {
@@ -1185,7 +1256,7 @@ impl KeyFile {
 
     /// The number of the first block of `group`, which names it in the
     /// index.
-    fn group_number(&self, group: &str) -> Option<usize> {
+    fn group_number(&self, group: &str) -> Option<u64> {
         // Hashed and compared.
         work::count(2 * group.len());
         self.index.headers.get(group).map(|found| found[0])
@@ -1234,11 +1305,11 @@ impl KeyFile {
         } else {
             lines.last(Some(wanted))
         };
-        // Places order as lines do: the later one counts.
+        // A key's ids order as its lines do: the later one counts.
         plain
             .max(lines.last_encoded(wanted))
             .inspect(|_| work::count(1))
-            .and_then(|place| self.line(place).value())
+            .and_then(|id| self.line(self.index.place(id)).value())
     }
 
     /// The untranslated value of `key` in `group`, unescaped.
@@ -1259,11 +1330,15 @@ impl KeyFile {
     /// one, else the untranslated value, as written. The group and the key
     /// are found once, so that the work per locale tried does not grow
     /// with their names.
-    fn locale_raw(&self, group: &str, key: &str, locales: &Locales) -> Option<&str> {
+    pub(crate) fn locale_raw(&self, group: &str, key: &str, locales: &Locales) -> Option<&str> {
         let lines = self.key_lines(group, key)?;
         locales
             .select(|locale| self.translated(lines, locale))
-            .or_else(|| lines.find(None).and_then(|place| self.line(place).value()))
+            .or_else(|| {
+                lines
+                    .find(None)
+                    .and_then(|id| self.line(self.index.place(id)).value())
+            })
     }
 
     /// The untranslated value of `key` in `group` as a `;`-separated list.
@@ -1335,7 +1410,8 @@ impl KeyFile {
         if !self.has_group(group) {
             self.push_group(group);
         }
-        self.insert_entry(group, key, locale, Line::entry(&text, key, locale));
+        let line = Line::entry(&text, key, locale, self.index.new_id());
+        self.insert_entry(group, key, locale, line);
         Ok(())
     }
 
@@ -1347,7 +1423,7 @@ impl KeyFile {
     /// block. Appending there puts the new entry before the tail without
     /// moving existing lines or changing positions in the index or problem
     /// lists. It also puts the entry after every other line for `key`, as
-    /// [`KeyLines::add`] requires.
+    /// [`KeyLines::add`] requires; its id, given last, is the largest.
     fn insert_entry(&mut self, group: &str, key: &str, locale: Option<&str>, mut line: Line) {
         // The group hashed and compared to find its blocks.
         work::count(2 * group.len());
@@ -1361,6 +1437,10 @@ impl KeyFile {
         let Some((first, number)) = found else {
             return;
         };
+        // Always an entry: `set_raw` makes it.
+        let Kind::Entry { id, .. } = line.kind else {
+            return;
+        };
         let slot = self.slot(number);
         let place = (number, self.blocks[slot].lines.len());
         self.match_line_end(place, &mut line);
@@ -1368,6 +1448,7 @@ impl KeyFile {
         work::count(1);
         self.blocks[slot].push(line);
         self.sizes.add(slot, 1);
+        self.index.set_place(id, place);
         // The key copied, hashed and compared for the entries (the key's
         // lines count the locale).
         work::count(3 * key.len());
@@ -1375,7 +1456,7 @@ impl KeyFile {
             .entries
             .entry((first, key.to_owned()))
             .or_default()
-            .add(locale, place);
+            .add(locale, id);
         // The key and locale copied for the key list (which counts the
         // rest).
         work::count(key.len() + locale.map_or(0, str::len));
@@ -1440,11 +1521,16 @@ impl KeyFile {
     }
 
     /// Removes every `key[locale]` entry from `group`; whether there was one.
-    /// The work is amortized log n per line removed, n the lines of its
-    /// block or the number of blocks, not proportional to the file: a
-    /// removed line is left in place until most of its block's lines are
-    /// removed ones, and the block is then compacted, at a step per line of
-    /// it, which the removals since its last compaction pay for.
+    /// Takes a few steps per byte of the supplied names and amortized
+    /// log n work per removed line, where n is the block's line count or
+    /// the number of blocks. The work does not otherwise grow with the file
+    /// or with the length of other lines' keys and locales.
+    ///
+    /// Removed lines stay in place until they form most of the block. The
+    /// block is then compacted at one step per line, paid for by removals
+    /// since the previous compaction. Moved lines are found by entry ID,
+    /// and the key list removes gaps using key numbers. Neither operation
+    /// hashes a key or locale again.
     pub fn remove(&mut self, group: &str, key: &str, locale: Option<&str>) -> bool {
         let Some(group) = self.group_number(group) else {
             return false;
@@ -1455,8 +1541,8 @@ impl KeyFile {
         let Some(lines) = self.index.entries.get_mut(&name) else {
             return false;
         };
-        let places = lines.remove(locale);
-        if places.is_empty() {
+        let ids = lines.remove(locale);
+        if ids.is_empty() {
             return false;
         }
         if lines.lines.is_empty() {
@@ -1473,6 +1559,11 @@ impl KeyFile {
                 self.index.keys.remove(&group);
             }
         }
+        // In file order, as the ids are.
+        let places: Vec<Place> = ids
+            .into_iter()
+            .filter_map(|id| self.index.take_place(id))
+            .collect();
         // The lines stay as removed ones, so no other place moves.
         for &(number, at) in &places {
             // A step for the line, and the line counts change.
@@ -1489,7 +1580,7 @@ impl KeyFile {
             self.sizes.sub(slot, 1);
         }
         // Places are in file order, so each block comes once.
-        let mut numbers: Vec<usize> = places.iter().map(|&(number, _)| number).collect();
+        let mut numbers: Vec<u64> = places.iter().map(|&(number, _)| number).collect();
         numbers.dedup();
         for number in numbers {
             self.tidy(number);
@@ -1504,8 +1595,9 @@ impl KeyFile {
     /// the tail; the line before the last is not a removed one; and once
     /// most of them are removed ones, the block is compacted. Log n work
     /// per line removed, n the block's lines (for their counts), and
-    /// otherwise constant amortized.
-    fn tidy(&mut self, number: usize) {
+    /// otherwise constant amortized, whatever the keys and locales of the
+    /// lines moved: their places are noted by their entries' ids.
+    fn tidy(&mut self, number: u64) {
         let slot = self.slot(number);
         let Self { blocks, index, .. } = self;
         let block = &mut blocks[slot];
@@ -1570,12 +1662,8 @@ impl KeyFile {
             block
                 .problems
                 .extend(moved.into_iter().rev().map(|problem| (to, problem)));
-            if let Kind::Entry { key, locale, .. } = &block.lines[to].kind {
-                // The key copied, hashed and compared.
-                work::count(3 * key.len());
-                if let Some(lines) = index.entries.get_mut(&(block.group, key.clone())) {
-                    lines.moved(locale.as_deref(), (number, from), (number, to));
-                }
+            if let Kind::Entry { id, .. } = block.lines[to].kind {
+                index.set_place(id, (number, to));
             }
         }
     }
@@ -1625,10 +1713,11 @@ impl KeyFile {
         // The last block is never a removed group's.
         let previous = self.blocks.len() - 1;
         let number = self.next_number;
-        self.next_number += 1;
+        self.next_number = number
+            .checked_add(1)
+            .expect("the key file's block numbers are exhausted");
         let mut block = Block {
             number,
-            group: number,
             previous: Some(self.blocks[previous].number),
             ..Block::default()
         };
@@ -1684,9 +1773,10 @@ impl KeyFile {
     /// Removes every occurrence of `group` with its lines, up to the next
     /// group; whether there was one. The work grows with the group's lines
     /// and keys, and log n per block, n the number of blocks; not with the
-    /// file. Amortized: once the emptied blocks of removed groups outnumber
-    /// the others, they are let go, at a step per block, which the removals
-    /// since they were last let go pay for.
+    /// file, nor with the names of other groups. Amortized: once the emptied
+    /// blocks of removed groups outnumber the others, they are let go, at a
+    /// step per block, which the removals since they were last let go pay
+    /// for.
     pub fn remove_group(&mut self, group: &str) -> bool {
         // Hashed and compared.
         work::count(2 * group.len());
@@ -1737,9 +1827,14 @@ impl KeyFile {
         self.index.groups.remove(&group.to_owned());
         if let Some(keys) = self.index.keys.remove(&first) {
             for (key, _) in keys.iter() {
-                // The key copied, hashed and compared.
+                // The key copied, hashed and compared; then its lines'
+                // places dropped.
                 work::count(3 * key.len());
-                self.index.entries.remove(&(first, key.clone()));
+                if let Some(lines) = self.index.entries.remove(&(first, key.clone())) {
+                    for id in lines.ids() {
+                        self.index.take_place(id);
+                    }
+                }
             }
         }
         self.changed();
@@ -1816,7 +1911,7 @@ impl KeyFile {
 pub(crate) struct Group<'a> {
     file: &'a KeyFile,
     /// The number of its first block, which names it in the index.
-    number: usize,
+    number: u64,
 }
 
 impl<'a> Group<'a> {
@@ -1844,7 +1939,17 @@ impl<'a> Group<'a> {
     /// The place of the line holding the value of `key[locale]`: the last
     /// one, as a repeated key's last value counts.
     fn find(self, key: &str, locale: Option<&str>) -> Option<Place> {
-        self.key_lines(key)?.find(locale)
+        let id = self.key_lines(key)?.find(locale)?;
+        Some(self.file.index.place(id))
+    }
+
+    /// Whether `key[locale]` exists, checked without reading its value.
+    /// Entry lines must be UTF-8, so this is true exactly when
+    /// [`Group::raw`] returns a value.
+    pub(crate) fn has(self, key: &str, locale: Option<&str>) -> bool {
+        self.key_lines(key)
+            .and_then(|lines| lines.find(locale))
+            .is_some()
     }
 
     /// The value of `key[locale]`, as [`KeyFile::raw`] gives it.
@@ -1861,9 +1966,8 @@ impl<'a> Group<'a> {
 }
 
 /// Drops the removed lines of block `number`, moving the others down and
-/// noting the new places of its entries in `index`.
-fn compact(block: &mut Block, number: usize, index: &mut Index) {
-    let group = block.group;
+/// noting the new places of its entries in `index`, by their ids.
+fn compact(block: &mut Block, number: u64, index: &mut Index) {
     let lines = std::mem::take(&mut block.lines);
     block.live = Counts::default();
     // The new place of each line, `None` for a removed one.
@@ -1876,15 +1980,10 @@ fn compact(block: &mut Block, number: usize, index: &mut Index) {
         }
         let to = block.lines.len();
         places.push(Some(to));
-        if let Kind::Entry { key, locale, .. } = &line.kind
+        if let Kind::Entry { id, .. } = line.kind
             && to != at
         {
-            // The key copied, hashed and compared. The key's earlier lines
-            // have moved already, so the places stay in order.
-            work::count(3 * key.len());
-            if let Some(lines) = index.entries.get_mut(&(group, key.clone())) {
-                lines.moved(locale.as_deref(), (number, at), (number, to));
-            }
+            index.set_place(id, (number, to));
         }
         block.push(line);
     }
@@ -1911,18 +2010,26 @@ fn classify(raw: &[u8], key_names: KeyNames) -> Line {
         }
     };
     let content = raw.strip_suffix(b"\r").unwrap_or(raw);
+    // A comment is uninterpreted and may hold any bytes, as the Desktop
+    // Entry spec says, so it is found before the line is checked for UTF-8,
+    // with a step per byte looked at.
+    let blanks = content
+        .iter()
+        .take_while(|&&byte| byte == b' ' || byte == b'\t')
+        .count();
+    work::count(blanks + 1);
+    if content.get(blanks) == Some(&b'#') {
+        return line(Kind::Comment, None);
+    }
     // A step per byte checked for UTF-8, and per character looked at to
     // find the line's parts (the spaces trimmed, the `=`).
     work::count(2 * content.len());
     let Ok(text) = std::str::from_utf8(content) else {
         return line(Kind::Invalid, Some("line is not UTF-8; ignored".to_owned()));
     };
-    let trimmed = text.trim_start_matches([' ', '\t']);
+    let trimmed = &text[blanks..];
     if trimmed.is_empty() {
         return line(Kind::Blank, None);
-    }
-    if trimmed.starts_with('#') {
-        return line(Kind::Comment, None);
     }
     if let Some(rest) = trimmed.strip_prefix('[') {
         let Some(name) = rest.trim_end_matches([' ', '\t']).strip_suffix(']') else {
@@ -1961,13 +2068,16 @@ fn classify(raw: &[u8], key_names: KeyNames) -> Line {
             key: key.to_owned(),
             locale: locale.map(str::to_owned),
             value_start: text.len() - value.len(),
+            // Given when the file is indexed.
+            id: 0,
         },
         problem,
     )
 }
 
 impl Line {
-    fn entry(text: &str, key: &str, locale: Option<&str>) -> Self {
+    /// The line `text` of a new entry `key[locale]` with the id `id`.
+    fn entry(text: &str, key: &str, locale: Option<&str>, id: u64) -> Self {
         let value_start = text.find('=').map_or(text.len(), |eq| eq + 1);
         // Looked through for the `=`, then the line, key and locale copied.
         work::count(value_start + text.len() + key.len() + locale.map_or(0, str::len));
@@ -1977,6 +2087,7 @@ impl Line {
                 key: key.to_owned(),
                 locale: locale.map(str::to_owned),
                 value_start,
+                id,
             },
             problem: None,
         }
@@ -2208,6 +2319,32 @@ mod tests {
         Name=New Window\n";
 
     #[test]
+    #[should_panic(expected = "the key file's entry ids are exhausted")]
+    fn running_out_of_entry_ids_panics() {
+        let mut file = KeyFile::parse(b"[G]\n");
+        file.index.next_id = u64::MAX;
+        let _ = file.set_string("G", "k", "v");
+    }
+
+    #[test]
+    #[should_panic(expected = "the key file's block numbers are exhausted")]
+    fn running_out_of_block_numbers_panics() {
+        let mut file = KeyFile::parse(b"[G]\n");
+        file.next_number = u64::MAX;
+        let _ = file.add_group("H");
+    }
+
+    #[test]
+    #[should_panic(expected = "the key file's list numbers are exhausted")]
+    fn running_out_of_list_numbers_panics() {
+        let mut listed = Listed::<String> {
+            next: u64::MAX,
+            ..Listed::default()
+        };
+        listed.insert("a".to_owned());
+    }
+
+    #[test]
     fn an_unchanged_file_is_written_back_byte_for_byte() {
         for text in [
             SAMPLE,
@@ -2305,6 +2442,34 @@ mod tests {
         assert_eq!(file.raw("Good", "bad key", None), Some("1"));
         let messages: Vec<_> = file.diagnostics().iter().map(|d| d.line).collect();
         assert_eq!(messages, [Some(1), Some(3), Some(5), Some(6)]);
+    }
+
+    #[test]
+    fn a_comment_that_is_not_utf8_is_a_comment() {
+        // Latin-1 and stray bytes, indented, with a carriage return, and on
+        // a last line without a line feed.
+        let text: &[u8] = b"# caf\xe9\n[A]\n \t#\xff\xfe\r\nk=v\n#\n# end \xe9";
+        let mut file = KeyFile::parse(text);
+        assert_eq!(file.to_bytes(), text);
+        assert!(file.diagnostics().is_empty(), "{:?}", file.diagnostics());
+        assert_eq!(file.raw("A", "k", None), Some("v"));
+        assert_eq!(file.comments_not_utf8(), [1, 3, 6]);
+        // Edits keep their bytes, and their lines follow.
+        file.set_string("A", "n", "1").unwrap();
+        assert!(file.remove("A", "k", None));
+        file.set_string("B", "k", "v").unwrap();
+        assert_eq!(
+            file.to_bytes(),
+            b"# caf\xe9\n[A]\n \t#\xff\xfe\r\nn=1\n#\n# end \xe9\n\n[B]\nk=v"
+        );
+        assert_eq!(file.comments_not_utf8(), [1, 3, 6]);
+        assert!(file.remove_group("A"));
+        assert_eq!(file.comments_not_utf8(), [1]);
+        assert_like_reparse(&file);
+        // A line that is not UTF-8 and not a comment is still reported.
+        let file = KeyFile::parse(b"[A]\nk=caf\xe9\n");
+        assert_eq!(file.diagnostics().len(), 1, "{:?}", file.diagnostics());
+        assert!(file.comments_not_utf8().is_empty());
     }
 
     #[test]
@@ -2658,10 +2823,11 @@ mod tests {
             },
             // A step per line added (the blank line after the group stays),
             // with the group hashed and compared and the key copied, hashed
-            // and compared for each lookup and index entry: about 187 per
-            // key; and per character of a name or value checked or escaped:
-            // about 1.5 per byte. Twice that.
-            |keys, bytes| 374 * keys + 3 * bytes,
+            // and compared for each lookup and index entry, and its line's
+            // place and its number in the key list noted: about 189 per key;
+            // and per character of a name or value checked or escaped: about
+            // 1.5 per byte. Twice that.
+            |keys, bytes| 378 * keys + 3 * bytes,
         );
     }
 
@@ -2700,12 +2866,12 @@ mod tests {
             },
             // A step per line added and per line a lookup visits, with the
             // group hashed and compared and the key and locale copied, hashed
-            // and compared for each lookup and index entry, and the locale
-            // without its encoding hashed and compared: about 469 per
-            // translation; and per character of a name, locale or value
-            // checked, looked through or unescaped: about 1 per byte. Twice
-            // that.
-            |translations, bytes| 938 * translations + 2 * bytes,
+            // and compared for each lookup and index entry, the locale
+            // without its encoding hashed and compared, and the line's place
+            // noted and looked up by its id: about 473 per translation; and
+            // per character of a name, locale or value checked, looked
+            // through or unescaped: about 1 per byte. Twice that.
+            |translations, bytes| 946 * translations + 2 * bytes,
         );
     }
 
@@ -2738,9 +2904,10 @@ mod tests {
             },
             // A step per line added, with the group hashed and compared and
             // the key copied, hashed and compared for each lookup and index
-            // entry: about 187 per key; and per character of a name or value
+            // entry, and its line's place and its number in the key list
+            // noted: about 189 per key; and per character of a name or value
             // checked or escaped: about 1.5 per byte. Twice that.
-            |keys, bytes| 374 * keys + 3 * bytes,
+            |keys, bytes| 378 * keys + 3 * bytes,
         );
     }
 
@@ -2774,9 +2941,9 @@ mod tests {
             // the group, the key copied, hashed and compared to find and drop
             // its lines and its place in the key list; with a step per line
             // removed, moved or taken off the end, per block tidied and per
-            // bit of the number of blocks for its count: about 5 per byte,
+            // bit of the number of blocks for its count: about 5.4 per byte,
             // items included. Twice that.
-            |_, bytes| 10 * bytes,
+            |_, bytes| 11 * bytes,
         );
     }
 
@@ -2815,7 +2982,7 @@ mod tests {
             // find and drop its lines and its place in the key list, and to
             // look the last key up; with a step per line removed, and per bit
             // of the line count for each line's count changed and each line
-            // number worked out: about 3.4 per byte, items included. Twice
+            // number worked out: about 3.5 per byte, items included. Twice
             // that.
             |_, bytes| 7 * bytes,
         );
@@ -2855,7 +3022,7 @@ mod tests {
             // add and drop their lines and places in the key lists and to
             // look the last key up; with a step per line added or removed,
             // and per bit of the number of blocks for each block's count
-            // changed and each block's start worked out: about 3.9 per byte,
+            // changed and each block's start worked out: about 4 per byte,
             // items included. Twice that.
             |_, bytes| 8 * bytes,
         );
@@ -2901,8 +3068,107 @@ mod tests {
             // translation, drop its line, its set and its place in the key
             // list, and to look the next one up; with a step per line
             // removed, moved down or compacted and per list entry dropped:
-            // about 5.8 per byte. Twice that.
-            |_, bytes| 12 * bytes,
+            // about 4.5 per byte. Twice that.
+            |_, bytes| 9 * bytes,
+        );
+    }
+
+    /// Removes `n` short keys, last first, from a group whose last entry,
+    /// `last` for `n`, follows them: each removal moves that entry down
+    /// into the line removed before it. Returns the steps and the bytes of
+    /// the names given.
+    fn remove_backwards_before(n: usize, last: &str) -> (usize, usize) {
+        use std::fmt::Write as _;
+        let mut text = String::from("[Desktop Entry]\n");
+        for at in 0..n {
+            let _ = writeln!(text, "K{at}=v");
+        }
+        let _ = writeln!(text, "{last}");
+        let mut file = KeyFile::parse(text.as_bytes());
+        // The bytes of the names given.
+        let mut bytes = 0;
+        let ((), steps) = work::steps(|| {
+            for at in (0..n).rev() {
+                let key = format!("K{at}");
+                bytes += "Desktop Entry".len() + key.len();
+                assert!(file.remove("Desktop Entry", &key, None));
+            }
+        });
+        assert_eq!(
+            file.to_bytes(),
+            format!("[Desktop Entry]\n{last}\n").into_bytes()
+        );
+        assert_like_reparse(&file);
+        (steps, bytes)
+    }
+
+    #[test]
+    fn removing_keys_backwards_before_a_long_last_key_stays_fast() {
+        work::assert_linear(
+            2_000,
+            // A last key as long as there are keys before it, so that work
+            // per move that grew with the key would grow quadratically.
+            |n| remove_backwards_before(n, &format!("{}=v", "L".repeat(n))),
+            // Per character of the names given: the group hashed and
+            // compared to find it, the key copied, hashed and compared to
+            // find and drop its lines and its place in the key list; with a
+            // step per line removed and moved down, per place noted by its
+            // id, and per bit of the line count for each line's count
+            // changed: about 4.2 per byte, items included. Twice that.
+            |_, bytes| 9 * bytes,
+        );
+    }
+
+    #[test]
+    fn removing_keys_backwards_before_a_long_last_locale_stays_fast() {
+        work::assert_linear(
+            2_000,
+            // A last locale as long as there are keys before it, with an
+            // encoding, so that work per move that grew with the locale or
+            // its form without the encoding would grow quadratically.
+            |n| remove_backwards_before(n, &format!("Name[{}.UTF-8]=v", "l".repeat(n))),
+            // As for a long last key: about 4.2 per byte. Twice that.
+            |_, bytes| 9 * bytes,
+        );
+    }
+
+    #[test]
+    fn compacting_a_block_moves_a_long_key_in_constant_time() {
+        use std::fmt::Write as _;
+        work::assert_linear(
+            2_000,
+            |n| {
+                // A key 32 times as long as there are keys before it, then
+                // a short one, so that it never moves down into a removed
+                // line but moves each time the block is compacted, log n
+                // times: work per move that grew with the key would
+                // overshoot the bound many times over.
+                let long = "L".repeat(32 * n);
+                let mut text = String::from("[Desktop Entry]\n");
+                for at in 0..n {
+                    let _ = writeln!(text, "K{at}=v");
+                }
+                let _ = writeln!(text, "{long}=v\nk=v");
+                let mut file = KeyFile::parse(text.as_bytes());
+                // The bytes of the names given.
+                let mut bytes = 0;
+                let ((), steps) = work::steps(|| {
+                    for at in 0..n {
+                        let key = format!("K{at}");
+                        bytes += "Desktop Entry".len() + key.len();
+                        assert!(file.remove("Desktop Entry", &key, None));
+                    }
+                });
+                assert_eq!(
+                    file.to_bytes(),
+                    format!("[Desktop Entry]\n{long}=v\nk=v\n").into_bytes()
+                );
+                assert_like_reparse(&file);
+                (steps, bytes)
+            },
+            // As for removing keys backwards, with a step per line moved when
+            // the block is compacted: about 4.6 per byte. Twice that.
+            |_, bytes| 10 * bytes,
         );
     }
 
@@ -2937,9 +3203,9 @@ mod tests {
             // the group's blocks and its place in the group list, and each
             // key copied, hashed and compared to drop its lines; with a step
             // per line, block and key dropped, and per bit of the number of
-            // blocks for each block's count: about 10.4 per byte, items
+            // blocks for each block's count: about 9.3 per byte, items
             // included. Twice that.
-            |_, bytes| 21 * bytes,
+            |_, bytes| 19 * bytes,
         );
     }
 
@@ -3030,8 +3296,82 @@ mod tests {
             // and block added, dropped, written out or looked at for its
             // problems, per block kept when the dropped ones are let go, and
             // per bit of the number of blocks for each block's count: about
-            // 14.3 per byte, items included. Twice that.
-            |_, bytes| 29 * bytes,
+            // 13.9 per byte, items included. Twice that.
+            |_, bytes| 28 * bytes,
+        );
+    }
+
+    #[test]
+    fn adding_and_removing_keys_in_turn_beside_a_long_key_stays_fast() {
+        work::assert_linear(
+            2_000,
+            |n| {
+                // A key as long as there are rounds, listed before the keys
+                // that come and go, so that work per round that grew with
+                // it would grow quadratically.
+                let long = "L".repeat(n);
+                let mut file = KeyFile::parse(format!("[Desktop Entry]\n{long}=v\n").as_bytes());
+                // The bytes of the names and values given.
+                let mut bytes = 0;
+                let ((), steps) = work::steps(|| {
+                    for at in 0..n {
+                        let key = format!("K{at}");
+                        bytes += 3 * "Desktop Entry".len() + 2 * key.len() + 1;
+                        file.set_string("Desktop Entry", &key, "v").unwrap();
+                        assert!(file.remove("Desktop Entry", &key, None));
+                        // Read in every round, so that a key list whose
+                        // gaps were never dropped would show.
+                        assert_eq!(file.keys("Desktop Entry"), [(long.as_str(), None)]);
+                    }
+                });
+                assert_like_reparse(&file);
+                (steps, bytes)
+            },
+            // Per character of the names and values given: checked, copied,
+            // hashed and compared to add the key and its line, to find it
+            // and drop them, and to find the group whose keys are read; with
+            // a step per line added, removed or taken off the end, per item
+            // or gap of the key list when its gaps are dropped or it is
+            // read, and per bit of the number of blocks for each block's
+            // count: about 5.7 per byte, items included. Twice that.
+            |_, bytes| 12 * bytes,
+        );
+    }
+
+    #[test]
+    fn adding_and_removing_groups_in_turn_beside_a_long_named_group_stays_fast() {
+        work::assert_linear(
+            2_000,
+            |n| {
+                // A group name as long as there are rounds, listed before
+                // the groups that come and go, so that work per round that
+                // grew with it would grow quadratically.
+                let long = "G".repeat(n);
+                let mut file = KeyFile::parse(format!("[{long}]\nk=v\n").as_bytes());
+                // The bytes of the names given.
+                let mut bytes = 0;
+                let ((), steps) = work::steps(|| {
+                    for at in 0..n {
+                        let group = format!("G{at}");
+                        bytes += 2 * group.len();
+                        file.add_group(&group).unwrap();
+                        assert!(file.remove_group(&group));
+                        // Read in every round, so that a group list whose
+                        // gaps were never dropped would show.
+                        assert_eq!(file.groups(), [long.as_str()]);
+                    }
+                });
+                assert_like_reparse(&file);
+                (steps, bytes)
+            },
+            // Per character of the names given: checked, copied into the
+            // header, hashed and compared to add and drop the group, its
+            // place in the group list and its block; with a step per line
+            // and block added or dropped, per item or gap of the group list
+            // when its gaps are dropped or it is read, and per bit of the
+            // number of blocks for each block's count: about 10 per byte,
+            // items included. Twice that.
+            |_, bytes| 20 * bytes,
         );
     }
 
@@ -3094,8 +3434,8 @@ mod tests {
             // place in the group list and its blocks; with a step per line
             // and block added or dropped, per block kept when the dropped
             // ones are let go, and per bit of the number of blocks for each
-            // block's count: about 12.1 per byte, items included. Twice that.
-            |_, bytes| 24 * bytes,
+            // block's count: about 11.2 per byte, items included. Twice that.
+            |_, bytes| 23 * bytes,
         );
     }
 
@@ -3124,8 +3464,8 @@ mod tests {
             // find it, and the key copied, hashed and compared to add it;
             // with a step per line added, per block looked at for the last
             // line, and per bit of the number of blocks for each block's
-            // count: about 10.9 per byte, items included. Twice that.
-            |_, bytes| 22 * bytes,
+            // count: about 11.2 per byte, items included. Twice that.
+            |_, bytes| 23 * bytes,
         );
     }
 
@@ -3173,7 +3513,7 @@ mod tests {
             // among the variants of `de_DE` and in the key list; with a step
             // per line added, removed or moved, and per level of the variants
             // of `de_DE` (log n) for each one added, found or removed: about
-            // 7.8 per byte, items and levels included (a little more at twice
+            // 7.6 per byte, items and levels included (a little more at twice
             // the size, a level more). Twice that.
             |_, bytes| 16 * bytes,
         );
@@ -3206,12 +3546,12 @@ mod tests {
             },
             // A step per line split off, read and indexed, per key listed
             // and per line a lookup visits, with the line copied, its key
-            // copied, hashed and compared to index it and to look it up, and
-            // the group hashed and compared to look it up: about 155 per
-            // key; and per character split off, checked for UTF-8, looked
-            // through for the line's parts, or of a name looked up: about 2
-            // per byte. Twice that.
-            |keys, bytes| 310 * keys + 4 * bytes,
+            // copied, hashed and compared to index it and to look it up, its
+            // place noted and looked up by its id, and the group hashed and
+            // compared to look it up: about 159 per key; and per character
+            // split off, checked for UTF-8, looked through for the line's
+            // parts, or of a name looked up: about 2 per byte. Twice that.
+            |keys, bytes| 318 * keys + 4 * bytes,
         );
     }
 
@@ -3221,8 +3561,9 @@ mod tests {
         // The steps of a clone, against a figure worked out by hand from
         // what each file is made of (see `Clone for KeyFile`): one per
         // block, line, problem, line count and slot, per group, key, locale
-        // and place in the index, per diagnostic, and per byte of each of
-        // these, the key and group lists' items twice. Each part shows in
+        // and id in the index, per entry's place, per diagnostic, and per
+        // byte of each of these, the key and group lists' items twice, with
+        // their numbers and where they are. Each part shows in
         // at least one file, so that leaving it out changes a count.
         let steps = |file: &KeyFile| {
             let (copy, steps) = work::steps(|| file.clone());
@@ -3251,10 +3592,11 @@ mod tests {
             + problems + problem_bytes // the block's problems
             + 201 // its line counts
             + 2 * 2; // slots and line counts of the blocks
-        let index = 1 + (1 + 2 * 13) // the group list
+        let index = 1 + (2 + 2 * 13) // the group list
             + (1 + 13 + 1) // the group's headers
-            + (1 + 100 + 100 * (1 + 2 * 4) + 2 * locales) // its key list
-            + (1 + 4 + 100 * (1 + 2) + locales); // the key's lines by locale
+            + (1 + 100 + 100 * (2 + 2 * 4) + 2 * locales) // its key list
+            + (1 + 4 + 100 * (1 + 2) + locales) // the key's lines by locale
+            + 200; // the entries' places
         let diagnostics = problems + problem_bytes;
         assert_eq!(steps(&file), blocks + index + diagnostics);
 
@@ -3272,10 +3614,11 @@ mod tests {
             + names + 100 // names on lines
             + 100 * 2 // their line counts: the header and the key
             + 2 * 101; // slots and line counts of the blocks
-        let index = 100 + (100 + 2 * names) // the group list
+        let index = 100 + (2 * 100 + 2 * names) // the group list
             + (100 * 2 + names) // the groups' headers
-            + 100 * (1 + 1 + (1 + 2)) // their key lists
-            + 100 * (1 + 1 + (1 + 1)); // their keys' lines
+            + 100 * (1 + 1 + (2 + 2)) // their key lists
+            + 100 * (1 + 1 + (1 + 1)) // their keys' lines
+            + 100; // the entries' places
         assert_eq!(steps(&file), blocks + index);
 
         // A file read from a path: an entry before the first group, a key
@@ -3306,13 +3649,14 @@ mod tests {
             + (2 + 4 + 1 + 2) // their line counts, up to the last entry
             + 2 * 4 // slots and line counts of the blocks
             + path_bytes;
-        let index = 2 + 2 * (1 + 2) // the group list
+        let index = 2 + 2 * (2 + 2) // the group list
             + (1 + 1 + 2) + (1 + 1 + 1) // the groups' headers
-            + (1 + 4 + (1 + 2) + (1 + 2 * 15) + (1 + 2 * 7) + (1 + 2)) // A's key list
+            + (1 + 4 + (2 + 2) + (2 + 2 * 15) + (2 + 2 * 7) + (2 + 2)) // A's key list
             + (1 + 1 + 2) // x's lines
             + (1 + 4 + (1 + 11 + 1) + (1 + 5 + 1)) // Name's, by locale and postfix
             + (1 + 7 + 2) // bad key's
-            + (1 + 1 + 2); // y's
+            + (1 + 1 + 2) // y's
+            + 4; // the places of the entries in groups
         let diagnostics = problems + problem_bytes + problems * path_bytes;
         assert_eq!(steps(&plain), blocks + index);
         assert_eq!(steps(&asked), blocks + index + diagnostics);
@@ -3338,10 +3682,11 @@ mod tests {
             + 1 + 1 // names on lines
             + 2 // its line counts
             + 2 * 2; // slots and line counts of the blocks
-        let index = 2 + (1 + 2) // the group list, with B's gap
+        let index = 2 + (2 + 2) // the group list, with B's gap
             + (1 + 1 + 1) // A's headers
-            + (1 + 1 + (1 + 2)) // its key list
-            + (1 + 1 + (1 + 1)); // k's lines
+            + (1 + 1 + (2 + 2)) // its key list
+            + (1 + 1 + (1 + 1)) // k's lines
+            + 1; // its place
         assert_eq!(steps(&file), blocks + index);
 
         // A key whose last locale is removed leaves nothing of it in the
@@ -3354,10 +3699,11 @@ mod tests {
             + 1 + 1 + 1 // names on lines
             + 2 + 1 // their line counts
             + 2 * 3; // slots and line counts of the blocks
-        let index = 2 + 2 * (1 + 2) // the group list
+        let index = 2 + 2 * (2 + 2) // the group list
             + 2 * (1 + 1 + 1) // the groups' headers
-            + (1 + 1 + (1 + 2)) // A's key list
-            + (1 + 1 + (1 + 1)); // k's lines
+            + (1 + 1 + (2 + 2)) // A's key list
+            + (1 + 1 + (1 + 1)) // k's lines
+            + 1; // its place
         assert_eq!(steps(&file), blocks + index);
     }
 
@@ -3387,10 +3733,10 @@ mod tests {
             // A step per line split off, read and indexed, with its key
             // copied, hashed and compared to index it, and each repeat's
             // message written and then copied into the diagnostics: about
-            // 136 per entry; and per character split off, checked for UTF-8
+            // 139 per entry; and per character split off, checked for UTF-8
             // or looked through for the line's parts, and of the group name
             // copied and hashed once: about 2 per byte. Twice that.
-            |entries, bytes| 272 * entries + 4 * bytes,
+            |entries, bytes| 278 * entries + 4 * bytes,
         );
     }
 

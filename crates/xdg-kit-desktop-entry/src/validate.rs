@@ -127,6 +127,15 @@ fn check_file(file: &KeyFile) -> Vec<Issue> {
         work::count(1 + diagnostic.message.len());
         v.error(diagnostic.line, diagnostic.message.clone());
     }
+    // A comment may hold any bytes; one that is not UTF-8 is warned about,
+    // as `desktop-file-validate` does.
+    for line in file.comments_not_utf8() {
+        v.push(
+            Level::Warning,
+            Some(line),
+            "the comment is not UTF-8 encoded",
+        );
+    }
     let groups = file.groups();
     match groups.first() {
         Some(&DESKTOP_ENTRY) => {}
@@ -152,8 +161,9 @@ fn check_file(file: &KeyFile) -> Vec<Issue> {
     v.issues
 }
 
-/// Line-level rules the key-file layer accepts: carriage returns and
-/// leading spaces, which `desktop-file-validate` rejects.
+/// Line-level rules the key-file layer accepts: carriage returns, and
+/// spaces or tabs before a line or after a group header, which
+/// `desktop-file-validate` rejects.
 fn check_lines(v: &mut Validator<'_>, text: &[u8]) {
     for (index, line) in text
         .split(|&byte| {
@@ -174,7 +184,7 @@ fn check_lines(v: &mut Validator<'_>, text: &[u8]) {
             v.error(number, "the line starts with a space");
         }
         let trimmed = line.strip_suffix(b"\r").unwrap_or(line);
-        if trimmed.starts_with(b"[") && trimmed.ends_with(b" ") {
+        if trimmed.starts_with(b"[") && (trimmed.ends_with(b" ") || trimmed.ends_with(b"\t")) {
             v.error(number, "a group header ends with a space");
         }
     }
@@ -392,7 +402,9 @@ fn check_key(
             v.error(line, format!("{shown}: {key} is not a localized key"));
             return;
         }
-        if found.raw(key, None).is_none() {
+        // Found without reading the untranslated value, so that the work
+        // per translation does not grow with it.
+        if !found.has(key, None) {
             v.error(
                 line,
                 format!("{shown} is translated, but there is no untranslated {key}"),
@@ -1221,6 +1233,26 @@ mod tests {
     }
 
     #[test]
+    fn a_comment_that_is_not_utf8_is_a_warning() {
+        let mut text = GOOD.as_bytes().to_vec();
+        text.extend_from_slice(b"# caf\xe9\n# fine\n  #\xff\n");
+        let issues = validate(&KeyFile::parse(&text));
+        let found: Vec<_> = issues
+            .iter()
+            .map(|issue| (issue.level, issue.line, issue.message.as_str()))
+            .collect();
+        let warning = "the comment is not UTF-8 encoded";
+        assert_eq!(
+            found,
+            [
+                (Level::Warning, Some(6), warning),
+                (Level::Error, Some(8), "the line starts with a space"),
+                (Level::Warning, Some(8), warning),
+            ]
+        );
+    }
+
+    #[test]
     fn required_keys_and_groups() {
         assert!(errors("").iter().any(|e| e.contains("empty")));
         assert!(errors("[Other]\nk=v\n")[0].contains("first group"));
@@ -1344,6 +1376,30 @@ mod tests {
         assert_eq!(exec(r#""""#), ["Exec: the command line has no program"]);
         assert_eq!(exec(r#""" foo"#), ["Exec: the command line has no program"]);
         assert!(exec(r#"foo """#).is_empty());
+    }
+
+    #[test]
+    fn a_field_code_in_the_program_is_an_error() {
+        let exec = |value: &str| {
+            errors(&format!(
+                "[Desktop Entry]\nType=Application\nName=a\nExec={value}\n"
+            ))
+        };
+        for value in ["%f", "%k --x", "a%c x"] {
+            assert_eq!(
+                exec(value),
+                ["Exec: the program's name may not contain a field code"],
+                "{value}"
+            );
+        }
+        let actions = errors(
+            "[Desktop Entry]\nType=Application\nName=a\nExec=a\nActions=n;\n\
+             [Desktop Action n]\nName=n\nExec=%U\n",
+        );
+        assert_eq!(
+            actions,
+            ["Exec: the program's name may not contain a field code"]
+        );
     }
 
     #[test]
@@ -1633,6 +1689,37 @@ mod tests {
     }
 
     #[test]
+    fn a_long_untranslated_value_with_many_translations_is_checked_in_linear_time() {
+        use std::fmt::Write as _;
+        work::assert_linear(
+            2_000,
+            |n| {
+                // An untranslated name as long as it has translations, so
+                // that work per translation that grew with it would grow
+                // quadratically.
+                let mut text = format!(
+                    "[Desktop Entry]\nType=Application\nExec=a\nName={}\n",
+                    "a".repeat(n)
+                );
+                for at in 0..n {
+                    let _ = writeln!(text, "Name[l{at}]=v");
+                }
+                let file = KeyFile::parse(text.as_bytes());
+                let (issues, steps) = work::steps(|| validate(&file));
+                assert!(issues.is_empty(), "{issues:?}");
+                (steps, text.len())
+            },
+            // A step per translation checked, with its key and locale
+            // copied, hashed and compared to find its line and the
+            // untranslated one, its locale checked and its line numbered;
+            // per line written out and checked; and per character of the
+            // values checked and unescaped: about 10.1 per byte, items
+            // included. Twice that.
+            |_, bytes| 21 * bytes,
+        );
+    }
+
+    #[test]
     fn many_interfaces_are_checked_in_linear_time() {
         use std::fmt::Write as _;
         work::assert_linear(
@@ -1759,6 +1846,20 @@ mod tests {
                 .contains("carriage return")
         );
         assert!(errors(&format!(" {GOOD}"))[0].contains("starts with a space"));
+        let action = "Actions=a;\n[Desktop Action a]\nName=A\nExec=a\n";
+        for (header, blank) in [
+            ("[Desktop Entry]", " "),
+            ("[Desktop Entry]", "\t"),
+            ("[Desktop Action a]", " "),
+            ("[Desktop Action a]", "\t"),
+        ] {
+            let text = format!("{GOOD}{action}").replacen(header, &format!("{header}{blank}"), 1);
+            let found = errors(&text);
+            assert!(
+                found == ["a group header ends with a space"],
+                "{header:?} and {blank:?}: {found:?}"
+            );
+        }
         assert!(errors(&format!("{GOOD}Name=again\n"))[0].contains("appears again"));
         let dir = tempfile::tempdir().unwrap();
         let named = |name: &str, text: &str| {

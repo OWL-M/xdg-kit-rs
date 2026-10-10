@@ -8,9 +8,10 @@ use std::sync::{Arc, Mutex};
 use xdg_kit_basedir::{BaseDirs, FileStamp};
 
 use crate::fnmatch::Pattern;
-use crate::merge::{self, Merged, Ranked};
+use crate::merge::{self, Bytes, Merged, Ranked};
 use crate::model::{Folder, Glob, MagicRule};
 use crate::read::{cache, text};
+use crate::work;
 use crate::xml::TypeInfo;
 use crate::{Diagnostic, MimeType};
 
@@ -48,6 +49,8 @@ impl Loaded {
         let stamps = std::iter::once(dir.to_owned())
             .chain(SOURCE_FILES.iter().map(|name| dir.join(name)))
             .map(|path| {
+                // The path, each byte copied by the join.
+                work::count(1 + path.as_os_str().len());
                 let stamp = FileStamp::of(&path);
                 (path, stamp)
             })
@@ -87,10 +90,66 @@ impl Loaded {
         }
     }
 
-    fn unchanged(&self) -> bool {
-        self.stamps
+    /// The folders of [`MimeDatabase::from_files`], parsed, least
+    /// important first.
+    #[cfg(any(test, fuzzing))]
+    fn in_memory(folders: &[Vec<(&str, &[u8])>]) -> Vec<Self> {
+        let mut loaded: Vec<Self> = folders
             .iter()
-            .all(|(path, stamp)| FileStamp::of(path) == *stamp)
+            .enumerate()
+            .map(|(at, files)| {
+                let dir = PathBuf::from(format!("/fuzz/{at}/mime"));
+                let mut folder = Folder::default();
+                let mut diagnostics = Vec::new();
+                for (name, bytes) in files {
+                    text::parse(name, &dir.join(name), bytes, &mut folder, &mut diagnostics);
+                }
+                // As `text::read` finishes a folder.
+                folder.max_extent = folder.magic_extent();
+                Self {
+                    dir,
+                    stamps: Vec::new(),
+                    folder: Arc::new(folder),
+                    diagnostics,
+                }
+            })
+            .collect();
+        // `assemble` takes the least important first.
+        loaded.reverse();
+        loaded
+    }
+
+    /// This folder again, as read before.
+    fn kept(&self) -> Self {
+        // Each byte copied.
+        work::count_by(|| {
+            self.dir.as_os_str().len()
+                + self
+                    .stamps
+                    .iter()
+                    .map(|(path, _)| 1 + path.as_os_str().len())
+                    .sum::<usize>()
+                + self
+                    .diagnostics
+                    .iter()
+                    .map(|diagnostic| {
+                        1 + diagnostic.path.as_os_str().len() + diagnostic.message.len()
+                    })
+                    .sum::<usize>()
+        });
+        Self {
+            dir: self.dir.clone(),
+            stamps: self.stamps.clone(),
+            folder: Arc::clone(&self.folder),
+            diagnostics: self.diagnostics.clone(),
+        }
+    }
+
+    fn unchanged(&self) -> bool {
+        self.stamps.iter().all(|(path, stamp)| {
+            work::count(1);
+            FileStamp::of(path) == *stamp
+        })
     }
 }
 
@@ -125,6 +184,9 @@ pub(crate) struct GlobIndex {
     pub(crate) literal: HashMap<String, Vec<usize>>,
     /// `*` and a literal tail: by the tail.
     pub(crate) suffix: HashMap<String, Vec<usize>>,
+    /// The lengths in bytes of the `suffix` tails, each once, shortest
+    /// first.
+    pub(crate) suffix_lens: Vec<usize>,
     /// Every other pattern, split for matching.
     pub(crate) full: Vec<(usize, Pattern)>,
     /// Each canonical type's globs, highest weight first, then the more
@@ -165,6 +227,11 @@ impl GlobIndex {
         let mut index = Self::default();
         for ranked in globs {
             let glob = &ranked.rule;
+            // The glob, and per byte of its pattern: lowercasing it (a scan
+            // and a copy) and checking the result, or copying it; finding
+            // its kind (two scans); copying it again, and counting its
+            // characters.
+            work::count(1 + 6 * glob.pattern.len());
             let compared = if glob.case_sensitive {
                 glob.pattern.clone()
             } else {
@@ -173,12 +240,19 @@ impl GlobIndex {
             };
             let at = index.all.len();
             match pattern_kind(&compared) {
-                PatternKind::Literal => index.literal.entry(compared.clone()).or_default().push(at),
-                PatternKind::Suffix => index
-                    .suffix
-                    .entry(compared[1..].to_owned())
-                    .or_default()
-                    .push(at),
+                PatternKind::Literal => {
+                    // Each byte copied, hashed and compared.
+                    work::count(3 * compared.len());
+                    index.literal.entry(compared.clone()).or_default().push(at);
+                }
+                PatternKind::Suffix => {
+                    work::count(3 * compared.len());
+                    index
+                        .suffix
+                        .entry(compared[1..].to_owned())
+                        .or_default()
+                        .push(at);
+                }
                 PatternKind::Full => index.full.push((at, Pattern::new(&compared))),
             }
             index.all.push(IndexedGlob {
@@ -191,6 +265,8 @@ impl GlobIndex {
                 folder: ranked.folder,
                 order: ranked.order,
             });
+            // The type hashed and compared.
+            work::count(2 * glob.mime.as_str().len());
             index
                 .by_type
                 .entry(merged.canonical(&glob.mime))
@@ -200,6 +276,8 @@ impl GlobIndex {
         let all = &index.all;
         for list in index.by_type.values_mut() {
             list.sort_by(|&a, &b| {
+                // Each comparison.
+                work::count(1);
                 let (a, b) = (&all[a], &all[b]);
                 b.weight
                     .cmp(&a.weight)
@@ -207,6 +285,23 @@ impl GlobIndex {
                     .then(a.order.cmp(&b.order))
             });
         }
+        index.suffix_lens = index
+            .suffix
+            .keys()
+            .map(|suffix| {
+                // Each key's length collected.
+                work::count(1);
+                suffix.len()
+            })
+            .collect();
+        index.suffix_lens.sort_unstable_by(|a, b| {
+            // Each comparison.
+            work::count(1);
+            a.cmp(b)
+        });
+        // The pass that drops repeated lengths, a step per length.
+        work::count(index.suffix_lens.len());
+        index.suffix_lens.dedup();
         index
     }
 }
@@ -247,11 +342,14 @@ fn present(candidates: &[(PathBuf, FileStamp)]) -> Vec<&Path> {
     let mut dirs: Vec<&Path> = candidates
         .iter()
         .filter_map(|(dir, _)| {
+            work::count(1);
             let metadata = fs::metadata(dir).ok().filter(fs::Metadata::is_dir)?;
             seen.insert((metadata.dev(), metadata.ino()))
                 .then_some(dir.as_path())
         })
         .collect();
+    // Each folder moved by the reversal.
+    work::count(dirs.len());
     dirs.reverse();
     dirs
 }
@@ -300,15 +398,17 @@ impl MimeDatabase {
         // Most important first, as base dirs list them; reversed below.
         // A folder listed again (the data home in `$XDG_DATA_DIRS`) is read
         // once, at its first place.
-        let mut candidates: Vec<PathBuf> = Vec::new();
-        for dir in std::iter::once(base_dirs.data_home())
+        let mut seen = HashSet::new();
+        let candidates = std::iter::once(base_dirs.data_home())
             .chain(base_dirs.data_dirs().iter().map(PathBuf::as_path))
-        {
-            let mime = dir.join("mime");
-            if !candidates.contains(&mime) {
-                candidates.push(mime);
-            }
-        }
+            .map(|dir| dir.join("mime"))
+            .filter(|mime| {
+                // Each byte copied by the join, then copied, hashed and
+                // compared.
+                work::count(1 + 4 * mime.as_os_str().len());
+                seen.insert(mime.clone())
+            })
+            .collect();
         Self::from_candidates(candidates)
     }
 
@@ -329,35 +429,14 @@ impl MimeDatabase {
     #[doc(hidden)]
     #[must_use]
     pub fn from_files(folders: &[Vec<(&str, &[u8])>]) -> Self {
-        let mut loaded: Vec<Loaded> = folders
-            .iter()
-            .enumerate()
-            .map(|(at, files)| {
-                let dir = PathBuf::from(format!("/fuzz/{at}/mime"));
-                let mut folder = Folder::default();
-                let mut diagnostics = Vec::new();
-                for (name, bytes) in files {
-                    text::parse(name, &dir.join(name), bytes, &mut folder, &mut diagnostics);
-                }
-                // As `text::read` finishes a folder.
-                folder.max_extent = folder.magic_extent();
-                Loaded {
-                    dir,
-                    stamps: Vec::new(),
-                    folder: Arc::new(folder),
-                    diagnostics,
-                }
-            })
-            .collect();
-        // `assemble` takes the least important first.
-        loaded.reverse();
-        Self::assemble(Vec::new(), loaded)
+        Self::assemble(Vec::new(), Loaded::in_memory(folders))
     }
 
     fn from_candidates(candidates: Vec<PathBuf>) -> Self {
         let stamped: Vec<(PathBuf, FileStamp)> = candidates
             .into_iter()
             .map(|dir| {
+                work::count(1);
                 let stamp = FileStamp::of(&dir);
                 (dir, stamp)
             })
@@ -372,14 +451,23 @@ impl MimeDatabase {
         let magic = merged
             .magic
             .iter()
-            .map(|ranked: &Ranked<MagicRule>| IndexedMagic {
-                mime: ranked.rule.mime.clone(),
-                matchlets: to_host(&ranked.rule.matchlets),
+            .map(|ranked: &Ranked<MagicRule>| {
+                // Each byte copied.
+                work::count_by(|| 1 + ranked.rule.bytes());
+                IndexedMagic {
+                    mime: ranked.rule.mime.clone(),
+                    matchlets: to_host(&ranked.rule.matchlets),
+                }
             })
             .collect();
         let diagnostics = folders
             .iter()
-            .flat_map(|loaded| loaded.diagnostics.iter().cloned())
+            .flat_map(|loaded| loaded.diagnostics.iter())
+            .map(|diagnostic| {
+                // Each byte copied.
+                work::count(1 + diagnostic.path.as_os_str().len() + diagnostic.message.len());
+                diagnostic.clone()
+            })
             .collect();
         Self {
             candidates,
@@ -403,10 +491,10 @@ impl MimeDatabase {
     /// size and inode can go unnoticed.
     #[must_use]
     pub fn refresh(&self) -> Option<Self> {
-        let candidates_changed = self
-            .candidates
-            .iter()
-            .any(|(dir, stamp)| FileStamp::of(dir) != *stamp);
+        let candidates_changed = self.candidates.iter().any(|(dir, stamp)| {
+            work::count(1);
+            FileStamp::of(dir) != *stamp
+        });
         let folders_changed = self.folders.iter().any(|loaded| !loaded.unchanged());
         let descriptions_changed = self
             .descriptions
@@ -414,28 +502,41 @@ impl MimeDatabase {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .values()
             .flat_map(|(_, stamps)| stamps)
-            .any(|(path, stamp)| FileStamp::of(path) != *stamp);
+            .any(|(path, stamp)| {
+                work::count(1);
+                FileStamp::of(path) != *stamp
+            });
         if !candidates_changed && !folders_changed && !descriptions_changed {
             return None;
         }
         let stamped: Vec<(PathBuf, FileStamp)> = self
             .candidates
             .iter()
-            .map(|(dir, _)| (dir.clone(), FileStamp::of(dir)))
+            .map(|(dir, _)| {
+                // Each byte copied.
+                work::count(1 + dir.as_os_str().len());
+                (dir.clone(), FileStamp::of(dir))
+            })
+            .collect();
+        let earlier: HashMap<&Path, &Loaded> = self
+            .folders
+            .iter()
+            .map(|loaded| {
+                // The folder hashed and compared.
+                work::count(1 + 2 * loaded.dir.as_os_str().len());
+                (loaded.dir.as_path(), loaded)
+            })
             .collect();
         let folders = present(&stamped)
             .into_iter()
-            .map(
-                |dir| match self.folders.iter().find(|loaded| loaded.dir == *dir) {
-                    Some(loaded) if loaded.unchanged() => Loaded {
-                        dir: loaded.dir.clone(),
-                        stamps: loaded.stamps.clone(),
-                        folder: Arc::clone(&loaded.folder),
-                        diagnostics: loaded.diagnostics.clone(),
-                    },
+            .map(|dir| {
+                // The folder looked up: hashed and compared.
+                work::count(1 + 2 * dir.as_os_str().len());
+                match earlier.get(dir) {
+                    Some(loaded) if loaded.unchanged() => loaded.kept(),
                     _ => Loaded::read(dir),
-                },
-            )
+                }
+            })
             .collect();
         Some(Self::assemble(stamped, folders))
     }
@@ -476,14 +577,14 @@ impl MimeDatabase {
     #[must_use]
     pub fn aliases(&self, mime: &MimeType) -> Vec<MimeType> {
         let canonical = self.canonical(mime);
-        let mut aliases: Vec<MimeType> = self
+        let aliases = self
             .merged
-            .aliases
-            .keys()
-            .filter(|alias| self.canonical(alias) == canonical && **alias != canonical)
+            .aliases_of
+            .get(&canonical)
             .cloned()
-            .collect();
-        aliases.sort();
+            .unwrap_or_default();
+        // The lookup, then each alias.
+        work::count(2 * canonical.as_str().len() + aliases.len());
         aliases
     }
 
@@ -491,13 +592,14 @@ impl MimeDatabase {
     #[must_use]
     pub fn parents(&self, mime: &MimeType) -> Vec<MimeType> {
         let canonical = self.canonical(mime);
-        let mut parents: Vec<MimeType> = Vec::new();
-        for parent in self.merged.parents.get(&canonical).into_iter().flatten() {
-            let parent = self.canonical(parent);
-            if !parents.contains(&parent) {
-                parents.push(parent);
-            }
-        }
+        let parents = self
+            .merged
+            .parents
+            .get(&canonical)
+            .cloned()
+            .unwrap_or_default();
+        // The lookup, then each parent.
+        work::count(2 * canonical.as_str().len() + parents.len());
         parents
     }
 
@@ -521,9 +623,14 @@ impl MimeDatabase {
         // define them as aliases of other types.
         let any_data = self.canonical(&MimeType::known("application/octet-stream"));
         let mut any_data_met = self.add_ancestors(&start, Some(&any_data), &mut seen, &mut found);
+        // Each type visited; `is_media` counts its own scan.
+        let media = |mime: &MimeType, media: &str| {
+            work::count(1);
+            mime.is_media(media)
+        };
         // Subclassing is transitive: a type with a `text/*` ancestor is
         // `text/plain` too, and so whatever `text/plain` is.
-        if start.is_media("text") || found.iter().any(|mime| mime.is_media("text")) {
+        if start.is_media("text") || found.iter().any(|mime| media(mime, "text")) {
             let text = self.canonical(&MimeType::known("text/plain"));
             if text == any_data {
                 any_data_met = true;
@@ -535,7 +642,7 @@ impl MimeDatabase {
         // Only a type that is `inode/*` through and through is not data.
         let data = any_data_met
             || !start.is_media("inode")
-            || found.iter().any(|mime| !mime.is_media("inode"));
+            || found.iter().any(|mime| !media(mime, "inode"));
         if data && seen.insert(any_data.clone()) {
             found.push(any_data.clone());
             self.add_ancestors(&any_data, None, &mut seen, &mut found);
@@ -557,6 +664,8 @@ impl MimeDatabase {
         let mut queue = VecDeque::from([start.clone()]);
         while let Some(current) = queue.pop_front() {
             for parent in self.parents(&current) {
+                // The parent compared with `held`, then hashed and compared.
+                work::count(1 + 3 * parent.as_str().len());
                 if held == Some(&parent) {
                     met = true;
                 } else if seen.insert(parent.clone()) {
@@ -573,7 +682,12 @@ impl MimeDatabase {
     #[must_use]
     pub fn is_a(&self, a: &MimeType, b: &MimeType) -> bool {
         let b = self.canonical(b);
-        self.canonical(a) == b || self.ancestors(a).contains(&b)
+        self.canonical(a) == b
+            || self.ancestors(a).iter().any(|mime| {
+                // Each ancestor compared.
+                work::count(1 + mime.as_str().len());
+                *mime == b
+            })
     }
 
     /// The icon for `mime`: the database's `icon` for it as written, else the
@@ -611,10 +725,14 @@ impl MimeDatabase {
     #[must_use]
     pub fn patterns_for(&self, mime: &MimeType) -> Vec<String> {
         let mut patterns: Vec<String> = Vec::new();
+        let mut seen: HashSet<&str> = HashSet::new();
         let found = self.globs.by_type.get(&self.canonical(mime));
         for &at in found.into_iter().flatten() {
             let pattern = &self.globs.all[at].pattern;
-            if !patterns.contains(pattern) {
+            // Hashed and compared; copied when new.
+            crate::work::count(1 + 2 * pattern.len());
+            if seen.insert(pattern) {
+                crate::work::count(pattern.len());
                 patterns.push(pattern.clone());
             }
         }
@@ -843,5 +961,186 @@ mod tests {
     fn database_is_send_and_sync() {
         fn shareable<T: Send + Sync>() {}
         shareable::<MimeDatabase>();
+    }
+
+    fn m(text: &str) -> MimeType {
+        MimeType::new(text).unwrap()
+    }
+
+    /// Assembles one folder of `files`, parsed first, and counts the steps
+    /// assembling takes.
+    fn assembled(files: &[(&str, &str)]) -> (MimeDatabase, usize) {
+        let folder: Vec<(&str, &[u8])> = files
+            .iter()
+            .map(|(name, text)| (*name, text.as_bytes()))
+            .collect();
+        let loaded = Loaded::in_memory(&[folder]);
+        work::steps(|| MimeDatabase::assemble(Vec::new(), loaded))
+    }
+
+    /// The aliases of an alias chain `text/x-a0` → `text/x-a1` → … →
+    /// `text/x-a{n}`.
+    fn chain(n: usize) -> String {
+        lines(n, |at| format!("text/x-a{at} text/x-a{}", at + 1))
+    }
+
+    /// `n` lines, each made by `line` from its number.
+    fn lines(n: usize, line: impl Fn(usize) -> String) -> String {
+        let mut text = String::new();
+        for at in 0..n {
+            text.push_str(&line(at));
+            text.push('\n');
+        }
+        text
+    }
+
+    #[test]
+    fn globs_of_a_long_alias_chain_are_indexed_in_linear_time() {
+        work::assert_linear(
+            1000,
+            |n| {
+                let aliases = chain(n);
+                let globs = lines(n, |at| format!("50:text/x-a0:*.g{at}"));
+                let (db, steps) = assembled(&[("aliases", &aliases), ("globs2", &globs)]);
+                assert_eq!(db.globs.by_type[&m(&format!("text/x-a{n}"))].len(), n);
+                (steps, aliases.len() + globs.len())
+            },
+            // Twice the analysed cost: per alias and per glob a few steps,
+            // the sort of the chain's aliases (about ten comparisons each)
+            // and the suffix lengths collected, sorted (about five
+            // comparisons each) and deduplicated, and per byte about
+            // twelve (each type looked up, hashed and compared a few
+            // times; each pattern lowercased, sorted, copied and indexed).
+            |items, bytes| 2 * (15 * items + 12 * bytes),
+        );
+    }
+
+    #[test]
+    fn the_aliases_of_a_long_alias_chain_are_listed_in_linear_time() {
+        work::assert_linear(
+            1000,
+            |n| {
+                let aliases = chain(n);
+                let (db, _) = assembled(&[("aliases", &aliases)]);
+                let end = m(&format!("text/x-a{n}"));
+                let (listed, steps) = work::steps(|| db.aliases(&end));
+                assert_eq!(listed.len(), n);
+                let (canonical, more) = work::steps(|| db.canonical(&m("text/x-a0")));
+                assert_eq!(canonical, end);
+                (steps + more, aliases.len())
+            },
+            // Twice the analysed cost: a lookup, then a step per alias.
+            |items, _| 2 * (items + 100),
+        );
+    }
+
+    #[test]
+    fn a_type_with_many_parents_is_handled_in_linear_time() {
+        work::assert_linear(
+            1000,
+            |n| {
+                let subclasses = lines(n, |at| format!("text/x-a text/x-p{at}"));
+                let (db, assembling) = assembled(&[("subclasses", &subclasses)]);
+                let a = m("text/x-a");
+                let (parents, listing) = work::steps(|| db.parents(&a));
+                assert_eq!(parents.len(), n);
+                let (ancestors, walking) = work::steps(|| db.ancestors(&a));
+                // The parents, `text/plain` and `application/octet-stream`.
+                assert_eq!(ancestors.len(), n + 2);
+                let last = m(&format!("text/x-p{}", n - 1));
+                let (is_a, checking) = work::steps(|| db.is_a(&a, &last));
+                assert!(is_a);
+                (assembling + listing + walking + checking, subclasses.len())
+            },
+            // Twice the analysed cost: per parent a few steps each time it
+            // is merged, listed, walked and compared, and per byte about
+            // twelve (hashing and comparing it, copying it).
+            |items, bytes| 2 * (8 * items + 12 * bytes),
+        );
+    }
+
+    #[test]
+    fn a_long_unclosed_bracket_glob_is_indexed_in_linear_time() {
+        work::assert_linear(
+            20_000,
+            |n| {
+                let globs = format!("50:text/x-a:{}\n", "[".repeat(n));
+                let (db, steps) = assembled(&[("globs2", &globs)]);
+                assert_eq!(db.globs.full.len(), 1);
+                (steps, globs.len())
+            },
+            // Twice the analysed cost: per byte about twenty, eleven to
+            // merge and index the pattern (copying, lowercasing, sorting,
+            // hashing) and about four for each of its two parses (as
+            // characters and as bytes).
+            |_, bytes| 2 * (100 + 20 * bytes),
+        );
+    }
+
+    #[test]
+    fn many_data_folders_are_loaded_in_linear_time() {
+        let home = tempfile::tempdir().unwrap();
+        work::assert_linear(
+            2000,
+            |n| {
+                // The data home listed again among the data folders, last.
+                let data_home = home.path().join(".local/share");
+                let list: Vec<String> = (0..n)
+                    .map(|at| format!("/nonexistent/d{at}"))
+                    .chain(std::iter::once(data_home.to_str().unwrap().to_owned()))
+                    .collect();
+                let list = list.join(":");
+                let base_dirs = BaseDirs::from_vars(|name| match name {
+                    "HOME" => Some(home.path().as_os_str().to_owned()),
+                    "XDG_DATA_DIRS" => Some(list.clone().into()),
+                    _ => None,
+                })
+                .unwrap();
+                let (db, steps) = work::steps(|| MimeDatabase::load(&base_dirs));
+                let candidates: Vec<PathBuf> =
+                    db.candidates.iter().map(|(dir, _)| dir.clone()).collect();
+                // The data home first and once, then the rest in order.
+                let expected: Vec<PathBuf> = std::iter::once(data_home.join("mime"))
+                    .chain((0..n).map(|at| PathBuf::from(format!("/nonexistent/d{at}/mime"))))
+                    .collect();
+                assert_eq!(candidates, expected);
+                (steps, list.len())
+            },
+            // Twice the analysed cost: per folder a few steps (joined,
+            // checked for a repeat, stamped, looked for), and per byte four
+            // (copied by the join, then copied, hashed and compared).
+            |items, bytes| 2 * (4 * items + 4 * (bytes + 5 * items)),
+        );
+    }
+
+    #[test]
+    fn many_folders_are_refreshed_in_linear_time() {
+        let root = tempfile::tempdir().unwrap();
+        work::assert_linear(
+            300,
+            |n| {
+                let dirs: Vec<PathBuf> = (0..n)
+                    .map(|at| {
+                        let dir = root.path().join(format!("{n}/d{at}"));
+                        fs::create_dir_all(&dir).unwrap();
+                        dir
+                    })
+                    .collect();
+                let db = MimeDatabase::from_dirs(&dirs);
+                fs::write(dirs[0].join("aliases"), b"text/x-a text/x-b\n").unwrap();
+                let (refreshed, steps) = work::steps(|| db.refresh());
+                let refreshed = refreshed.expect("a folder changed");
+                assert_eq!(refreshed.dirs().len(), n);
+                assert_eq!(refreshed.canonical(&m("text/x-a")), m("text/x-b"));
+                let bytes = dirs.iter().map(|dir| dir.as_os_str().len()).sum();
+                (steps, bytes)
+            },
+            // Twice the analysed cost: per folder about 150 steps (its
+            // twelve stamps checked twice and copied with the file names
+            // in their paths), and per byte of its path eighteen (copied
+            // for each of its thirteen paths and as a candidate, hashed
+            // and compared twice).
+            |items, bytes| 2 * (150 * items + 18 * bytes),
+        );
     }
 }

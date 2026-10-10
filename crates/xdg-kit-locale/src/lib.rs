@@ -19,8 +19,11 @@
 //! assert_eq!(keys, ["de_DE@euro", "de_DE", "de@euro", "de"]);
 //! ```
 
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fmt;
+
+mod work;
 
 /// One language: `lang`, optionally with a country and a modifier, as in
 /// `sr_RS@latin`. The encoding of a POSIX locale name is not kept.
@@ -38,6 +41,9 @@ impl Locale {
     /// language.
     #[must_use]
     pub fn parse(name: &str) -> Option<Self> {
+        // A step per byte for each of the three splits, the check of its
+        // parts and their copies.
+        work::count(1 + 5 * name.len());
         let (rest, modifier) = match name.split_once('@') {
             Some((rest, modifier)) => (rest, Some(modifier)),
             None => (name, None),
@@ -84,6 +90,13 @@ impl Locale {
         self.modifier.as_deref()
     }
 
+    /// The bytes of its parts.
+    fn len(&self) -> usize {
+        self.lang.len()
+            + self.country.as_ref().map_or(0, String::len)
+            + self.modifier.as_ref().map_or(0, String::len)
+    }
+
     /// The keys to try for this language, most specific first, as the
     /// Desktop Entry spec orders them.
     fn variants(&self) -> Vec<String> {
@@ -100,6 +113,8 @@ impl Locale {
             (None, None) => {}
         }
         keys.push(lang.clone());
+        // A step per byte of each key made.
+        work::count(keys.iter().map(String::len).sum());
         keys
     }
 }
@@ -146,23 +161,32 @@ impl Locales {
     /// nothing is translated.
     #[must_use]
     pub fn from_vars(vars: impl Fn(&str) -> Option<OsString>) -> Self {
-        let value = |name: &str| {
-            vars(name)
-                .and_then(|value| value.into_string().ok())
-                .filter(|value| !value.is_empty())
-        };
         let set = ["LC_ALL", "LC_MESSAGES", "LANG"]
             .into_iter()
             .find_map(|name| vars(name).filter(|value| !value.is_empty()));
+        // A step per byte of the locale checked for UTF-8 (in place, not
+        // copied).
+        work::count(set.as_ref().map_or(0, |value| 1 + value.len()));
         let Some(locale) = set.and_then(|value| value.into_string().ok()) else {
             return Self::untranslated();
         };
         let base = locale.split(['.', '@']).next().unwrap_or_default();
+        // A step per byte the split looks at: up to and including the
+        // first `.` or `@`.
+        work::count(1 + base.len());
         if base == "C" || base == "POSIX" {
             return Self::untranslated();
         }
-        match value("LANGUAGE") {
+        let language = vars("LANGUAGE");
+        // A step per byte checked for UTF-8, whether it is or not.
+        work::count(language.as_ref().map_or(0, |value| value.len()));
+        match language
+            .and_then(|value| value.into_string().ok())
+            .filter(|value| !value.is_empty())
+        {
             Some(languages) => {
+                // A step per byte split.
+                work::count(languages.len());
                 Self::new(languages.split(':').take_while(|name| {
                     !(*name == "C" || name.starts_with("C.") || *name == "POSIX")
                 }))
@@ -174,18 +198,24 @@ impl Locales {
     /// The given languages, most preferred first. Names that cannot be
     /// parsed, and repeats, are skipped.
     pub fn new(names: impl IntoIterator<Item = impl AsRef<str>>) -> Self {
+        // Each kept in order, and once: a set of those seen beside each.
         let mut locales: Vec<Locale> = Vec::new();
+        let mut seen: HashSet<Locale> = HashSet::new();
         for locale in names
             .into_iter()
             .filter_map(|name| Locale::parse(name.as_ref()))
         {
-            if !locales.contains(&locale) {
+            // Cloned, hashed and compared: three steps per byte.
+            work::count(1 + 3 * locale.len());
+            if seen.insert(locale.clone()) {
                 locales.push(locale);
             }
         }
         let mut keys: Vec<String> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
         for key in locales.iter().flat_map(Locale::variants) {
-            if !keys.contains(&key) {
+            work::count(1 + 3 * key.len());
+            if seen.insert(key.clone()) {
                 keys.push(key);
             }
         }
@@ -311,6 +341,70 @@ mod tests {
             assert_eq!(Locale::parse(bad), None, "{bad:?}");
         }
         assert_eq!(keys(&Locales::new(["", "de/x", "es"])), ["es"]);
+    }
+
+    #[test]
+    fn many_languages_are_read_in_linear_time() {
+        // `n` names in `LANGUAGE`, each given twice: plain (`l7`), full
+        // (`l7_C7.UTF-8@m7`), or full with one country (`l7_C@m7`), whose
+        // fallback keys `l7` and `l7_C` repeat; and one long full name, `n`
+        // bytes in each part.
+        let kinds: [fn(usize) -> String; 3] = [
+            |at| format!("l{at}"),
+            |at| format!("l{at}_C{at}.UTF-8@m{at}"),
+            |at| format!("l{}_C@m{at}", at % 7),
+        ];
+        for name in kinds {
+            work::assert_linear(
+                2_000,
+                |n| {
+                    let mut names: Vec<String> = (0..n).chain(0..n).map(name).collect();
+                    let long = |part: &str| part.repeat(n);
+                    names.push(format!("{}_{}@{}", long("L"), long("C"), long("M")));
+                    let language = names.join(":");
+                    let (locales, steps) =
+                        work::steps(|| from(&[("LANG", "en_US"), ("LANGUAGE", &language)]));
+                    assert_eq!(locales.locales().len(), n + 1);
+                    (steps, language.len())
+                },
+                // Per name (`2 * n + 1`) two steps (and `LANG`, the same
+                // at each size, checked for UTF-8 and split: a few more).
+                // Per byte of `LANGUAGE`
+                // about 15: checked and split (2), parsed (5), each locale
+                // cloned, hashed and compared (3), its keys made and each
+                // key cloned, hashed and compared (about 4 per byte of the
+                // name, more for a full name). Twice that is allowed.
+                |n, bytes| 2 * (2 * (2 * n + 1) + 15 * bytes),
+            );
+        }
+    }
+
+    #[test]
+    fn a_long_language_that_is_not_utf8_is_checked_in_linear_time() {
+        use std::os::unix::ffi::OsStringExt;
+        work::assert_linear(
+            2_000,
+            |n| {
+                let mut language = b"fr:".repeat(n);
+                language.push(0xff);
+                let bytes = language.len();
+                let vars = |name: &str| match name {
+                    "LANG" => Some("en_US".into()),
+                    "LANGUAGE" => Some(OsString::from_vec(language.clone())),
+                    _ => None,
+                };
+                let (locales, steps) = work::steps(|| Locales::from_vars(vars));
+                // Not UTF-8: as if unset, so the locale gives the language.
+                assert_eq!(keys(&locales), ["en_US", "en"]);
+                // At least a step per byte checked for UTF-8.
+                assert!(steps >= bytes, "{steps} steps for {bytes} bytes");
+                (steps, bytes)
+            },
+            // Per byte of `LANGUAGE` a step, checked for UTF-8, and `LANG`
+            // (the same at each size) checked, split and parsed: under a
+            // hundred steps. Twice that is allowed.
+            |_, bytes| 2 * (bytes + 100),
+        );
     }
 
     #[test]

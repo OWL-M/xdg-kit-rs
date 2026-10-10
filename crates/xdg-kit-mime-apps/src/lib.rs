@@ -57,20 +57,32 @@ pub use pattern::{MediaType, TypePattern};
 /// compared, each lookup), and each character a scan of a key or ID looks
 /// at, whether the loop is written here or is a library call such as
 /// `contains` or `trim` (counted by the bytes it may walk). So does each
-/// character of input text copied (`to_owned`, `clone`, `format!`, a type
-/// made from text), hashed (a set or map key inserted or looked up: hashed
-/// and compared, two steps per byte) or compared with other input, and each
-/// byte of a message that input is written into. Comparing with a fixed
-/// name (a literal) is bounded by that name and not counted; nor is file
-/// I/O. A new loop over input on such a path must count its steps too.
+/// character of input text copied (`to_owned`, `clone`, `format!`, a
+/// media type made from text), hashed (a set or map key inserted or looked
+/// up: hashed and compared, two steps per byte) or compared with other
+/// input, and each byte of a message that input is written into. Comparing
+/// with a fixed name (a literal) is bounded by that name and not counted;
+/// nor is file I/O. A new loop over input on such a path must count its
+/// steps too.
 ///
 /// There is one counter, the key file's: in tests this crate counts on the
 /// counter of `xdg-kit-desktop-entry`, which its dev-dependency compiles in
 /// with the hidden `__count-work` feature (not public API). So the steps
 /// counted here include those inside the key file (reading, listing keys,
 /// splitting values, finding lines, editing, copying), which that crate
-/// counts by the same rules; a type's checks in `xdg-kit-mime` are counted
-/// where they are called.
+/// counts by the same rules (decision 73), and those of
+/// [`AppIndex`](xdg_kit_desktop_entry::AppIndex) listing its folders and
+/// giving out entries (`dirs`, `get`, `iter`), each entry with its ID and
+/// path copied, and their lookups by ID (`get`, `dir_of`; decisions 140
+/// and 144); this crate does not count them again.
+///
+/// This crate counts only its own work (decision 140). `xdg-kit-mime`
+/// counts its internals in its own tests: creating and checking types,
+/// looking up aliases, finding ancestors and finding a type's media part.
+/// Each call into that crate counts as one step here. Processing its
+/// results, such as comparing or copying each ancestor, is counted here
+/// too. A [`MimeType`](xdg_kit_mime::MimeType) is an `Arc`, so copying one
+/// counts as one step regardless of its length.
 pub(crate) mod work {
     /// Counts `steps` steps on this thread, on the key file's counter.
     #[inline]

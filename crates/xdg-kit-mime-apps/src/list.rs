@@ -169,6 +169,8 @@ impl MimeAppsList {
     pub fn open(path: impl Into<PathBuf>) -> io::Result<Self> {
         // Absolute now, so that a later change of folder does not move it.
         let path = std::path::absolute(path.into())?;
+        // Each byte of the path copied.
+        work::count(path.as_os_str().len());
         let desktop_specific = path.file_name().is_some_and(|name| name != MIMEAPPS_LIST);
         let file = match KeyFile::read_with(&path, KeyNames::Any) {
             Ok(file) => file,
@@ -309,11 +311,12 @@ impl MimeAppsList {
     }
 
     fn resolve(&self, pattern: &TypePattern) -> TypePattern {
-        // Hashed and compared to look up an alias, and copied.
-        work::count(1 + 3 * pattern.text_len());
-        match &self.database {
-            Some(database) => pattern.canonical(database),
-            None => pattern.clone(),
+        // Its alias looked up (`TypePattern::canonical` counts), or copied.
+        if let Some(database) = &self.database {
+            pattern.canonical(database)
+        } else {
+            work::count(pattern.clone_steps());
+            pattern.clone()
         }
     }
 
@@ -1037,13 +1040,15 @@ mod tests {
                 let conflicts = if resolving { n } else { n / 2 };
                 assert_eq!(found.len(), conflicts, "{:?}", found.first());
                 // Per type: about 14 steps for its keys and IDs looked at,
-                // gathered and looked up; and about 18 per byte of the text,
-                // each key and ID checked, copied, hashed and compared a few
-                // times, here and in the key file (listing the keys,
-                // splitting the values, finding the lines reported). Twice
-                // that is allowed.
+                // gathered and looked up (making its type and looking up
+                // its alias are calls into `xdg-kit-mime`, a step each);
+                // and about 14.5 per byte of the text, each key and ID
+                // checked, copied, hashed and compared a few times, here
+                // and in the key file (listing the keys, splitting the
+                // values, finding the lines reported). Twice that is
+                // allowed.
                 let bytes = text.len();
-                (steps, 2 * (14 * n + 18 * bytes))
+                (steps, 2 * 14 * n + 29 * bytes)
             };
             work::assert_linear("diagnostics", steps(2_000), steps(4_000));
         }
@@ -1141,9 +1146,10 @@ mod tests {
             // hashed or compared, here and in the key file (values split and
             // unescaped, lines found, written and their keys looked up), and
             // per byte of the messages, which show at most 32 characters of
-            // one: about 43 per byte of the text, which has 7 long items.
-            // Twice that is allowed.
-            (steps, 2 * 43 * text.len())
+            // one: about 41 per byte of the text, which has 7 long items
+            // (a long key made a type is a call into `xdg-kit-mime`, a
+            // step). Twice that is allowed.
+            (steps, 2 * 41 * text.len())
         };
         work::assert_linear("long values", steps(1 << 19), steps(1 << 20));
     }
@@ -1166,16 +1172,17 @@ mod tests {
                 }
             });
             assert_eq!(list.ids(Group::Added, &types[n - 1]), ["b.desktop"]);
-            // Per edit, about 44 steps per byte of the type and ID, as the
-            // type is copied, hashed and compared and the IDs read, copied,
-            // hashed and compared a few times each, here and in the key file
-            // (the entry's line found, split, escaped and written, its key
-            // looked up and indexed). Twice that is allowed.
+            // Per edit, about 36 steps per byte of the type and ID, as the
+            // type is hashed and compared (its copies are `Arc`s, a step
+            // each) and the IDs read, copied, hashed and compared a few
+            // times each, here and in the key file (the entry's line found,
+            // split, escaped and written, its key looked up and indexed).
+            // Twice that is allowed.
             let bytes: usize = types
                 .iter()
                 .map(|pattern| 4 * (pattern.to_string().len() + "a.desktop".len()))
                 .sum();
-            (steps, 2 * 44 * bytes)
+            (steps, 2 * 36 * bytes)
         };
         work::assert_linear("edits", steps(1_000), steps(2_000));
     }

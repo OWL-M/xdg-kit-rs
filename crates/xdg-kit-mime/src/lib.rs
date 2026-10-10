@@ -32,6 +32,7 @@ mod mime_type;
 mod model;
 mod read;
 mod tree;
+mod work;
 mod xml;
 
 pub use database::MimeDatabase;

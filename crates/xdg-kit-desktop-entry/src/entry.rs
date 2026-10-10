@@ -1,6 +1,7 @@
 //! A desktop entry: the typed view of a key file (Desktop Entry spec
 //! "Recognized desktop entry keys", "Additional applications actions").
 
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::io;
 use std::path::Path;
@@ -50,13 +51,20 @@ impl EntryType {
 pub struct Desktops(Vec<String>);
 
 impl Desktops {
-    /// The given desktop names.
+    /// The given desktop names, skipping empty names and keeping only the
+    /// first occurrence of each name.
     pub fn new(names: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        let mut seen = HashSet::new();
         Self(
             names
                 .into_iter()
                 .map(Into::into)
-                .filter(|name: &String| !name.is_empty())
+                .filter(|name: &String| {
+                    // The repeat check: a step, and the name copied, hashed
+                    // and compared.
+                    work::count(1 + 3 * name.len());
+                    !name.is_empty() && seen.insert(name.clone())
+                })
                 .collect(),
         )
     }
@@ -150,20 +158,41 @@ fn parse_boolean(value: &str) -> Option<bool> {
 /// Whether `OnlyShowIn`/`NotShowIn` let an entry be shown on `desktops`:
 /// each desktop in turn, a match in `OnlyShowIn` shows it and a match in
 /// `NotShowIn` hides it; with no match, shown unless `OnlyShowIn` is set.
+/// The lists are made sets first, so the work grows with the desktops and
+/// names, not with their product.
 pub(crate) fn shown(
     only_show_in: Option<&[String]>,
     not_show_in: Option<&[String]>,
     desktops: &Desktops,
 ) -> bool {
+    let (only_show_in, not_show_in) = (name_set(only_show_in), name_set(not_show_in));
+    let has = |set: &Option<HashSet<&str>>, desktop: &str| {
+        // Hashed and compared.
+        work::count(1 + 2 * desktop.len());
+        set.as_ref().is_some_and(|set| set.contains(desktop))
+    };
     for desktop in desktops.names() {
-        if only_show_in.is_some_and(|list| list.contains(desktop)) {
+        if has(&only_show_in, desktop) {
             return true;
         }
-        if not_show_in.is_some_and(|list| list.contains(desktop)) {
+        if has(&not_show_in, desktop) {
             return false;
         }
     }
     only_show_in.is_none()
+}
+
+/// The names of a show list as a set.
+fn name_set(list: Option<&[String]>) -> Option<HashSet<&str>> {
+    list.map(|list| {
+        list.iter()
+            .map(|name| {
+                // Hashed and compared.
+                work::count(1 + 2 * name.len());
+                name.as_str()
+            })
+            .collect()
+    })
 }
 
 /// A desktop entry (`.desktop` or `.directory` file), read with every line
@@ -416,11 +445,13 @@ impl DesktopEntry {
         self.list("Implements").unwrap_or_default()
     }
 
-    /// `Keywords`, translated.
+    /// `Keywords`, translated. In a file before version 1.0, a value
+    /// without `;` is split at commas, as [`DesktopEntry::list`] does.
     #[must_use]
     pub fn keywords(&self, locales: &Locales) -> Vec<String> {
         self.file
-            .locale_list(self.main_group(), "Keywords", locales)
+            .locale_raw(self.main_group(), "Keywords", locales)
+            .map(|raw| list_items(raw, self.before_1_0()))
             .unwrap_or_default()
     }
 
@@ -633,6 +664,57 @@ mod tests {
             (name == "XDG_CURRENT_DESKTOP").then(|| "ubuntu:GNOME".into())
         });
         assert_eq!(from_env.names(), ["ubuntu", "GNOME"]);
+        let repeated = Desktops::from_vars(|name| {
+            (name == "XDG_CURRENT_DESKTOP").then(|| "GNOME:ubuntu:GNOME::KDE:ubuntu".into())
+        });
+        assert_eq!(
+            repeated.names(),
+            ["GNOME", "ubuntu", "KDE"],
+            "the first kept"
+        );
+    }
+
+    #[test]
+    fn many_desktops_against_long_show_lists_take_linear_time() {
+        use std::fmt::Write as _;
+        work::assert_linear(
+            2_000,
+            |n| {
+                // `n` names in each list and `n` desktops, none matching, and
+                // a long name in each that differs from the others only at
+                // its end.
+                let long = "X-Long".to_owned() + &"g".repeat(n);
+                let (mut only, mut not) = (String::new(), String::new());
+                for at in 0..n {
+                    let _ = write!(only, "X-Only{at};");
+                    let _ = write!(not, "X-Not{at};");
+                }
+                let text = format!(
+                    "[Desktop Entry]\nType=Application\nName=a\nExec=a\nOnlyShowIn={only}{long}1;\nNotShowIn={not}{long}2;\n"
+                );
+                let entry = DesktopEntry::parse(text.as_bytes());
+                // Each desktop named twice.
+                let names: Vec<String> = (0..2 * n)
+                    .map(|at| format!("X-Desk{}", at % n))
+                    .chain([format!("{long}3"), format!("{long}3")])
+                    .collect();
+                let bytes = text.len() + names.iter().map(String::len).sum::<usize>();
+                let (shown, steps) = work::steps(|| {
+                    let desktops = Desktops::new(names);
+                    assert_eq!(desktops.names().len(), n + 1);
+                    entry.shown_in(&desktops)
+                });
+                assert!(!shown);
+                (steps, bytes)
+            },
+            // A step per name split off a list and put in a set, and per
+            // desktop checked for repeats and looked up: under 1 per item; and
+            // per character of the lists split and unescaped, of the names
+            // hashed into the sets, and of the desktops copied and hashed for
+            // the repeat check and hashed in two lookups: about 5 per byte.
+            // Twice that.
+            |items, bytes| 2 * items + 10 * bytes,
+        );
     }
 
     #[test]
@@ -646,6 +728,20 @@ mod tests {
         assert!(old.terminal());
         let new = DesktopEntry::parse(b"[Desktop Entry]\nVersion=1.5\nMimeType=a/b,c;\n");
         assert_eq!(new.mime_types(), ["a/b,c"], "commas are kept from 1.0 on");
+    }
+
+    #[test]
+    fn keywords_of_old_files_are_split_at_commas() {
+        let old = DesktopEntry::parse(
+            b"[Desktop Entry]\nVersion=0.9.8\nType=Application\nName=Foo\nExec=foo\nKeywords=one,two\nKeywords[de]=eins,zwei\n",
+        );
+        assert_eq!(old.keywords(&Locales::untranslated()), ["one", "two"]);
+        assert_eq!(old.keywords(&Locales::new(["de_DE"])), ["eins", "zwei"]);
+        let new = DesktopEntry::parse(
+            b"[Desktop Entry]\nVersion=1.5\nKeywords=one,two\nKeywords[de]=a\\;b,c;\n",
+        );
+        assert_eq!(new.keywords(&Locales::untranslated()), ["one,two"]);
+        assert_eq!(new.keywords(&Locales::new(["de_DE"])), ["a;b,c"]);
     }
 
     #[test]

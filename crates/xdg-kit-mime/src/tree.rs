@@ -12,6 +12,7 @@ use rustix::fs::{Access, AtFlags, Dir, FileType, Mode, OFlags};
 use rustix::io::Errno;
 
 use crate::model::{TreeKind, TreeMatchlet};
+use crate::work::count;
 use crate::{MimeDatabase, MimeType};
 
 /// Options for [`MimeDatabase::content_types_for_root`]. None yet; it exists
@@ -776,6 +777,9 @@ impl MimeDatabase {
         root_path: &Path,
         matchlet: &TreeMatchlet,
     ) -> bool {
+        // The rule path, split into its components; the lookups themselves
+        // are file I/O, bounded per rule path by `MAX_LOOKUPS`.
+        count(1 + matchlet.path.len());
         any_path(
             root,
             root_path,
@@ -863,10 +867,13 @@ impl MimeDatabase {
         let root_path = root.as_ref();
         let root = open_folder(rustix::fs::CWD, root_path)?;
         let mut types: Vec<MimeType> = Vec::new();
+        let mut kept: HashSet<MimeType> = HashSet::new();
         for ranked in &self.merged.tree {
             let rule = &ranked.rule;
             let mime = self.canonical(&rule.mime);
-            if types.contains(&mime) {
+            // Hashed and compared.
+            count(1 + 2 * mime.as_str().len());
+            if kept.contains(&mime) {
                 continue;
             }
             if rule
@@ -874,6 +881,9 @@ impl MimeDatabase {
                 .iter()
                 .any(|matchlet| self.tree_matchlet_matches(root.as_fd(), root_path, matchlet))
             {
+                // Copied, hashed and compared.
+                count(3 * mime.as_str().len());
+                kept.insert(mime.clone());
                 types.push(mime);
             }
         }
@@ -1068,6 +1078,15 @@ mod tests {
     fn folders_are_placed_on_linux() {
         use std::os::unix::fs::PermissionsExt;
 
+        /// Gives the folder back its usual mode when dropped (before
+        /// `root`, also on a panic), so that `root` can be removed.
+        struct Readable<'a>(&'a Path);
+        impl Drop for Readable<'_> {
+            fn drop(&mut self) {
+                let _ = fs::set_permissions(self.0, fs::Permissions::from_mode(0o755));
+            }
+        }
+
         let root = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink(".", root.path().join("link")).unwrap();
         // A folder that can be read is opened for reading.
@@ -1077,6 +1096,7 @@ mod tests {
         // One that can only be searched, for lookups only.
         let search_only = root.path().join("search-only");
         fs::create_dir(&search_only).unwrap();
+        let _readable = Readable(&search_only);
         fs::set_permissions(&search_only, fs::Permissions::from_mode(0o111)).unwrap();
         if fs::read_dir(&search_only).is_ok() {
             eprintln!("folder permissions are not enforced here (root?): O_PATH not checked");
@@ -1176,6 +1196,30 @@ mod tests {
             );
             assert_eq!(given, [root.as_os_str()], "{rule_path:?}");
         }
+    }
+
+    #[test]
+    fn the_types_of_a_root_are_gathered_in_linear_work() {
+        // `n` rules of their own types, each matching `f` at the root.
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("f"), "").unwrap();
+        let run = |n: usize| {
+            let mut text = b"MIME-TreeMagic\0\n".to_vec();
+            for at in 0..n {
+                text.extend_from_slice(format!("[50:x-content/t{at}]\n>\"f\"=file\n").as_bytes());
+            }
+            let db = MimeDatabase::from_files(&[vec![("treemagic", &text)]]);
+            let (found, steps) = crate::work::steps(|| {
+                db.content_types_for_root(root.path(), &TreeOptions::default())
+            });
+            assert_eq!(found.unwrap().len(), n);
+            (steps, text.len())
+        };
+        // Per rule: a few steps and its path, and its type made canonical
+        // (hashed and compared), looked up among the kept, then kept
+        // (copied, hashed and compared): seven steps per byte of the type,
+        // under half of each rule's bytes.
+        crate::work::assert_linear(1_000, run, |items, bytes| 2 * (3 * items + 7 * bytes / 2));
     }
 
     #[test]
@@ -1532,18 +1576,41 @@ mod tests {
             && limit.maximum.is_none_or(|most| most >= wanted)
     }
 
-    /// The walk of `rule_path` from `root` with [`MAX_OPEN_FOLDERS`] handles
-    /// and with as many as it wants: they find the same and take the same
-    /// lookups, and the first stays within the bound on reopens
-    /// ([`MAX_REOPENS`]). Gives whether it found the path, its lookups and
-    /// its reopens; `None` where the system does not allow the handles the
-    /// second needs.
-    fn against_unlimited(root: &Path, rule_path: &str) -> Option<(bool, usize, usize)> {
-        let levels = Path::new(rule_path).iter().count();
-        if !allow_open(u64::try_from(levels).unwrap() + 64) {
-            eprintln!("cannot open {levels} files at once here: not compared");
+    /// Serializes tests that open many handles or would fail if none were
+    /// available, preventing parallel tests from exhausting the shared
+    /// open-file limit. Acquired before creating the test volume: removing
+    /// a deep volume also needs a handle for each level.
+    static MANY_HANDLES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn many_handles() -> std::sync::MutexGuard<'static, ()> {
+        MANY_HANDLES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The walk of the rule path that `volume` makes in a new temporary
+    /// folder, `levels` levels then `f` (as [`dead_ends`] and [`climb`]
+    /// do), with [`MAX_OPEN_FOLDERS`] handles and with as many as it
+    /// wants: they find the same and take the same lookups, and the first
+    /// stays within the bound on reopens ([`MAX_REOPENS`]). Gives whether
+    /// it found the path, its lookups and its reopens; `None` where the
+    /// system does not allow the handles the second needs, and then the
+    /// volume is not made (it could not be removed either: removing it
+    /// holds a handle for each level). Callers hold [`many_handles`].
+    fn against_unlimited(
+        levels: usize,
+        volume: impl FnOnce(&Path, usize) -> String,
+    ) -> Option<(bool, usize, usize)> {
+        let components = levels + 1;
+        if !allow_open(u64::try_from(components).unwrap() + 64) {
+            eprintln!("cannot open {components} files at once here: not compared");
             return None;
         }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let rule_path = volume(root, levels);
+        let rule_path = rule_path.as_str();
+        assert_eq!(Path::new(rule_path).iter().count(), components);
         let unlimited = Setup {
             most_open: usize::MAX,
             ..two_handles()
@@ -1597,17 +1664,15 @@ mod tests {
         // it started from, near and kept, and the levels before have no
         // names left. (Which handles are closed first is checked in
         // `a_handle_whose_folder_has_no_names_left_is_closed_first`.)
-        let root = tempfile::tempdir().unwrap();
-        let rule_path = dead_ends(root.path(), 1_600, 2);
-        let found = against_unlimited(root.path(), &rule_path);
+        let _many = many_handles();
+        let two_deep = |root: &Path, levels| dead_ends(root, levels, 2);
+        let found = against_unlimited(1_600, two_deep);
         assert!(
             found.is_none_or(|found| found == (true, 9_600, 0)),
             "{found:?}"
         );
         // 1,700 levels: the lookups run out, with unlimited handles too.
-        let root = tempfile::tempdir().unwrap();
-        let rule_path = dead_ends(root.path(), 1_700, 2);
-        let found = against_unlimited(root.path(), &rule_path);
+        let found = against_unlimited(1_700, two_deep);
         assert!(
             found.is_none_or(|(found, lookups, _)| !found && lookups == MAX_LOOKUPS),
             "{found:?}"
@@ -1618,13 +1683,10 @@ mod tests {
     fn climbing_back_level_by_level_finds_what_unlimited_handles_find() {
         // Every level on the way down has a name left to try, so the walk
         // goes back to each, with at most 16 handles for 1,600 levels.
-        let root = tempfile::tempdir().unwrap();
-        let rule_path = climb(root.path(), 1_600);
-        let found = against_unlimited(root.path(), &rule_path);
+        let _many = many_handles();
+        let found = against_unlimited(1_600, climb);
         assert!(found.is_none_or(|(found, _, _)| found), "{found:?}");
-        let root = tempfile::tempdir().unwrap();
-        let rule_path = climb(root.path(), 1_700);
-        let found = against_unlimited(root.path(), &rule_path);
+        let found = against_unlimited(1_700, climb);
         assert!(
             found.is_none_or(|(found, lookups, _)| !found && lookups == MAX_LOOKUPS),
             "{found:?}"
@@ -1636,9 +1698,8 @@ mod tests {
         // 150 levels with a dead end 20 folders deep before each. (Closing
         // the handle leaving the smallest gap took 403 reopens here, and
         // closing the shallowest 9,045.)
-        let root = tempfile::tempdir().unwrap();
-        let rule_path = dead_ends(root.path(), 150, 20);
-        let found = against_unlimited(root.path(), &rule_path);
+        let _many = many_handles();
+        let found = against_unlimited(150, |root, levels| dead_ends(root, levels, 20));
         assert!(found.is_none_or(|(found, _, _)| found));
     }
 
@@ -2121,6 +2182,7 @@ mod tests {
         // spellings (`K` is also the Kelvin sign), names that are no
         // folders among them: the walk and its simulation over the same
         // listings open the same folders again, with 2, 3, 5 or 16 handles.
+        let _many = many_handles();
         let mut seed = 0x2545_f491_4f6c_dd1d_u64;
         let mut random = |below: u64| {
             seed ^= seed << 13;

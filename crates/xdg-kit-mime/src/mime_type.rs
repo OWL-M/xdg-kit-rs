@@ -4,6 +4,8 @@ use std::hash::{Hash, Hasher};
 use std::str::FromStr;
 use std::sync::Arc;
 
+use crate::work;
+
 /// A MIME type such as `image/png`: a media type and a subtype, without
 /// parameters or wildcards.
 ///
@@ -37,11 +39,23 @@ impl fmt::Display for InvalidMimeType {
 /// `!#$&^_.+-`.
 fn restricted_name(name: &str) -> bool {
     let mut bytes = name.bytes();
+    // The first byte checked, then, if the name is short enough, the rest.
+    work::count(1);
     bytes
         .next()
         .is_some_and(|first| first.is_ascii_alphanumeric())
         && name.len() <= 127
-        && bytes.all(|byte| byte.is_ascii_alphanumeric() || b"!#$&^_.+-".contains(&byte))
+        && {
+            work::count(bytes.len());
+            bytes.all(|byte| byte.is_ascii_alphanumeric() || b"!#$&^_.+-".contains(&byte))
+        }
+}
+
+/// `text` split at its first `/`, counting the bytes scanned for it.
+fn split(text: &str) -> Option<(&str, &str)> {
+    let parts = text.split_once('/');
+    work::count(parts.map_or(text.len(), |(media, _)| media.len() + 1));
+    parts
 }
 
 impl std::error::Error for InvalidMimeType {}
@@ -56,9 +70,10 @@ impl MimeType {
     /// letters, digits and `!#$&^_.+-`. So no parameters (`;`), no
     /// wildcards (`*`), and no `.` or `..` as a part.
     pub fn new(text: &str) -> Result<Self, InvalidMimeType> {
-        let valid = text
-            .split_once('/')
+        let valid = split(text)
             .is_some_and(|(media, subtype)| restricted_name(media) && restricted_name(subtype));
+        // Each byte copied, into the type or the error.
+        work::count(text.len());
         if valid {
             Ok(Self(text.into()))
         } else {
@@ -75,18 +90,20 @@ impl MimeType {
     /// The part before the `/`, as in `image`.
     #[must_use]
     pub fn media(&self) -> &str {
-        self.0.split_once('/').map_or("", |(media, _)| media)
+        split(&self.0).map_or("", |(media, _)| media)
     }
 
     /// The part after the `/`, as in `png`.
     #[must_use]
     pub fn subtype(&self) -> &str {
-        self.0.split_once('/').map_or("", |(_, subtype)| subtype)
+        split(&self.0).map_or("", |(_, subtype)| subtype)
     }
 
     /// Whether the media part is `media`, ignoring ASCII case.
     #[must_use]
     pub fn is_media(&self, media: &str) -> bool {
+        // The media part's scan counts in `media()`; the comparison, with a
+        // fixed name, does not.
         self.media().eq_ignore_ascii_case(media)
     }
 
@@ -251,6 +268,54 @@ mod tests {
             MimeType::try_from(&with_parameters).unwrap().as_str(),
             "text/plain"
         );
+    }
+
+    /// Parses `text`, checks the result, and counts the steps: at least
+    /// one per byte, as each byte is copied.
+    fn counted(text: &str, valid: bool) -> (usize, usize) {
+        let (parsed, steps) = work::steps(|| MimeType::new(text));
+        assert_eq!(parsed.is_ok(), valid, "{text}");
+        let bytes = text.len();
+        assert!(steps >= bytes, "{steps} steps for {bytes} bytes");
+        (steps, bytes)
+    }
+
+    #[test]
+    fn a_long_type_is_parsed_in_linear_time() {
+        // Each part may have at most 127 characters.
+        work::assert_linear(
+            60,
+            |n| counted(&format!("{}/{}", "a".repeat(n), "b".repeat(n)), true),
+            // The analysed cost, with `n` bytes in each part: the media
+            // type and the `/` scanned for it (n + 1), each byte of both
+            // parts checked (2n, that is bytes - 1), and every byte copied
+            // (bytes): 2 per byte and 1 per item. Twice that.
+            |items, bytes| 2 * (2 * bytes + items),
+        );
+    }
+
+    #[test]
+    fn a_long_text_that_is_not_a_type_is_refused_in_linear_time() {
+        // Each case with the analysed cost of a text of `bytes` bytes: the
+        // bytes scanned for the `/`, those checked, and every byte copied
+        // into the error (bytes). A part longer than 127 bytes is refused
+        // once its first byte is checked, and a refused media type leaves
+        // the subtype unchecked. Each bound is twice the analysed cost.
+        let refused = |text: fn(usize) -> String, cost: fn(usize) -> usize| {
+            work::assert_linear(
+                10_000,
+                |n| counted(&text(n), false),
+                |_, bytes| 2 * cost(bytes),
+            );
+        };
+        // No `/`: every byte scanned for it (bytes), none checked.
+        refused(|n| "a".repeat(n), |bytes| 2 * bytes);
+        // A long subtype: `a/` scanned (2), the first byte of each part
+        // checked (2).
+        refused(|n| format!("a/{}\n", "b".repeat(n)), |bytes| bytes + 4);
+        // A long media type: scanned up to and with the `/` (bytes - 1),
+        // its first byte checked (1).
+        refused(|n| format!("{}\n/b", "a".repeat(n)), |bytes| 2 * bytes);
     }
 
     #[test]
