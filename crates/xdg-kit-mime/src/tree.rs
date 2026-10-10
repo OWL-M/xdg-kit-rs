@@ -15,35 +15,67 @@ use crate::model::{TreeKind, TreeMatchlet};
 use crate::work::count;
 use crate::{MimeDatabase, MimeType};
 
-/// Options for [`MimeDatabase::content_types_for_root`]. None yet; it exists
-/// so options can be added without breaking callers.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Options for [`MimeDatabase::content_types_for_root`]. Each field limits the
+/// search for one rule path. [`TreeOptions::default`] supplies the defaults
+/// described below; `None` means no limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct TreeOptions {}
+pub struct TreeOptions {
+    /// The lookups one rule path's search may take, 10,000 by default;
+    /// past that the rule path does not match. Listing a folder counts as
+    /// one lookup, as does looking for an exact name with `match-case`.
+    /// Opening each entry as a folder, or checking it at the last
+    /// component, also counts. Opening a folder again on the way back does
+    /// not (see [`TreeOptions::max_reopens`]), so the lookups taken do not
+    /// depend on how many handles the search keeps open.
+    ///
+    /// Remembering folders that led nowhere bounds the search by folders ×
+    /// path components. This limit also bounds searches without mount IDs
+    /// (Linux before 5.8 and other Unixes), where that cannot work, and
+    /// searches on volumes made to defeat it. `None`: there, a search can
+    /// take time exponential in the rule path's components (each matched
+    /// by every spelling that differs only in case).
+    pub max_lookups: Option<usize>,
+    /// The maximum folder reopens while backtracking along one rule path, after
+    /// their handles have been closed. Exceeding it makes the rule path fail to
+    /// match. Defaults to 6 per default lookup, a bound proven sufficient
+    /// within the default lookup limit. Under those limits, the search finds
+    /// the same paths as one that keeps every folder open. Raising the lookup
+    /// limit may exhaust reopens first and miss matches; `None` removes that
+    /// restriction.
+    pub max_reopens: Option<usize>,
+}
 
-/// The lookup limit for searching one rule path. Exceeding it means the
-/// rule path does not match. Listing a folder counts as one lookup, as
-/// does looking for an exact name with `match-case`. Opening each entry
-/// as a folder, or checking it at the last component, also counts.
-/// Reopening a folder while backtracking does not count (see
-/// [`MAX_REOPENS`]), so the lookup count is independent of how many
-/// handles the search keeps open.
-///
-/// Remembering folders that led nowhere bounds the search by folders ×
-/// path components. This limit also bounds searches without mount IDs
-/// (Linux before 5.8 and other Unixes), where that optimization cannot
-/// work, and searches on volumes designed to defeat it.
+impl Default for TreeOptions {
+    fn default() -> Self {
+        Self {
+            max_lookups: Some(MAX_LOOKUPS),
+            max_reopens: Some(MAX_REOPENS),
+        }
+    }
+}
+
+impl TreeOptions {
+    /// No limit: a search where folders cannot be remembered, or on a
+    /// volume made to defeat that, can take time exponential in the rule
+    /// path's components.
+    #[must_use]
+    pub fn unlimited() -> Self {
+        Self {
+            max_lookups: None,
+            max_reopens: None,
+        }
+    }
+}
+
+/// The default of [`TreeOptions::max_lookups`].
 const MAX_LOOKUPS: usize = 10_000;
 
-/// The most folders one rule path's search opens again on the way back,
-/// their handles having been closed (see [`MAX_OPEN_FOLDERS`]); past that,
-/// the rule path counts as not matching. A search never gets there: with
-/// its handles kept as [`Window`] says, it opens folders again at most 6
-/// times for each lookup after the first. Within [`MAX_LOOKUPS`] lookups a
-/// search is at most 4,999 folders deep, as each folder entered takes two
-/// lookups, and for that depth the proof (design notes, decision 32) gives
-/// 6. So whatever a search with unlimited handles finds within its
-/// lookups, this one finds too.
+/// The default of [`TreeOptions::max_reopens`]. With its handles kept as
+/// [`Window`] says, a search opens folders again at most 6 times for each
+/// lookup after the first, while it is at most 4,999 folders deep (the
+/// default lookups allow no deeper, as each folder entered takes two): the
+/// proof is decision 32 of the design notes.
 const MAX_REOPENS: usize = 6 * MAX_LOOKUPS;
 
 /// The most folder handles one rule path's search holds open at a time,
@@ -52,8 +84,9 @@ const MAX_REOPENS: usize = 6 * MAX_LOOKUPS;
 /// given, the handle a folder's listing holds while it is read (see
 /// [`list_folder`]), and those `accept` opens while it checks an entry (a
 /// listing, a file's contents), each closed before the search goes on. The
-/// bound on reopening ([`MAX_REOPENS`]) holds with 2 more handles than the
-/// most times 2 divides a depth reached (12 times, for 4,096): 14.
+/// bound on reopening ([`MAX_REOPENS`]) holds within the default lookups
+/// with 2 more handles than the most times 2 divides a depth reached (12
+/// times, for 4,096): 14.
 const MAX_OPEN_FOLDERS: usize = 16;
 
 /// Opens `path` relative to `dir` as a folder, following symbolic links.
@@ -139,13 +172,13 @@ fn has_entries(folder: BorrowedFd<'_>, name: &OsStr) -> bool {
     })
 }
 
-/// Finds entries in `folder` named `name`. With `match_case`, looks the
-/// name up. Otherwise lists the folder with `list` and compares Unicode
-/// lowercase for UTF-8 names and ASCII lowercase for other names: both
-/// `DCIM` and `dcim` can match. A folder that may not be listed (`EACCES`
-/// or `EPERM`: searchable but not readable) is looked up for `name` as
-/// written: other spellings in it cannot be seen. A folder whose listing
-/// fails otherwise gives no entries.
+/// Finds entries in `folder` named `name`. With `match_case`, looks up the
+/// exact name. Otherwise, uses `list` to compare names after lowercasing each
+/// UTF-8 character independently (`ΑΣ` becomes `ασ`, never `ας`), or
+/// lowercasing ASCII for non-UTF-8 names. Both `DCIM` and `dcim` can match. If
+/// the folder is searchable but not readable (`EACCES` or `EPERM`), looks up
+/// `name` as written because other spellings cannot be listed. Other listing
+/// errors return no entries.
 fn find_entries(
     folder: BorrowedFd<'_>,
     name: &OsStr,
@@ -200,23 +233,25 @@ fn find_entries(
 /// at a path. A lookup that failed with an error is remembered like any
 /// other: by another way it would fail the same, short of a passing error
 /// such as running out of file descriptors. A folder whose mount cannot be
-/// told is not remembered (see [`Identity::place`]). After [`MAX_LOOKUPS`]
-/// lookups (listings, and entries opened or checked) the search stops and
-/// the rule path does not match.
+/// told is not remembered (see [`Identity::place`]). After
+/// [`TreeOptions::max_lookups`] lookups (listings, and entries opened or
+/// checked) the search stops and the rule path does not match.
 ///
 /// The search holds at most [`MAX_OPEN_FOLDERS`] handles regardless of
 /// depth. While backtracking, it reopens closed folders from their
 /// ancestors ([`Window`]). Reopening does not count as a lookup and has
-/// its own limit, [`MAX_REOPENS`]. The handle retention strategy is proven
-/// to stay within that limit for the lookup budget, so it finds every
-/// path that a search with unlimited handles would find within the same
-/// budget. If reopening finds a different folder (see [`Walk::from`]),
-/// the rule path does not match. This works with or without mount IDs.
+/// its own limit, [`TreeOptions::max_reopens`]. The handle retention
+/// strategy is proven to stay within the default reopens for the default
+/// lookups, so it then finds every path that a search with unlimited
+/// handles would find within the same lookups. If reopening finds a
+/// different folder (see [`Walk::from`]), the rule path does not match.
+/// This works with or without mount IDs.
 fn any_path(
     root: BorrowedFd<'_>,
     root_path: &Path,
     rule_path: &str,
     match_case: bool,
+    options: &TreeOptions,
     accept: &mut impl FnMut(BorrowedFd<'_>, &OsStr) -> bool,
 ) -> bool {
     let mut components: Vec<&OsStr> = Vec::new();
@@ -230,7 +265,13 @@ fn any_path(
     if components.is_empty() {
         return accept(rustix::fs::CWD, root_path.as_os_str());
     }
-    Walk::new(&components, match_case, accept).from(root, 0)
+    // No limit is as good as one that cannot be reached.
+    Walk {
+        lookups: options.max_lookups.unwrap_or(usize::MAX),
+        reopens: options.max_reopens.unwrap_or(usize::MAX),
+        ..Walk::new(&components, match_case, accept)
+    }
+    .from(root, 0)
 }
 
 /// Where a folder is: (mount ID, device, inode).
@@ -399,9 +440,11 @@ struct Walk<'a, F> {
     /// Places and component indexes of folders whose search from that
     /// component found nothing.
     failed: HashSet<(Place, usize)>,
-    /// Lookups left ([`MAX_LOOKUPS`] but in tests).
+    /// Lookups left ([`TreeOptions::max_lookups`]; `usize::MAX` for no
+    /// limit).
     lookups: usize,
-    /// Folders left to open again ([`MAX_REOPENS`] but in tests).
+    /// Folders left to open again ([`TreeOptions::max_reopens`];
+    /// `usize::MAX` for no limit).
     reopens: usize,
     /// The most handles open at a time ([`MAX_OPEN_FOLDERS`] but in
     /// tests).
@@ -776,21 +819,23 @@ impl MimeDatabase {
         root: BorrowedFd<'_>,
         root_path: &Path,
         matchlet: &TreeMatchlet,
+        options: &TreeOptions,
     ) -> bool {
         // The rule path, split into its components; the lookups themselves
-        // are file I/O, bounded per rule path by `MAX_LOOKUPS`.
+        // are file I/O, bounded per rule path by `options.max_lookups`.
         count(1 + matchlet.path.len());
         any_path(
             root,
             root_path,
             &matchlet.path,
             matchlet.match_case,
+            options,
             &mut |folder, name| self.entry_passes(folder, name, matchlet),
         ) && (matchlet.children.is_empty()
             || matchlet
                 .children
                 .iter()
-                .any(|child| self.tree_matchlet_matches(root, root_path, child)))
+                .any(|child| self.tree_matchlet_matches(root, root_path, child, options)))
     }
 
     /// Whether `name` in `folder` has the kind, permission, content and
@@ -837,14 +882,14 @@ impl MimeDatabase {
     /// case-insensitively unless the rule says `match-case`. Rule paths with
     /// `..` or a leading `/` never match (the database reports them), but
     /// symbolic links on the volume are followed like any other path. A
-    /// rule path whose search takes more than 10,000 lookups (folder
-    /// listings, and entries opened or checked) does not match. A search
-    /// keeps at most 16 folders open, and opens a closed one again when it
-    /// goes back to it, which is not counted as a lookup: it chooses which
-    /// to keep so that it opens folders again at most six times for each
-    /// lookup, so it finds what it would find with every folder kept open.
-    /// A rule path whose folders change while it is searched does not
-    /// match.
+    /// rule path whose search takes more than [`TreeOptions::max_lookups`]
+    /// lookups (folder listings, and entries opened or checked) does not
+    /// match. A search keeps at most 16 folders open, and opens a closed one
+    /// again when it goes back to it, which is not counted as a lookup but
+    /// against [`TreeOptions::max_reopens`]: it chooses which to keep so
+    /// that, within the default limits, it finds what it would find with
+    /// every folder kept open. A rule path whose folders change while it is
+    /// searched does not match.
     ///
     /// A path is matched where it is present, whether or not the folders
     /// on the way can be listed: in a folder that can only be searched, a
@@ -862,7 +907,7 @@ impl MimeDatabase {
     pub fn content_types_for_root(
         &self,
         root: impl AsRef<Path>,
-        _options: &TreeOptions,
+        options: &TreeOptions,
     ) -> io::Result<Vec<MimeType>> {
         let root_path = root.as_ref();
         let root = open_folder(rustix::fs::CWD, root_path)?;
@@ -876,11 +921,9 @@ impl MimeDatabase {
             if kept.contains(&mime) {
                 continue;
             }
-            if rule
-                .matchlets
-                .iter()
-                .any(|matchlet| self.tree_matchlet_matches(root.as_fd(), root_path, matchlet))
-            {
+            if rule.matchlets.iter().any(|matchlet| {
+                self.tree_matchlet_matches(root.as_fd(), root_path, matchlet, options)
+            }) {
                 // Copied, hashed and compared.
                 count(3 * mime.as_str().len());
                 kept.insert(mime.clone());
@@ -932,6 +975,7 @@ mod tests {
             root,
             rule_path,
             match_case,
+            &TreeOptions::default(),
             &mut |folder, name| {
                 found.push((id(&rustix::fs::fstat(folder).unwrap()), name.to_owned()));
                 false
@@ -960,6 +1004,18 @@ mod tests {
     }
 
     #[test]
+    fn components_are_lowercased_per_character() {
+        // Lowercased with context, `ΑΣ` would end in a final `ς`.
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("ΑΣ")).unwrap();
+        assert_eq!(
+            paths(root.path(), "ασ", false),
+            entries(&[&root.path().join("ΑΣ")])
+        );
+        assert!(paths(root.path(), "ας", false).is_empty());
+    }
+
+    #[test]
     fn every_entry_differing_only_in_case_is_tried() {
         let root = tempfile::tempdir().unwrap();
         fs::create_dir_all(root.path().join("DCIM")).unwrap();
@@ -979,6 +1035,7 @@ mod tests {
             root.path(),
             "DCIM",
             false,
+            &TreeOptions::default(),
             &mut |folder, name| has_entries(folder, name)
         ));
     }
@@ -1133,6 +1190,7 @@ mod tests {
             root.path(),
             &format!("{prefix}target"),
             false,
+            &TreeOptions::default(),
             &mut |_, name| name == "Target"
         ));
         // One case variant leads to an empty folder, the other through a
@@ -1164,6 +1222,7 @@ mod tests {
                     root.path(),
                     "dcim/photos",
                     false,
+                    &TreeOptions::default(),
                     &mut |folder, name| is_folder(folder, name)
                 ),
                 "{linked} links to the photos"
@@ -1187,6 +1246,7 @@ mod tests {
                 &root,
                 rule_path,
                 false,
+                &TreeOptions::default(),
                 &mut |folder, name| {
                     given.push(name.to_owned());
                     rustix::fs::statat(folder, name, AtFlags::SYMLINK_NOFOLLOW).is_ok_and(|found| {

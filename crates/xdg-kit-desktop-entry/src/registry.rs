@@ -1,7 +1,8 @@
 //! The Desktop Menu spec's registries (version 1.1, xdg-specs `1e7f4ce`,
 //! `menu/menu-spec.xml`): categories ("Registered Categories") and desktop
 //! names ("Registered `OnlyShowIn` Environments"), used by `validate`. A test
-//! checks these tables against the pinned spec.
+//! checks these tables against the pinned spec, allowing one correction
+//! (`Qt` for the spec's `QT`, see [`ADDITIONAL_CATEGORIES`]).
 
 /// Main categories, each with the category it requires besides itself
 /// ("Desktop entry must include ... as well").
@@ -23,7 +24,9 @@ pub(crate) const MAIN_CATEGORIES: &[(&str, Option<&str>)] = &[
 ];
 
 /// Additional categories, each with its related categories: any one of
-/// the alternatives, each a set of categories, should be present too.
+/// the alternatives, each a set of categories, should be present too. The
+/// spec's KDE and `LXQt` rows say `QT`, a typo for the registered `Qt`, as
+/// `desktop-file-validate` reads them; here they say `Qt`.
 pub(crate) const ADDITIONAL_CATEGORIES: &[(&str, &[&[&str]])] = &[
     ("Building", &[&["Development"]]),
     ("Debugger", &[&["Development"]]),
@@ -169,10 +172,10 @@ pub(crate) const ADDITIONAL_CATEGORIES: &[(&str, &[&[&str]])] = &[
     ("Documentation", &[]),
     ("Adult", &[]),
     ("Core", &[]),
-    ("KDE", &[&["QT"]]),
+    ("KDE", &[&["Qt"]]),
     ("COSMIC", &[]),
     ("GNOME", &[&["GTK"]]),
-    ("LXQt", &[&["QT"]]),
+    ("LXQt", &[&["Qt"]]),
     ("XFCE", &[&["GTK"]]),
     ("DDE", &[&["Qt"]]),
     ("GTK", &[]),
@@ -276,11 +279,23 @@ mod tests {
             .collect();
         assert_eq!(ours, main);
 
+        // The one correction allowed: the spec's KDE and LXQt rows relate
+        // them to `QT`, a typo upstream for the registered `Qt`.
+        let corrected = |name: &str, related: &str| match (name, related) {
+            ("KDE" | "LXQt", "QT") => "Qt".to_owned(),
+            _ => related.to_owned(),
+        };
         let additional: Vec<(String, String)> =
             rows(&xml, "additional-category-registry", "</sect1>")
                 .into_iter()
-                .map(|row| (row[0].clone(), row[2].clone()))
+                .map(|row| (row[0].clone(), corrected(&row[0], &row[2])))
                 .collect();
+        let typos = rows(&xml, "additional-category-registry", "</sect1>")
+            .into_iter()
+            .filter(|row| row[2] == "QT")
+            .map(|row| row[0].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(typos, ["KDE", "LXQt"], "the typo the correction is for");
         let ours: Vec<(String, String)> = ADDITIONAL_CATEGORIES
             .iter()
             .map(|(name, related)| {

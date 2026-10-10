@@ -15,10 +15,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags};
 use rustix::io::Errno;
-use xdg_kit_basedir::MAX_FILE_LEN;
 use xdg_kit_desktop_entry::DesktopEntry;
 
-use crate::TypePattern;
+use crate::{Limits, TypePattern};
 
 /// The `mimeinfo.cache` for the `applications` folder `folder`, as
 /// `update-desktop-database` writes it: `[MIME Cache]`, then one
@@ -28,19 +27,34 @@ use crate::TypePattern;
 /// ([`DesktopEntry::supports_encoding`]), as the tool lists them. Unlike
 /// `AppIndex`, entries of no or unknown `Type` are listed, as the tool does.
 /// Items of `MimeType=` that are not types or `media/*` wildcards (see
-/// [`TypePattern::parse`]) are left out, `*/*` too, as the tool does.
+/// [`TypePattern::parse`]) are left out, `*/*` too, as the tool does. A
+/// folder reached under two names through a link is listed under both,
+/// as the tool and `AppIndex` do. Each ID appears once per type, even if
+/// several paths produce it. The tool removes only consecutive repeats,
+/// so it repeats an ID when another ID of the same type falls between
+/// its paths in folder listing order.
+///
+/// Links back to any ancestor folder are skipped, as in `AppIndex`.
+/// The tool and `GLib` follow these loops until the path is too long:
+/// one link produces dozens of IDs, and work grows exponentially with
+/// the number of such links.
 ///
 /// # Errors
 ///
-/// Calls interrupted by a signal (`EINTR`) are retried. Any other error
-/// opening or listing `folder`, listing an opened sub-folder, or reading
-/// an opened folder's status fails the walk.
+/// Calls interrupted by a signal (`EINTR`) are retried. Interrupted folder
+/// listings restart from the beginning. Any other error opening or
+/// listing `folder`, listing an opened sub-folder, or reading an opened
+/// folder's status fails the walk.
 ///
 /// Errors looking up a name, opening a sub-folder, or opening, checking or
 /// reading a desktop entry also fail the walk, except for the errors listed
 /// below. This includes reopening a folder whose handle was closed. Failures
 /// such as `EMFILE`, `ENFILE`, `ENOMEM`, `EIO` and `EAGAIN` may reflect a
 /// system, disk or temporary problem rather than a problem with the name.
+///
+/// The walk lists at most [`Limits::max_listed`] entries, counted along
+/// every path, so links cannot multiply its work without bound; past that
+/// it fails with [`io::ErrorKind::Other`], naming the limit.
 ///
 /// No partial listing is returned. This deliberately differs from
 /// `update-desktop-database`, which silently keeps what it listed before
@@ -62,18 +76,32 @@ use crate::TypePattern;
 /// in the folders the walk goes back to by its old name: they are listed
 /// under no name. A run after the move lists it fully; going through it
 /// again under its new name would list the part read under two names, and
-/// is not done. A folder reached again (through a link) is listed once,
-/// under its first name in byte order, where `update-desktop-database`
-/// lists it under each. The folder a name opens is told by its device and
-/// inode once opened; a name that was, when looked at, a folder listed
-/// already (a link to it) is skipped without being opened, a change to it
-/// since not seen, as for a name the walk has passed. A desktop entry that
+/// is not done. The folder a name opens is told by its device and inode
+/// once opened; a name that was, when looked at, a folder on the path (a
+/// link back to it) is skipped without being opened, a change to it since
+/// not seen, as for a name the walk has passed. A desktop entry that
 /// is not a regular file (also when it is replaced after its type was
-/// checked) or is larger than [`MAX_FILE_LEN`] is skipped too, as are the
-/// entries left out above.
+/// checked) or is larger than [`Limits::max_file_len`] is skipped too, as
+/// are the entries left out above. Failure to reserve memory for an entry,
+/// including one that grows during a read, fails the walk with
+/// [`io::ErrorKind::OutOfMemory`], with or without the size limit. On
+/// systems that overcommit memory, such as Linux, a reservation may
+/// succeed even when there is too little free memory. Reading the entry
+/// may still exhaust memory.
+///
+/// This is [`mimeinfo_cache_with`] within the default [`Limits`].
 pub fn mimeinfo_cache(folder: &Path) -> io::Result<Vec<u8>> {
+    mimeinfo_cache_with(folder, &Limits::default())
+}
+
+/// [`mimeinfo_cache`] within `limits`.
+///
+/// # Errors
+///
+/// As [`mimeinfo_cache`].
+pub fn mimeinfo_cache_with(folder: &Path, limits: &Limits) -> io::Result<Vec<u8>> {
     let mut types: BTreeMap<String, BTreeSet<Vec<u8>>> = BTreeMap::new();
-    collect(folder, &mut types)?;
+    collect(folder, &mut types, limits)?;
     let mut out = b"[MIME Cache]\n".to_vec();
     for (mime, ids) in types {
         out.extend_from_slice(mime.as_bytes());
@@ -104,8 +132,18 @@ pub fn mimeinfo_cache(folder: &Path) -> io::Result<Vec<u8>> {
 /// still returned. The new `mimeinfo.cache` is already in place, but may
 /// not survive a crash.
 pub fn write_mimeinfo_cache(folder: &Path) -> io::Result<()> {
+    write_mimeinfo_cache_with(folder, &Limits::default())
+}
+
+/// Writes the cache as [`write_mimeinfo_cache`] does, using `limits` for
+/// [`mimeinfo_cache_with`].
+///
+/// # Errors
+///
+/// As [`write_mimeinfo_cache`].
+pub fn write_mimeinfo_cache_with(folder: &Path, limits: &Limits) -> io::Result<()> {
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
-    let bytes = mimeinfo_cache(folder)?;
+    let bytes = mimeinfo_cache_with(folder, limits)?;
     // A name left over from a crashed writer is skipped, not an error.
     let (temporary, mut file) = loop {
         let temporary = folder.join(format!(
@@ -162,49 +200,57 @@ struct Level {
 
 /// Adds the types of every desktop entry under `folder` to `types`.
 ///
-/// The walk keeps its own stack, not the thread's, as folders may nest
-/// deeper than a thread's stack allows. It works from folder handles: each
-/// name is looked at, opened or read from the handle of its folder, so no
-/// path is formed and an entry is listed however deep it is, past
-/// `PATH_MAX`. IDs are built from the names. At most [`MOST_OPEN`] handles
-/// are kept (more only past 2^14 folders deep, see [`Window`]); going back
-/// to a folder whose handle was closed opens it again by name from a
-/// handle kept, as a path to it would ([`reopen`]).
+/// Uses an explicit stack because folders may nest deeper than a thread stack
+/// allows. Looks up, opens and reads each name through its parent folder's
+/// handle, without forming a path. This allows entries beyond `PATH_MAX`; IDs
+/// are built from the names. Keeps at most [`MOST_OPEN`] handles (more only
+/// beyond 2^14 folders deep, see [`Window`]). When returning to a folder whose
+/// handle was closed, reopens it by name from a retained handle, as a path
+/// lookup would ([`reopen`]).
 ///
-/// Each folder is listed once, when first opened: a folder is told by the
-/// device and inode of its handle once opened, as the name looked at may
-/// be another folder by then. A name that was, when looked at, a folder
-/// listed already is skipped without being opened: a change to it since is
-/// not seen, as for a name the walk has passed. A name that cannot be
-/// looked at, a sub-folder that cannot be opened, or opened again, and a
-/// desktop entry that cannot be opened, checked or read, for an error
-/// saying the name cannot be used as written, is skipped ([`skipped`]). For
-/// any other error, or when a sub-folder is opened but cannot be listed,
-/// the walk fails with that error, as for `folder`, rather than give a
-/// listing with its entries missing (`update-desktop-database` keeps such a
-/// partial listing). A call interrupted by a signal is made again. A
-/// folder opened again that is not the one listed is skipped as if deleted
-/// ([`reopen`]); one read through a handle kept is read as first seen. So a
-/// folder moved to another name mid-walk may lose the entries not yet read,
-/// listed under no name; a run after the move lists it fully, and going
-/// through it again under its new name would list the part read under two
-/// names. A desktop entry is also skipped for what it is ([`add`]). An
-/// invariant of the walk found broken fails it too ([`invariant`]).
-fn collect(folder: &Path, types: &mut BTreeMap<String, BTreeSet<Vec<u8>>>) -> io::Result<()> {
+/// Lists each folder when opened, through every path to it, but skips loops
+/// back to ancestors. Identifies opened folders by their handle's device and
+/// inode because a name may point elsewhere between lookup and opening. If
+/// lookup already identifies an ancestor, skips the name without opening it.
+/// Later changes to that name go unseen, as with names the walk has passed.
+/// Exceeding [`Limits::max_listed`] entries fails the walk ([`counted`]).
+///
+/// Skips names that cannot be looked up, sub-folders that cannot be opened or
+/// reopened, and desktop entries that cannot be opened, checked or read, when
+/// the error means the name cannot be used as written ([`skipped`]). Other
+/// errors fail the walk. Listing failures also fail it, both for `folder` and
+/// for opened sub-folders, rather than return an incomplete listing
+/// (`update-desktop-database` keeps partial listings). Interrupted calls are
+/// retried.
+///
+/// A reopened folder that differs from the one listed is skipped as if deleted
+/// ([`reopen`]); a folder read through a retained handle stays as first seen.
+/// Moving a folder during the walk may therefore leave unread entries unlisted.
+/// A run after the move lists it fully. Revisiting it under the new name would
+/// list previously read entries under both names. Desktop entries can also be
+/// skipped for their file type, size or contents ([`add`]). A broken walk
+/// invariant fails the walk ([`invariant`]).
+fn collect(
+    folder: &Path,
+    types: &mut BTreeMap<String, BTreeSet<Vec<u8>>>,
+    limits: &Limits,
+) -> io::Result<()> {
     let first = open_folder(rustix::fs::CWD, folder)?;
-    // A folder reached again through a link is listed once, under the first
-    // name in byte order, as `AppIndex` gives its files IDs
-    // (`update-desktop-database` lists every path). It is told by the
+    // Every path is listed, a folder reached under two names (a link) under
+    // each, as `update-desktop-database` and `AppIndex` do; a link back to a
+    // folder on the path (a loop) is not followed. A folder is told by the
     // device and inode of the handle opened; those of the name looked at
-    // only skip a name that was a folder listed already.
+    // only skip a name that was a folder on the path.
     let stat = fstat(first.as_fd())?;
-    let mut visited = HashSet::from([(stat.st_dev, stat.st_ino)]);
+    let mut ancestors = HashSet::from([(stat.st_dev, stat.st_ino)]);
+    let left = names(first.as_fd())?;
+    let mut listed = counted(0, &left, limits.max_listed)?;
     let mut id = Vec::new();
     let mut stack = vec![Level {
         name: OsString::new(),
         stat,
         handle: None,
-        left: names(first.as_fd())?,
+        left,
         prefix: 0,
     }];
     let mut window = Window::new(MOST_OPEN);
@@ -212,7 +258,13 @@ fn collect(folder: &Path, types: &mut BTreeMap<String, BTreeSet<Vec<u8>>>) -> io
         let Some(name) = level.left.pop() else {
             // Every handle kept is that of a folder on the stack, at its
             // depth, and the deepest kept is the last in `window.open`.
-            if stack.pop().is_some_and(|level| level.handle.is_some()) {
+            let popped = stack.pop();
+            if let Some(level) = &popped
+                && !stack.is_empty()
+            {
+                ancestors.remove(&(level.stat.st_dev, level.stat.st_ino));
+            }
+            if popped.is_some_and(|level| level.handle.is_some()) {
                 let closed = window.open.pop();
                 debug_assert_eq!(closed, Some(stack.len()), "the handle kept");
                 if closed != Some(stack.len()) {
@@ -238,11 +290,11 @@ fn collect(folder: &Path, types: &mut BTreeMap<String, BTreeSet<Vec<u8>>>) -> io
         match FileType::from_raw_mode(stat.st_mode) {
             FileType::Directory => {
                 id.push(b'-');
-                // A name that was a folder listed already (a link to it)
+                // A name that was a folder on the path (a link back to it)
                 // when looked at is skipped unopened, a change to it since
                 // unseen, as for a name passed. Otherwise the name may be
                 // another folder by the time it is opened: checked again.
-                if visited.contains(&(stat.st_dev, stat.st_ino)) {
+                if ancestors.contains(&(stat.st_dev, stat.st_ino)) {
                     continue;
                 }
                 // Room for one more handle, the deepest folder's kept.
@@ -253,13 +305,13 @@ fn collect(folder: &Path, types: &mut BTreeMap<String, BTreeSet<Vec<u8>>>) -> io
                 // walk ([`skipping`]); one opened that then cannot be listed
                 // fails the walk, as the first folder does.
                 if let Some(handle) = skipping(open_folder(from, &name))? {
-                    // A folder listed already, now under this name, is
-                    // skipped.
+                    // A folder on the path, now under this name, is skipped.
                     let stat = fstat(handle.as_fd())?;
-                    if !visited.insert((stat.st_dev, stat.st_ino)) {
+                    if !ancestors.insert((stat.st_dev, stat.st_ino)) {
                         continue;
                     }
                     let left = names(handle.as_fd())?;
+                    listed = counted(listed, &left, limits.max_listed)?;
                     window.push(depth + 1);
                     stack.push(Level {
                         name,
@@ -272,12 +324,30 @@ fn collect(folder: &Path, types: &mut BTreeMap<String, BTreeSet<Vec<u8>>>) -> io
             }
             // Only regular files: reading a FIFO would wait for a writer.
             FileType::RegularFile if name.as_bytes().ends_with(b".desktop") => {
-                add(at, &name, &id, types)?;
+                add(at, &name, &id, types, limits.max_file_len)?;
             }
             _ => {}
         }
     }
     Ok(())
+}
+
+/// `listed`, the entries the walk listed before, with `names` added.
+///
+/// # Errors
+///
+/// Past `max` ([`Limits::max_listed`]): the walk fails, so no cache is
+/// made.
+fn counted(listed: usize, names: &[OsString], max: Option<usize>) -> io::Result<usize> {
+    let listed = listed + names.len();
+    if let Some(max) = max
+        && listed > max
+    {
+        return Err(io::Error::other(format!(
+            "mimeinfo.cache walk: more than {max} entries to list; no cache made"
+        )));
+    }
+    Ok(listed)
 }
 
 /// The status of `name` in `dir`, links followed, looked at again when
@@ -391,11 +461,12 @@ const LOOKUPS_ONLY: Option<OFlags> = Some(OFlags::from_bits_retain(libc::O_SEARC
 )))]
 const LOOKUPS_ONLY: Option<OFlags> = None;
 
-/// The names in `folder`, in byte order, last first. Listed from a copy of
-/// the handle, closed once they are read; only the names are kept. An error
-/// reading them is given, not a shorter listing (a handle opened for
-/// lookups only, [`reopen_folder`], cannot be listed), except that a folder
-/// deleted while listed ends the listing, as rustix ends it on `ENOENT`.
+/// Returns names in `folder` in reverse byte order. Lists through a copy of the
+/// handle, then closes it and keeps only the names. An interrupted listing is
+/// rewound and restarted after discarding the names read so far. Other read
+/// errors are returned instead of a partial listing. A handle opened for
+/// lookups only ([`reopen_folder`]) cannot be listed. If the folder is deleted
+/// during listing, rustix ends the listing on `ENOENT`.
 fn names(folder: BorrowedFd<'_>) -> io::Result<Vec<OsString>> {
     #[cfg(test)]
     if tests::UNLISTABLE.with_borrow(|unlistable| {
@@ -405,12 +476,39 @@ fn names(folder: BorrowedFd<'_>) -> io::Result<Vec<OsString>> {
     }) {
         return Err(Errno::IO.into());
     }
-    let listing = Dir::new(folder.try_clone_to_owned()?)?;
-    let mut names = listing
-        .map(|entry| Ok(OsStr::from_bytes(entry?.file_name().to_bytes()).to_owned()))
-        .filter(|name| !matches!(name, Ok(name) if name == "." || name == ".."))
-        .collect::<io::Result<Vec<OsString>>>()?;
+    let mut listing = Dir::new(folder.try_clone_to_owned()?)?;
+    // On interruption, rewind and restart, discarding the partial listing.
+    // Retry as often as needed, as `retry_on_intr` does.
+    let mut names = loop {
+        match listed(&mut listing, folder) {
+            Err(Errno::INTR) => listing.rewind(),
+            names => break names?,
+        }
+    };
     names.sort_unstable_by(|a, b| b.cmp(a));
+    Ok(names)
+}
+
+/// Reads the remaining names from `listing` (of `folder`), excluding `.` and
+/// `..`.
+fn listed(listing: &mut Dir, folder: BorrowedFd<'_>) -> rustix::io::Result<Vec<OsString>> {
+    #[cfg(not(test))]
+    let _ = folder;
+    let mut names = Vec::new();
+    while let Some(entry) = listing.read() {
+        let entry = entry?;
+        let name = entry.file_name().to_bytes();
+        if name != b"." && name != b".." {
+            names.push(OsStr::from_bytes(name).to_owned());
+        }
+        // Interrupted once a name is kept, so that the listing is partial.
+        #[cfg(test)]
+        if !names.is_empty()
+            && let Some(errno) = tests::fault(&tests::INTERRUPTED_LISTING, folder)
+        {
+            return Err(errno);
+        }
+    }
     Ok(names)
 }
 
@@ -724,7 +822,7 @@ impl Window {
 /// Adds the types of the desktop entry `name` in `folder`, of ID `id`, to
 /// `types`. It is skipped when it cannot be opened, checked or read for an
 /// error saying its name cannot be used as written ([`skipped`]), when it
-/// is not a regular file (any more) or is larger than [`MAX_FILE_LEN`]
+/// is not a regular file (any more) or is larger than `max_len`
 /// ([`read_regular_file`]), and when it is deleted
 /// ([`DesktopEntry::hidden`]) or not in UTF-8
 /// ([`DesktopEntry::supports_encoding`]).
@@ -738,8 +836,9 @@ fn add(
     name: &OsStr,
     id: &[u8],
     types: &mut BTreeMap<String, BTreeSet<Vec<u8>>>,
+    max_len: Option<u64>,
 ) -> io::Result<()> {
-    let Some(bytes) = skipping(read_regular_file(folder, name))?.flatten() else {
+    let Some(bytes) = skipping(read_regular_file(folder, name, max_len))?.flatten() else {
         return Ok(());
     };
     let entry = DesktopEntry::parse(&bytes);
@@ -776,16 +875,21 @@ fn fstat_file(file: BorrowedFd<'_>, name: &OsStr) -> rustix::io::Result<rustix::
 }
 
 /// Reads the regular file `name` in `folder`, as
-/// [`xdg_kit_basedir::read_regular_file`] reads one by path: opened without
-/// waiting (its type was checked before), checked again to be a regular
-/// file, and at most [`MAX_FILE_LEN`] bytes long. Opened and checked again
-/// when interrupted by a signal. `None` when it is not a regular file
-/// (replaced since its type was checked) or is longer.
+/// [`xdg_kit_basedir::read_regular_file`] reads one by path. Opens without
+/// waiting after a type check, checks again that the opened file is regular,
+/// and rejects files larger than `max_len` bytes (`None` allows any size).
+/// Retries opening and checking after signal interruptions. Returns `None`
+/// if the file is no longer regular or exceeds the size limit.
 ///
 /// # Errors
 ///
-/// When it cannot be opened, checked or read.
-fn read_regular_file(folder: BorrowedFd<'_>, name: &OsStr) -> io::Result<Option<Vec<u8>>> {
+/// When the file cannot be opened, checked or read, or memory cannot be
+/// reserved for it ([`io::ErrorKind::OutOfMemory`]).
+fn read_regular_file(
+    folder: BorrowedFd<'_>,
+    name: &OsStr,
+    max_len: Option<u64>,
+) -> io::Result<Option<Vec<u8>>> {
     let flags = OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC;
     let file = fs::File::from(rustix::io::retry_on_intr(|| {
         #[cfg(test)]
@@ -796,13 +900,69 @@ fn read_regular_file(folder: BorrowedFd<'_>, name: &OsStr) -> io::Result<Option<
     })?);
     let stat = fstat_file(file.as_fd(), name)?;
     let len = u64::try_from(stat.st_size).unwrap_or(0);
-    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile || len > MAX_FILE_LEN {
+    let fits = |len: u64| max_len.is_none_or(|max| len <= max);
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile || !fits(len) {
         return Ok(None);
     }
-    let mut bytes = Vec::with_capacity(usize::try_from(len).unwrap_or(0));
+    let mut bytes = buffer(len)?;
     // One byte more, to notice a file grown past the limit since.
-    file.take(MAX_FILE_LEN + 1).read_to_end(&mut bytes)?;
-    Ok((bytes.len() as u64 <= MAX_FILE_LEN).then_some(bytes))
+    let most = max_len.map_or(u64::MAX, |max| max.saturating_add(1));
+    read_rest(&mut file.take(most), &mut bytes, grow)?;
+    Ok(fits(bytes.len() as u64).then_some(bytes))
+}
+
+/// Appends data from `reader` to `bytes` until EOF, retrying reads interrupted
+/// by a signal. All buffer growth goes through `reserve` ([`grow`] outside
+/// tests). Unlike `read_to_end`, this returns an allocation error instead of
+/// aborting if the file grows beyond what can be reserved.
+///
+/// # Errors
+///
+/// When reading or `reserve` fails.
+fn read_rest(
+    reader: &mut impl Read,
+    bytes: &mut Vec<u8>,
+    reserve: impl Fn(&mut Vec<u8>, usize) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut chunk = [0; 16 * 1024];
+    loop {
+        let read = match reader.read(&mut chunk) {
+            Ok(0) => return Ok(()),
+            Ok(read) => read,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        };
+        reserve(bytes, read)?;
+        bytes.extend_from_slice(&chunk[..read]);
+    }
+}
+
+/// Reserves space in `bytes` for `more` bytes, as `Vec::reserve` would.
+///
+/// # Errors
+///
+/// [`io::ErrorKind::OutOfMemory`] if the space cannot be reserved.
+fn grow(bytes: &mut Vec<u8>, more: usize) -> io::Result<()> {
+    bytes.try_reserve(more).map_err(|_| out_of_memory())
+}
+
+/// The error returned when memory for a file cannot be reserved.
+fn out_of_memory() -> io::Error {
+    io::Error::new(io::ErrorKind::OutOfMemory, "too large to hold in memory")
+}
+
+/// Creates an empty buffer with capacity for `len` bytes.
+///
+/// # Errors
+///
+/// [`io::ErrorKind::OutOfMemory`] if the space cannot be reserved.
+fn buffer(len: u64) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    usize::try_from(len)
+        .ok()
+        .and_then(|len| bytes.try_reserve_exact(len).ok())
+        .ok_or_else(out_of_memory)?;
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -814,6 +974,117 @@ mod tests {
     use std::cell::{Cell, RefCell};
 
     use super::*;
+
+    #[test]
+    fn a_buffer_too_large_for_memory_is_an_error_not_an_abort() {
+        // Larger than any address space, whatever the machine's memory.
+        let err = buffer(1 << 60).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::OutOfMemory);
+        assert_eq!(buffer(4).unwrap().capacity(), 4);
+    }
+
+    // The tests below exercise the loop with custom readers. They deliberately
+    // leave its call sites untested: proving that a call cannot abort would
+    // require a file to grow beyond reservable memory while being read.
+
+    /// The bytes each read of a [`Drip`] gives.
+    const DRIP: usize = 7;
+
+    /// Gives `left` bytes, [`DRIP`] at a time, after failing once with
+    /// `hiccup`, if any.
+    struct Drip {
+        left: usize,
+        hiccup: Option<io::ErrorKind>,
+    }
+
+    impl Drip {
+        fn new(left: usize, hiccup: Option<io::ErrorKind>) -> Self {
+            Self { left, hiccup }
+        }
+    }
+
+    impl Read for Drip {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if let Some(kind) = self.hiccup.take() {
+                return Err(io::Error::from(kind));
+            }
+            let n = self.left.min(buf.len()).min(DRIP);
+            buf[..n].fill(b'x');
+            self.left -= n;
+            Ok(n)
+        }
+    }
+
+    /// [`grow`], checked to have made room for the [`DRIP`] bytes just
+    /// read.
+    fn checked_grow(bytes: &mut Vec<u8>, more: usize) -> io::Result<()> {
+        grow(bytes, more)?;
+        let room = bytes.capacity() - bytes.len();
+        assert!(room >= DRIP, "room for {room} bytes, {DRIP} read");
+        Ok(())
+    }
+
+    /// A whole number of reads.
+    const DRIPPED: usize = 14_286 * DRIP;
+
+    #[test]
+    fn a_reader_giving_more_than_reserved_is_read_whole() {
+        let mut bytes = buffer(4).unwrap();
+        read_rest(&mut Drip::new(DRIPPED, None), &mut bytes, checked_grow).unwrap();
+        assert_eq!(bytes, vec![b'x'; DRIPPED]);
+    }
+
+    #[test]
+    fn an_interrupted_read_is_made_again() {
+        let mut bytes = buffer(4).unwrap();
+        let mut reader = Drip::new(DRIPPED, Some(io::ErrorKind::Interrupted));
+        read_rest(&mut reader, &mut bytes, checked_grow).unwrap();
+        assert_eq!(bytes, vec![b'x'; DRIPPED]);
+    }
+
+    #[test]
+    fn a_failed_read_is_an_error() {
+        let mut bytes = buffer(4).unwrap();
+        let mut reader = Drip::new(DRIPPED, Some(io::ErrorKind::PermissionDenied));
+        let err = read_rest(&mut reader, &mut bytes, checked_grow).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn growth_that_cannot_be_reserved_is_an_error_not_an_abort() {
+        // Past 64 bytes, each growth asks for more than any address space.
+        let greedy = |bytes: &mut Vec<u8>, more: usize| {
+            grow(bytes, if bytes.len() < 64 { more } else { usize::MAX })
+        };
+        let mut bytes = buffer(4).unwrap();
+        let err = read_rest(&mut Drip::new(DRIPPED, None), &mut bytes, greedy).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::OutOfMemory);
+        assert!(bytes.len() <= 64 + DRIP, "{}", bytes.len());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_file_longer_than_its_size_is_skipped_past_the_limit() {
+        // A regular file whose size says 0 but whose reads give more, as a
+        // file that grew after `fstat` would.
+        let proc = open_at(rustix::fs::CWD, "/proc/self");
+        let name = OsStr::new("status");
+        assert_eq!(
+            rustix::fs::statat(&proc, name, AtFlags::empty())
+                .unwrap()
+                .st_size,
+            0
+        );
+        assert_eq!(
+            read_regular_file(proc.as_fd(), name, Some(8)).unwrap(),
+            None
+        );
+        let whole = read_regular_file(proc.as_fd(), name, None)
+            .unwrap()
+            .unwrap();
+        assert!(whole.len() > 8, "{}", whole.len());
+    }
 
     /// A change a test makes to the tree when the walk looks at a name.
     type Change = Box<dyn FnMut(&OsStr)>;
@@ -880,6 +1151,10 @@ mod tests {
         /// What [`open_folder`] calls on this thread with each name, before
         /// it opens it: a change to the tree once the name was looked at.
         pub(super) static OPENING: RefCell<Option<Change>> = const { RefCell::new(None) };
+        /// The folder whose listing [`names`] reads is interrupted on this
+        /// thread once a name was kept, and the error it gives.
+        pub(super) static INTERRUPTED_LISTING: RefCell<Option<(rustix::fs::Stat, Errno)>> =
+            const { RefCell::new(None) };
         /// The calls interrupted by a fault on this thread ([`once`]).
         static INTERRUPTED: Cell<usize> = const { Cell::new(0) };
     }
@@ -1539,13 +1814,13 @@ mod tests {
     }
 
     #[test]
-    fn a_folder_is_listed_once_by_the_folder_opened() {
+    fn a_folder_is_listed_as_the_folder_opened() {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir(dir.path().join("a")).unwrap();
         fs::write(dir.path().join("a/x.desktop"), ENTRY).unwrap();
         fs::create_dir(dir.path().join("z")).unwrap();
-        // `z` is an empty folder when looked at, and a link to `a`, listed
-        // already, when opened.
+        // `z` is an empty folder when looked at, and a link to `a` when
+        // opened: what is listed is `a`.
         let z = dir.path().join("z");
         let made = changed_when_opened(dir.path(), {
             let z = z.clone();
@@ -1557,8 +1832,8 @@ mod tests {
             }
         });
         assert!(z.is_symlink(), "`z` was changed when opened");
-        assert_eq!(made, "[MIME Cache]\ntext/plain=a-x.desktop;\n");
-        // The handle of `a` opened again through `z`, skipped, was closed.
+        assert_eq!(made, "[MIME Cache]\ntext/plain=a-x.desktop;z-x.desktop;\n");
+        // Every handle opened was closed.
         #[cfg(any(target_os = "linux", target_os = "android"))]
         assert_eq!(open_under(dir.path()), Vec::<std::path::PathBuf>::new());
     }
@@ -1613,26 +1888,25 @@ mod tests {
     #[test]
     fn a_folder_of_the_same_inode_on_another_device_is_another_folder() {
         let dir = tempfile::tempdir().unwrap();
-        for folder in ["a", "b"] {
-            fs::create_dir(dir.path().join(folder)).unwrap();
-            fs::write(dir.path().join(folder).join("x.desktop"), ENTRY).unwrap();
-        }
-        let [a, b] = ["a", "b"].map(|folder| rustix::fs::stat(dir.path().join(folder)).unwrap());
+        fs::write(dir.path().join("top.desktop"), ENTRY).unwrap();
+        fs::create_dir(dir.path().join("a")).unwrap();
+        fs::write(dir.path().join("a/x.desktop"), ENTRY).unwrap();
+        let [top, a] = ["", "a"].map(|folder| rustix::fs::stat(dir.path().join(folder)).unwrap());
         let made = |seen_as| {
-            SEEN_AS.set(Some((b, seen_as)));
+            SEEN_AS.set(Some((a, seen_as)));
             let made = mimeinfo_cache(dir.path());
             SEEN_AS.set(None);
             String::from_utf8(made.unwrap()).unwrap()
         };
-        // Once opened, `b` has the device and inode of `a`, listed already:
-        // it is skipped.
-        assert_eq!(made(a), "[MIME Cache]\ntext/plain=a-x.desktop;\n");
-        // With the inode of `a` but on another device, it is listed too.
-        let mut other_device = a;
+        // Once opened, `a` has the device and inode of the first folder, on
+        // the path: a loop, not listed.
+        assert_eq!(made(top), "[MIME Cache]\ntext/plain=top.desktop;\n");
+        // With that inode but on another device, it is listed.
+        let mut other_device = top;
         other_device.st_dev ^= 1;
         assert_eq!(
             made(other_device),
-            "[MIME Cache]\ntext/plain=a-x.desktop;b-x.desktop;\n"
+            "[MIME Cache]\ntext/plain=a-x.desktop;top.desktop;\n"
         );
     }
 
@@ -1688,19 +1962,19 @@ mod tests {
     }
 
     #[test]
-    fn a_folder_listed_already_is_not_opened_or_listed_again() {
+    fn a_folder_on_the_path_is_not_opened_or_listed_again() {
         let dir = tempfile::tempdir().unwrap();
         let a = dir.path().join("a");
         fs::create_dir(&a).unwrap();
         fs::write(a.join("x.desktop"), ENTRY).unwrap();
-        std::os::unix::fs::symlink("a", dir.path().join("z")).unwrap();
-        // Once `a` is listed, opening it fails: the link `z` to it, looked
-        // at, is not opened.
+        std::os::unix::fs::symlink("..", a.join("up")).unwrap();
+        // Once the walk is in `a`, opening the first folder fails: the link
+        // `up` to it, looked at, is not opened.
         LOOKING_AT.set(Some(Box::new({
-            let a = a.clone();
+            let top = dir.path().to_owned();
             move |name| {
-                if name == "z" {
-                    fail(&UNOPENABLE, Some((&a, Errno::IO)));
+                if name == "up" {
+                    fail(&UNOPENABLE, Some((&top, Errno::IO)));
                 }
             }
         })));
@@ -1711,24 +1985,91 @@ mod tests {
             String::from_utf8(made.unwrap()).unwrap(),
             "[MIME Cache]\ntext/plain=a-x.desktop;\n"
         );
-        // Once `a` is listed, listing it fails: `z`, an empty folder when
-        // looked at and a link to `a` when opened, is not listed.
-        fs::remove_file(dir.path().join("z")).unwrap();
-        fs::create_dir(dir.path().join("z")).unwrap();
-        let z = dir.path().join("z");
+        // Once the walk is in `a`, listing the first folder fails: `z`, an
+        // empty folder when looked at and a link to it when opened, is not
+        // listed.
+        fs::remove_file(a.join("up")).unwrap();
+        let z = a.join("z");
+        fs::create_dir(&z).unwrap();
         let made = changed_when_opened(dir.path(), {
-            let z = z.clone();
+            let (z, top) = (z.clone(), dir.path().to_owned());
             move |name| {
                 if name == "z" && !z.is_symlink() {
                     fs::remove_dir(&z).unwrap();
-                    std::os::unix::fs::symlink("a", &z).unwrap();
-                    UNLISTABLE.set(Some(rustix::fs::stat(&a).unwrap()));
+                    std::os::unix::fs::symlink("..", &z).unwrap();
+                    UNLISTABLE.set(Some(rustix::fs::stat(&top).unwrap()));
                 }
             }
         });
         UNLISTABLE.set(None);
         assert!(z.is_symlink(), "`z` was changed when opened");
         assert_eq!(made, "[MIME Cache]\ntext/plain=a-x.desktop;\n");
+    }
+
+    #[test]
+    fn a_folder_linked_under_two_names_is_listed_under_each() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("b")).unwrap();
+        fs::write(dir.path().join("b/foo.desktop"), ENTRY).unwrap();
+        std::os::unix::fs::symlink("b", dir.path().join("a")).unwrap();
+        // A loop: back to the first folder, and to `b` itself.
+        std::os::unix::fs::symlink("..", dir.path().join("b/self")).unwrap();
+        std::os::unix::fs::symlink(".", dir.path().join("b/here")).unwrap();
+        assert_eq!(
+            String::from_utf8(mimeinfo_cache(dir.path()).unwrap()).unwrap(),
+            "[MIME Cache]\ntext/plain=a-foo.desktop;b-foo.desktop;\n"
+        );
+    }
+
+    #[test]
+    fn one_file_under_two_paths_of_one_id_is_listed_once() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("x/y")).unwrap();
+        fs::write(dir.path().join("x/y/foo.desktop"), ENTRY).unwrap();
+        std::os::unix::fs::symlink("x/y", dir.path().join("x-y")).unwrap();
+        assert_eq!(
+            String::from_utf8(mimeinfo_cache(dir.path()).unwrap()).unwrap(),
+            "[MIME Cache]\ntext/plain=x-y-foo.desktop;\n"
+        );
+    }
+
+    #[test]
+    fn fan_out_through_links_fails_at_the_cap() {
+        // Folders `d1` to `d17` outside, each but the last with two links to
+        // the next, and two links to `d1`: about 2^18 entries along every
+        // path, more than the cap.
+        let dir = tempfile::tempdir().unwrap();
+        let ext = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.desktop"), ENTRY).unwrap();
+        write_mimeinfo_cache(dir.path()).unwrap();
+        let before = fs::read(dir.path().join("mimeinfo.cache")).unwrap();
+        let levels = 17;
+        for level in 1..=levels {
+            let folder = ext.path().join(format!("d{level}"));
+            fs::create_dir(&folder).unwrap();
+            if level < levels {
+                for name in ["l0", "l1"] {
+                    let next = ext.path().join(format!("d{}", level + 1));
+                    std::os::unix::fs::symlink(next, folder.join(name)).unwrap();
+                }
+            }
+        }
+        for name in ["l0", "l1"] {
+            std::os::unix::fs::symlink(ext.path().join("d1"), dir.path().join(name)).unwrap();
+        }
+        let err = mimeinfo_cache(dir.path()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Other, "{err}");
+        assert_eq!(
+            err.to_string(),
+            "mimeinfo.cache walk: more than 100000 entries to list; no cache made"
+        );
+        // No cache is written; the one written before stays.
+        assert!(write_mimeinfo_cache(dir.path()).is_err());
+        assert_eq!(fs::read(dir.path().join("mimeinfo.cache")).unwrap(), before);
+        assert_eq!(
+            listed(dir.path()),
+            ["a.desktop", "l0", "l1", "mimeinfo.cache"]
+        );
     }
 
     #[test]
@@ -1809,6 +2150,20 @@ mod tests {
     }
 
     #[test]
+    fn a_link_to_an_ancestor_further_up_is_not_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("a/b/c/d/e")).unwrap();
+        fs::write(dir.path().join("a/b/x.desktop"), ENTRY).unwrap();
+        fs::write(dir.path().join("a/b/c/d/e/f.desktop"), ENTRY).unwrap();
+        // At depth 5, a link to `a/b`, three levels up.
+        std::os::unix::fs::symlink("../../..", dir.path().join("a/b/c/d/e/up3")).unwrap();
+        assert_eq!(
+            String::from_utf8(mimeinfo_cache(dir.path()).unwrap()).unwrap(),
+            "[MIME Cache]\ntext/plain=a-b-c-d-e-f.desktop;a-b-x.desktop;\n"
+        );
+    }
+
+    #[test]
     fn an_interrupted_call_is_made_again() {
         // Each fault gives `EINTR` once, then is forgotten.
         let dir = three_entries();
@@ -1842,6 +2197,28 @@ mod tests {
             assert_eq!(made(), Ok(all.clone()), "{folder}");
             assert!(
                 UNFSTATABLE.with_borrow(Option::is_none),
+                "{folder}: interrupted"
+            );
+        }
+        // Listing a folder: listed again from the start, the partial
+        // listing dropped.
+        for folder in ["", "sub", "sub/deeper"] {
+            let path = dir.path().join(folder);
+            fail(&INTERRUPTED_LISTING, Some((&path, Errno::INTR)));
+            let handle = open_folder(rustix::fs::CWD, &path).unwrap();
+            let mut names = names(handle.as_fd()).map_err(|err| err.raw_os_error());
+            if let Ok(names) = &mut names {
+                names.reverse();
+            }
+            assert_eq!(names, Ok(listed(&path)), "{folder}");
+            assert!(
+                INTERRUPTED_LISTING.with_borrow(Option::is_none),
+                "{folder}: interrupted"
+            );
+            fail(&INTERRUPTED_LISTING, Some((&path, Errno::INTR)));
+            assert_eq!(made(), Ok(all.clone()), "{folder}");
+            assert!(
+                INTERRUPTED_LISTING.with_borrow(Option::is_none),
                 "{folder}: interrupted"
             );
         }
@@ -1883,8 +2260,8 @@ mod tests {
         .unwrap();
         assert_eq!(
             String::from_utf8(mimeinfo_cache(dir.path()).unwrap()).unwrap(),
-            "[MIME Cache]\ntext/plain=a-nested.desktop;\n",
-            "the FIFO is skipped, and the folder is listed once, under its first name"
+            "[MIME Cache]\ntext/plain=a-nested.desktop;z-nested.desktop;\n",
+            "the FIFO is skipped, and the folder is listed under each name"
         );
     }
 
@@ -2031,7 +2408,7 @@ mod tests {
             .write(true)
             .open(dir.path().join("sub/b.desktop"))
             .unwrap();
-        b.set_len(MAX_FILE_LEN + 1).unwrap();
+        b.set_len(xdg_kit_basedir::MAX_FILE_LEN + 1).unwrap();
         assert_eq!(
             String::from_utf8(mimeinfo_cache(dir.path()).unwrap()).unwrap(),
             "[MIME Cache]\ntext/plain=a.desktop;sub-deeper-c.desktop;\n"
@@ -2056,6 +2433,7 @@ mod tests {
                 OsStr::new("fifo.desktop"),
                 b"fifo.desktop",
                 &mut types,
+                Limits::default().max_file_len,
             )
             .unwrap();
             assert!(types.is_empty(), "{types:?}");

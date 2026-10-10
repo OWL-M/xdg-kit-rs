@@ -15,7 +15,7 @@ use xdg_kit_desktop_entry::{KeyFile, KeyNames};
 use xdg_kit_mime::MimeDatabase;
 
 use crate::error::{quoted, quoted_pair};
-use crate::{Diagnostic, TypePattern, work};
+use crate::{Diagnostic, Limits, TypePattern, work};
 
 /// The name of a file that may hold every group; desktop-specific ones
 /// (`$desktop-mimeapps.list`) may hold only the defaults.
@@ -156,7 +156,17 @@ impl MimeAppsList {
     ///
     /// When the file exists but cannot be read.
     pub fn for_user(base_dirs: &BaseDirs) -> io::Result<Self> {
-        Self::open(base_dirs.config_home().join(MIMEAPPS_LIST))
+        Self::for_user_with(base_dirs, &Limits::default())
+    }
+
+    /// [`MimeAppsList::for_user`] within `limits`.
+    ///
+    /// # Errors
+    ///
+    /// When the file exists but cannot be read, or is larger than
+    /// [`Limits::max_file_len`].
+    pub fn for_user_with(base_dirs: &BaseDirs, limits: &Limits) -> io::Result<Self> {
+        Self::open_with(base_dirs.config_home().join(MIMEAPPS_LIST), limits)
     }
 
     /// The file at `path`; a missing file is an empty list, created by
@@ -167,12 +177,22 @@ impl MimeAppsList {
     ///
     /// When the file exists but cannot be read.
     pub fn open(path: impl Into<PathBuf>) -> io::Result<Self> {
+        Self::open_with(path, &Limits::default())
+    }
+
+    /// [`MimeAppsList::open`] within `limits`.
+    ///
+    /// # Errors
+    ///
+    /// When the file exists but cannot be read, or is larger than
+    /// [`Limits::max_file_len`].
+    pub fn open_with(path: impl Into<PathBuf>, limits: &Limits) -> io::Result<Self> {
         // Absolute now, so that a later change of folder does not move it.
         let path = std::path::absolute(path.into())?;
         // Each byte of the path copied.
         work::count(path.as_os_str().len());
         let desktop_specific = path.file_name().is_some_and(|name| name != MIMEAPPS_LIST);
-        let file = match KeyFile::read_with(&path, KeyNames::Any) {
+        let file = match KeyFile::read_with_limits(&path, KeyNames::Any, &limits.for_entries()) {
             Ok(file) => file,
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
                 KeyFile::parse_with(b"", KeyNames::Any)

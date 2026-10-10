@@ -35,13 +35,17 @@ mod error;
 #[cfg(fuzzing)]
 #[doc(hidden)]
 pub mod fuzzing;
+mod limits;
 mod list;
 mod open;
 mod pattern;
 
 pub use apps::{AppMatch, Matched, MimeApps};
-pub use cache::{mimeinfo_cache, write_mimeinfo_cache};
+pub use cache::{
+    mimeinfo_cache, mimeinfo_cache_with, write_mimeinfo_cache, write_mimeinfo_cache_with,
+};
 pub use error::Diagnostic;
+pub use limits::Limits;
 pub use list::{EditError, Group, MIMEAPPS_LIST, MimeAppsList};
 pub use open::{OpenError, open_plan};
 pub use pattern::{MediaType, TypePattern};

@@ -15,13 +15,54 @@
 //! properties for them. A name that is not UTF-8 is matched byte by byte,
 //! with ASCII classes, and only against ASCII patterns: it never matches a
 //! pattern with other characters.
+//!
+//! A case-insensitive pattern is matched against a name lowercased per
+//! character, without context (ASCII only when it is not UTF-8). Its
+//! literals are lowercased the same way. A set member compares its
+//! one-to-one lowercase (itself when that is not one character) with the
+//! name's character: `[Σ]` matches `σ` but not `ς`, and `[İ]` (which
+//! lowercases to two characters) matches nothing. A range or a class tests
+//! the name's character and its one-to-one lowercase and uppercase:
+//! `[Σ-Σ]` matches `ς`. `[:upper:]` and `[:lower:]` match any letter that
+//! has case.
 
 use crate::work;
 
-/// Whether `name` matches `pattern`.
+/// Whether `name` matches `pattern`, case-sensitively.
 #[cfg(any(test, fuzzing))]
 pub(crate) fn matches(pattern: &str, name: &[u8]) -> bool {
-    Pattern::new(pattern).matches(&Name::new(name))
+    Pattern::new(pattern, false).matches(&Name::new(name))
+}
+
+/// Where the pattern at the start of `text` ends, in bytes: at the first
+/// `:` read as an item of its own (not escaped, not in a set), else at the
+/// end. A `[` that no `]` closes is itself, so a later `:` still ends the
+/// pattern; one that can never match takes the rest of `text`, as
+/// [`parse`] reads it. A set that a trailing `\` keeps from closing
+/// (`[:\:cs`, `x[:a\:cs`) leaves its `[` itself and its `:` bare, so the
+/// pattern ends there: the format's accepted ambiguity.
+pub(crate) fn pattern_end(text: &str) -> usize {
+    // Each byte decoded and copied twice.
+    work::count(2 * text.len());
+    let places: Vec<usize> = text.char_indices().map(|(at, _)| at).collect();
+    let chars: Vec<char> = text.chars().collect();
+    let mut sets = None;
+    let mut at = 0;
+    while let Some(&symbol) = chars.get(at) {
+        work::count(1);
+        if symbol == ':' {
+            return places[at];
+        }
+        at += 1;
+        if symbol == '\\' {
+            at += 1;
+        } else if symbol == '['
+            && let Some((_, used)) = sets.get_or_insert_with(|| Sets::new(&chars)).bracket(at)
+        {
+            at += used;
+        }
+    }
+    text.len()
 }
 
 /// A pattern parsed once, to be matched against many names.
@@ -31,27 +72,32 @@ pub(crate) struct Pattern {
     /// The pattern over bytes when it is all ASCII: only then can a name
     /// that is not UTF-8 match.
     bytes: Option<Vec<Item<u8>>>,
+    /// Case-insensitive: names given are lowercased.
+    fold: bool,
 }
 
 impl Pattern {
-    pub(crate) fn new(pattern: &str) -> Self {
+    /// Parses `pattern`, using case-insensitive matching when `fold` is set.
+    pub(crate) fn new(pattern: &str, fold: bool) -> Self {
         // Each byte decoded and copied, then checked for ASCII.
         work::count(2 * pattern.len());
         let chars: Vec<char> = pattern.chars().collect();
         Self {
-            chars: parse(&chars),
-            bytes: pattern.is_ascii().then(|| parse(pattern.as_bytes())),
+            chars: parse(&chars, fold),
+            bytes: pattern.is_ascii().then(|| parse(pattern.as_bytes(), fold)),
+            fold,
         }
     }
 
-    /// Whether `name` matches this pattern.
+    /// Whether `name` matches this pattern. A case-insensitive pattern
+    /// wants the name lowercased per character.
     pub(crate) fn matches(&self, name: &Name<'_>) -> bool {
         match name {
-            Name::Chars(name) => match_items(&self.chars, name),
+            Name::Chars(name) => match_items(&self.chars, name, self.fold),
             Name::Bytes(name) => self
                 .bytes
                 .as_deref()
-                .is_some_and(|pattern| match_items(pattern, name)),
+                .is_some_and(|pattern| match_items(pattern, name, self.fold)),
         }
     }
 }
@@ -139,6 +185,23 @@ trait Symbol: Copy + Eq + Ord {
     /// The ASCII letter this is, if it is one.
     fn ascii(self) -> Option<char>;
     fn in_class(self, class: Class) -> bool;
+    /// Lowercased, as names are for case-insensitive patterns.
+    fn lowercase(self) -> impl Iterator<Item = Self>;
+    /// Returns the lowercase and uppercase forms when each is one symbol;
+    /// otherwise returns the original symbol for that form.
+    fn lower(self) -> Self;
+    fn upper(self) -> Self;
+    /// A letter with case: what `[:upper:]` and `[:lower:]` match
+    /// case-insensitively.
+    fn has_case(self) -> bool;
+}
+
+/// The only character of `mapped`, if it has just one.
+fn single(mut mapped: impl Iterator<Item = char>) -> Option<char> {
+    match (mapped.next(), mapped.next()) {
+        (Some(only), None) => Some(only),
+        _ => None,
+    }
 }
 
 impl Symbol for char {
@@ -148,6 +211,22 @@ impl Symbol for char {
 
     fn ascii(self) -> Option<char> {
         self.is_ascii().then_some(self)
+    }
+
+    fn lowercase(self) -> impl Iterator<Item = Self> {
+        self.to_lowercase()
+    }
+
+    fn lower(self) -> Self {
+        single(self.to_lowercase()).unwrap_or(self)
+    }
+
+    fn upper(self) -> Self {
+        single(self.to_uppercase()).unwrap_or(self)
+    }
+
+    fn has_case(self) -> bool {
+        self.is_lowercase() || self.is_uppercase()
     }
 
     fn in_class(self, class: Class) -> bool {
@@ -177,6 +256,22 @@ impl Symbol for u8 {
         self.is_ascii().then_some(char::from(self))
     }
 
+    fn lowercase(self) -> impl Iterator<Item = Self> {
+        std::iter::once(self.to_ascii_lowercase())
+    }
+
+    fn lower(self) -> Self {
+        self.to_ascii_lowercase()
+    }
+
+    fn upper(self) -> Self {
+        self.to_ascii_uppercase()
+    }
+
+    fn has_case(self) -> bool {
+        self.is_ascii_alphabetic()
+    }
+
     fn in_class(self, class: Class) -> bool {
         match class {
             Class::Alnum => self.is_ascii_alphanumeric(),
@@ -195,7 +290,8 @@ impl Symbol for u8 {
     }
 }
 
-fn parse<T: Symbol>(pattern: &[T]) -> Vec<Item<T>> {
+/// The items of `pattern`; with `fold`, those outside sets lowercased.
+fn parse<T: Symbol>(pattern: &[T], fold: bool) -> Vec<Item<T>> {
     let mut items = Vec::new();
     let mut sets = None;
     let mut at = 0;
@@ -225,7 +321,10 @@ fn parse<T: Symbol>(pattern: &[T]) -> Vec<Item<T>> {
         } else {
             Item::Literal(symbol)
         };
-        items.push(item);
+        match item {
+            Item::Literal(symbol) if fold => items.extend(symbol.lowercase().map(Item::Literal)),
+            item => items.push(item),
+        }
     }
     items
 }
@@ -381,12 +480,23 @@ enum Element<T> {
     Never,
 }
 
-fn set_matches<T: Symbol>(members: &[Member<T>], negated: bool, symbol: T) -> bool {
+/// Whether a set matches `symbol`; with `fold`, case-insensitively.
+fn set_matches<T: Symbol>(members: &[Member<T>], negated: bool, symbol: T, fold: bool) -> bool {
+    let variants = if fold {
+        [symbol, symbol.lower(), symbol.upper()]
+    } else {
+        [symbol; 3]
+    };
     for member in members {
+        work::count(1);
         let hit = match *member {
+            Member::One(one) if fold => one.lower() == symbol.lower(),
             Member::One(one) => one == symbol,
-            Member::Range(low, high) => low <= symbol && symbol <= high,
-            Member::Class(class) => symbol.in_class(class),
+            Member::Range(low, high) => variants.iter().any(|&v| low <= v && v <= high),
+            Member::Class(Class::Upper | Class::Lower) if fold => {
+                variants.iter().any(|&v| v.has_case())
+            }
+            Member::Class(class) => variants.iter().any(|&v| v.in_class(class)),
             Member::Invalid => return false,
         };
         if hit {
@@ -396,13 +506,20 @@ fn set_matches<T: Symbol>(members: &[Member<T>], negated: bool, symbol: T) -> bo
     negated
 }
 
-/// Matching with backtracking only at the last `*`, which keeps it linear
-/// in practice and never recursive.
-fn match_items<T: Symbol>(pattern: &[Item<T>], name: &[T]) -> bool {
+/// Matching that backtracks only to the last `*`, never recursively.
+/// After a `*`, the items up to the next one are tried at successive
+/// places of the name, and no try starts before the one before it: at
+/// most (name length + `*`s + 1) tries, each costing at most the longest
+/// run of items after a `*` (set members included) plus one step, on top
+/// of the items before the first `*`. So the work is linear in the name
+/// for a given pattern, but pattern × name at worst: `*aa…ab` against
+/// `aa…a`.
+fn match_items<T: Symbol>(pattern: &[Item<T>], name: &[T], fold: bool) -> bool {
     let (mut p, mut n) = (0, 0);
     // Where to resume after the last `*`: (pattern index after it, name index).
     let mut resume: Option<(usize, usize)> = None;
     loop {
+        work::count(1);
         if let Some(item) = pattern.get(p) {
             let advanced = match item {
                 Item::Star => {
@@ -412,7 +529,7 @@ fn match_items<T: Symbol>(pattern: &[Item<T>], name: &[T]) -> bool {
                 }
                 Item::Any => n < name.len(),
                 Item::Set { members, negated } => {
-                    n < name.len() && set_matches(members, *negated, name[n])
+                    n < name.len() && set_matches(members, *negated, name[n], fold)
                 }
                 Item::Literal(symbol) => n < name.len() && name[n] == *symbol,
                 Item::Never => false,
@@ -439,7 +556,7 @@ fn match_items<T: Symbol>(pattern: &[Item<T>], name: &[T]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Pattern, matches};
+    use super::{Name, Pattern, matches, pattern_end};
     use crate::work;
 
     fn m(pattern: &str, name: &str) -> bool {
@@ -501,6 +618,22 @@ mod tests {
     }
 
     #[test]
+    fn a_bracket_that_never_matches_takes_the_rest_of_the_pattern() {
+        // `[.` with no `.]` after it: the bracket never matches, and the
+        // `:` after it is part of it, as `parse` reads it.
+        for text in ["[[.:", "*[a:b[.x:cs", "x[a[.:y:z"] {
+            assert_eq!(pattern_end(text), text.len(), "{text}");
+            assert!(!m(text, text), "{text}");
+            assert!(!folded(text, text), "{text}");
+        }
+        // A `[` no `]` closes is itself: the next `:` still ends it.
+        assert_eq!(pattern_end("*[a:cs"), 3);
+        // Also when an escaped `:` keeps the set open.
+        assert_eq!(pattern_end("[:\\:cs"), 1);
+        assert_eq!(pattern_end("x[:a\\:cs"), 2);
+    }
+
+    #[test]
     fn names_that_are_not_utf8_match_byte_wise() {
         assert!(matches("*.txt", b"\xff\xfe.txt"));
         assert!(matches("?.txt", b"\xff.txt"));
@@ -510,6 +643,94 @@ mod tests {
             "no byte-wise match of a non-ASCII pattern"
         );
         assert!(!matches("[é]?", b"\xc3\xff"));
+    }
+
+    /// Whether `name`, lowercased per character as names are, matches
+    /// `pattern` case-insensitively.
+    fn folded(pattern: &str, name: &str) -> bool {
+        let lower: String = name.chars().flat_map(char::to_lowercase).collect();
+        Pattern::new(pattern, true).matches(&Name::new(lower.as_bytes()))
+    }
+
+    #[test]
+    fn case_insensitive_patterns_fold_in_the_matcher() {
+        assert!(folded("*.TXT", "a.txt"));
+        assert!(folded("*Σ", "aσ"));
+        assert!(!folded("*Σ", "aς"), "ς is lowercase already");
+        assert!(folded("[[:upper:]].foo", "a.foo"));
+        assert!(folded("[[:upper:]].foo", "A.foo"));
+        assert!(folded("[[:lower:]]", "É"));
+        assert!(folded("[[:upper:]]", "ß"), "a letter with case");
+        assert!(!folded("[[:upper:]]", "1"));
+        assert!(!folded("[![:upper:]]", "a"));
+        assert!(folded("[A-C].x", "b.x"));
+        assert!(folded("[a-c].x", "B.x"));
+        assert!(folded("[Z-a]", "z"), "a range keeps its ends as written");
+        assert!(!folded("[!A-C]", "b"));
+        assert!(folded("[Σ]", "σ"));
+        assert!(!folded("[Σ]", "ς"), "a member folds as a literal does");
+        assert!(folded("[Σ-Σ]", "ς"), "a range tests the uppercase too");
+        assert!(!folded("[İ]", "İ"), "a member that lowercases to two");
+        assert!(!folded("[İ]", "i"));
+        assert!(folded("[[=A=]]", "a"));
+        assert!(folded("\\A", "a"));
+        assert!(folded("İ", "İ"), "a character that lowercases to two");
+        assert!(!m("[[:upper:]]", "a"), "case-sensitive patterns as before");
+        assert!(!m("[A-C]", "b"));
+        // Names that are not UTF-8: ASCII folding.
+        let ascii = Pattern::new("[[:upper:]]?", true);
+        assert!(ascii.matches(&Name::new(b"a\xff")));
+        assert!(!ascii.matches(&Name::new(b"1\xff")));
+        let range = Pattern::new("[A-C]?", true);
+        assert!(range.matches(&Name::new(b"b\xff")));
+    }
+
+    #[test]
+    fn a_long_case_insensitive_pattern_is_parsed_and_matched_in_linear_time() {
+        // Items that fold: a literal that lowercases to two characters,
+        // a range and a class tested with case variants, a member. One
+        // `*` first, which matches at once, or no `*` and a mismatch at
+        // the end: no backtracking. Steps cost per character, so per
+        // unit (29 pattern bytes in 25 characters, 9 name bytes): 58 to
+        // decode and copy the pattern's bytes; 5 to read the top-level
+        // characters and 50 to mark each character and look at it for
+        // a `.]`; 20 in the sets (a step per member and per `]`, and
+        // `upper:` read and copied, 12); 10 to match (6 items, `İ`
+        // folding to two, and 4 members), about 0.26 a byte. 143 in
+        // all, 3.76 a byte; the bound is twice that.
+        let unit = "İ[Σ-Σ][[:upper:]][A-C][Σ]";
+        let name = "i\u{307}ςabσ";
+        for (pattern, tail, matched) in [("*", "", true), ("", "x", false)] {
+            work::assert_linear(
+                2000,
+                |n| {
+                    let pattern = format!("{pattern}{}{tail}", unit.repeat(n));
+                    // Lowercased and split as names are, by the caller.
+                    let lower = crate::database::lowercase(name.repeat(n).as_bytes());
+                    let bytes = pattern.len() + lower.len();
+                    let lower = Name::new(&lower);
+                    let (hit, steps) = work::steps(|| Pattern::new(&pattern, true).matches(&lower));
+                    assert_eq!(hit, matched);
+                    (steps, bytes)
+                },
+                |units, _| 2 * (100 + 143 * units),
+            );
+        }
+    }
+
+    #[test]
+    fn backtracking_after_a_star_takes_pattern_times_name_at_worst() {
+        // `*` then `a` × n and `b`, against `a` × 2n: 2n + 1 tries, the
+        // first n + 1 of n + 1 steps. Within the documented bound of
+        // (name + `*`s + 1) tries of (run + 1) steps, and above n².
+        for n in [1000, 2000] {
+            let pattern = Pattern::new(&format!("*{}b", "a".repeat(n)), false);
+            let name = "a".repeat(2 * n);
+            let name = Name::new(name.as_bytes());
+            let (hit, steps) = work::steps(|| pattern.matches(&name));
+            assert!(!hit);
+            assert!(n * n < steps && steps <= (2 * n + 2) * (n + 2), "{steps}");
+        }
     }
 
     #[test]
@@ -550,7 +771,7 @@ mod tests {
                 5000,
                 |n| {
                     let pattern = shape(n);
-                    let ((), steps) = work::steps(|| drop(Pattern::new(&pattern)));
+                    let ((), steps) = work::steps(|| drop(Pattern::new(&pattern, false)));
                     (steps, pattern.len())
                 },
                 |_, bytes| parse_bound(per, bytes),

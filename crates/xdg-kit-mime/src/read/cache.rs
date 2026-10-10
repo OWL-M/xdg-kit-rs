@@ -2,22 +2,23 @@
 //! as the text files.
 //!
 //! Treats the file as untrusted. Checks every offset, count and string
-//! against its length, and limits recursion to [`MAX_DEPTH`]. The file size
-//! bounds the number of suffix tree nodes and matchlets visited, preventing
-//! loops from offsets that point back into the tree. It also bounds the
-//! bytes copied and time spent finding strings, so reading costs time and
-//! memory in proportion to the file size. Reports at most
-//! [`MAX_DIAGNOSTICS`](super::MAX_DIAGNOSTICS) problems per file.
+//! against its length, and limits recursion to
+//! [`Limits::max_rule_depth`] and [`MAX_SUFFIX_LEN`]. The file size bounds
+//! the number of suffix tree nodes and matchlets visited, preventing loops
+//! from offsets that point back into the tree. With the default
+//! [`Limits`], it also bounds the bytes copied and time spent finding
+//! strings, so reading costs time and memory in proportion to the file
+//! size. Reports at most [`Limits::max_diagnostics`] problems per file.
 
 use std::path::Path;
 
 use super::Problems;
-use crate::model::{Folder, Glob, MAX_DEPTH, MagicRule, Matchlet, NO_GLOBS, NO_MAGIC};
-use crate::{Diagnostic, Location, MimeType};
+use crate::model::{Folder, Glob, MagicRule, Matchlet, NO_GLOBS, NO_MAGIC};
+use crate::{Diagnostic, Limits, Location, MimeType};
 
-/// Longest string read from the file. Real patterns, namespace URIs and icon
-/// names are far shorter; the limit bounds the search for each string's end.
-const MAX_STRING: usize = 4096;
+/// Longest suffix pattern read from the suffix tree, in characters, less
+/// the `*`; the tree is read recursively, a level per character.
+const MAX_SUFFIX_LEN: usize = 256;
 
 /// The major version this reader understands.
 const MAJOR: u16 = 1;
@@ -50,11 +51,13 @@ struct Reader<'a> {
     problems: Problems<'a>,
     /// Nodes and matchlets still allowed to be visited.
     budget: usize,
-    /// Bytes still allowed to be copied out of the file. Strings are shared
-    /// by many entries in a real cache, so this allows several times the
-    /// file's size; it only stops a file that points many entries at one
-    /// large region.
-    byte_budget: usize,
+    /// Bytes still allowed to be copied out of the file (`None`: any). See
+    /// [`Limits::cache_copy_per_byte`].
+    byte_budget: Option<usize>,
+    /// The longest string read ([`Limits::max_cache_string`]).
+    max_string: Option<usize>,
+    /// The deepest matchlet nesting read ([`Limits::max_rule_depth`]).
+    max_depth: usize,
     /// Whether the byte budget has run out (reported once).
     exhausted: bool,
     /// Matchlets dropped so far because none of their children could be
@@ -73,10 +76,13 @@ impl Reader<'_> {
     }
 
     /// A zero-terminated string starting at `at`, of at most
-    /// [`MAX_STRING`] bytes.
+    /// [`Limits::max_cache_string`] bytes.
     fn bytes_at(&self, at: usize) -> Option<&[u8]> {
         let rest = self.bytes.get(at..)?;
-        let rest = &rest[..rest.len().min(MAX_STRING + 1)];
+        let rest = match self.max_string {
+            Some(max) => &rest[..rest.len().min(max.saturating_add(1))],
+            None => rest,
+        };
         let end = rest.iter().position(|&byte| byte == 0)?;
         Some(&rest[..end])
     }
@@ -97,7 +103,10 @@ impl Reader<'_> {
     /// Spends `len` bytes of the copy budget; `false` (reported once) when
     /// it runs out.
     fn charge(&mut self, at: usize, len: usize) -> bool {
-        if self.exhausted || len > self.byte_budget {
+        let Some(byte_budget) = self.byte_budget else {
+            return true;
+        };
+        if self.exhausted || len > byte_budget {
             if !self.exhausted {
                 self.exhausted = true;
                 self.report(at, "more data than the file can hold, rest skipped");
@@ -106,7 +115,7 @@ impl Reader<'_> {
             self.budget = 0;
             return false;
         }
-        self.byte_budget -= len;
+        self.byte_budget = Some(byte_budget - len);
         true
     }
 
@@ -159,12 +168,13 @@ impl Reader<'_> {
     }
 }
 
-/// Reads `bytes`, the contents of `path`, into `folder`.
+/// Reads `bytes`, the contents of `path`, into `folder`, within `limits`.
 pub(crate) fn read(
     path: &Path,
     bytes: &[u8],
     folder: &mut Folder,
     diagnostics: &mut Vec<Diagnostic>,
+    limits: &Limits,
 ) -> Result<(), Unusable> {
     if bytes.len() < 40 {
         return Err(Unusable::Damaged("header too short", 0));
@@ -176,9 +186,17 @@ pub(crate) fn read(
     }
     let mut reader = Reader {
         bytes,
-        problems: Problems::new(path, diagnostics),
+        problems: Problems::new(path, diagnostics, limits.max_diagnostics),
+        // Each node and matchlet takes at least 12 bytes.
         budget: bytes.len() / 12 + 1,
-        byte_budget: bytes.len().saturating_mul(8).saturating_add(64 * 1024),
+        byte_budget: limits.cache_copy_per_byte.map(|per_byte| {
+            bytes
+                .len()
+                .saturating_mul(per_byte)
+                .saturating_add(limits.cache_copy_extra)
+        }),
+        max_string: limits.max_cache_string,
+        max_depth: limits.rule_depth(),
         exhausted: false,
         childless: 0,
     };
@@ -349,7 +367,7 @@ fn read_suffix_nodes(
     reversed: &mut Vec<char>,
     folder: &mut Folder,
 ) {
-    if reversed.len() > 4 * MAX_DEPTH {
+    if reversed.len() > MAX_SUFFIX_LEN {
         reader.report(first, "suffix tree too deep, branch skipped");
         return;
     }
@@ -463,7 +481,8 @@ fn read_matchlets(
     first: usize,
     depth: usize,
 ) -> Vec<Matchlet> {
-    if depth > MAX_DEPTH {
+    // A leaf's empty child list nests nothing, whatever its depth.
+    if count > 0 && depth > reader.max_depth {
         reader.report(first, "magic nested too deep, branch skipped");
         return Vec::new();
     }
@@ -497,7 +516,8 @@ fn read_matchlets(
         else {
             continue;
         };
-        let copied = if mask_at == 0 { 1 } else { 2 } * value_len as usize;
+        // A length that overflows is more than any budget.
+        let copied = copied_len(value_len as usize, mask_at != 0).unwrap_or(usize::MAX);
         if !reader.charge(at, copied) {
             break;
         }
@@ -534,6 +554,13 @@ fn read_matchlets(
         });
     }
     matchlets
+}
+
+/// The bytes a matchlet copies: its value of `value_len` bytes, and as
+/// many again for its mask if `masked`. `None` when that overflows `usize`
+/// (on 32-bit targets).
+fn copied_len(value_len: usize, masked: bool) -> Option<usize> {
+    value_len.checked_mul(if masked { 2 } else { 1 })
 }
 
 /// `NamespaceList`: (namespace URI, local name, type).
@@ -612,6 +639,7 @@ mod tests {
             bytes,
             &mut folder,
             &mut diagnostics,
+            &Limits::default(),
         );
         (result, folder, diagnostics)
     }
@@ -749,6 +777,38 @@ mod tests {
             diagnostics.len()
         );
         assert!(!diagnostics.is_empty());
+    }
+
+    #[test]
+    fn a_copied_length_that_overflows_is_refused() {
+        assert_eq!(copied_len(7, false), Some(7));
+        assert_eq!(copied_len(7, true), Some(14));
+        assert_eq!(copied_len(usize::MAX, false), Some(usize::MAX));
+        assert_eq!(copied_len(usize::MAX, true), None);
+        assert_eq!(copied_len(usize::MAX / 2 + 1, true), None);
+    }
+
+    /// Value and mask together overflow `usize` on 32-bit targets. A guard
+    /// only: on 64-bit the sum does not overflow and the length is refused
+    /// as more than the file holds, fixed or not.
+    /// `a_copied_length_that_overflows_is_refused` tells the two apart.
+    #[test]
+    fn a_masked_value_of_2_gib_is_refused() {
+        let mut bytes = cache_bytes();
+        let magic = u32_at(&bytes, 24);
+        let first_match = u32_at(&bytes, magic + 8);
+        let matchlet = u32_at(&bytes, first_match + 12);
+        set_u32(&mut bytes, matchlet + 12, 0x8000_0000); // value length
+        set_u32(&mut bytes, matchlet + 20, 4); // a mask
+        let (result, folder, diagnostics) = decode(&bytes);
+        assert!(result.is_ok());
+        assert!(folder.magic.is_empty(), "{:?}", folder.magic);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("more data than the file can hold")),
+            "{diagnostics:?}"
+        );
     }
 
     #[test]

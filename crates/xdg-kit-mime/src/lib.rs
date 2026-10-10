@@ -27,6 +27,7 @@ mod fnmatch;
 #[cfg(fuzzing)]
 #[doc(hidden)]
 pub mod fuzzing;
+mod limits;
 mod merge;
 mod mime_type;
 mod model;
@@ -38,6 +39,7 @@ mod xml;
 pub use database::MimeDatabase;
 pub use detect::{Certainty, DecidedBy, Detection, NameMatch, NameMatches, PathOptions};
 pub use error::{Diagnostic, Location};
+pub use limits::{Limits, MAX_RULE_DEPTH};
 pub use mime_type::{InvalidMimeType, MimeType};
 pub use tree::TreeOptions;
 pub use xdg_kit_locale::Locales;

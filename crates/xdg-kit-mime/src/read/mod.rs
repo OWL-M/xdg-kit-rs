@@ -7,30 +7,49 @@ use std::path::Path;
 
 use crate::{Diagnostic, Location};
 
-/// Problems listed per file before the rest are summed up in one line.
-pub(crate) const MAX_DIAGNOSTICS: usize = 100;
+/// The default problem cap, for tests.
+#[cfg(test)]
+pub(crate) use crate::limits::DEFAULT_DIAGNOSTICS as MAX_DIAGNOSTICS;
 
-/// The problems found in one file: the first [`MAX_DIAGNOSTICS`] are
-/// listed, then one line says there are more.
+/// The problems found in one file: the first
+/// [`Limits::max_diagnostics`](crate::Limits::max_diagnostics) are listed,
+/// then one line says there are more.
 pub(crate) struct Problems<'a> {
     path: &'a Path,
     diagnostics: &'a mut Vec<Diagnostic>,
+    /// The most problems listed (`None`: all).
+    max: Option<usize>,
     /// Problems reported so far.
     reported: usize,
 }
 
 impl<'a> Problems<'a> {
-    pub(crate) fn new(path: &'a Path, diagnostics: &'a mut Vec<Diagnostic>) -> Self {
+    pub(crate) fn new(
+        path: &'a Path,
+        diagnostics: &'a mut Vec<Diagnostic>,
+        max: Option<usize>,
+    ) -> Self {
         Self {
             path,
             diagnostics,
+            max,
             reported: 0,
         }
     }
 
+    /// The most problems listed (`None`: all).
+    pub(crate) fn max(&self) -> Option<usize> {
+        self.max
+    }
+
     pub(crate) fn report(&mut self, location: Option<Location>, message: impl Into<String>) {
         self.reported += 1;
-        match self.reported.cmp(&(MAX_DIAGNOSTICS + 1)) {
+        let Some(max) = self.max else {
+            self.diagnostics
+                .push(Diagnostic::new(self.path, location, message));
+            return;
+        };
+        match self.reported.cmp(&max.saturating_add(1)) {
             std::cmp::Ordering::Less => {
                 self.diagnostics
                     .push(Diagnostic::new(self.path, location, message));
@@ -38,7 +57,7 @@ impl<'a> Problems<'a> {
             std::cmp::Ordering::Equal => self.diagnostics.push(Diagnostic::new(
                 self.path,
                 None,
-                format!("more than {MAX_DIAGNOSTICS} problems; the rest are not listed"),
+                format!("more than {max} problems; the rest are not listed"),
             )),
             std::cmp::Ordering::Greater => {}
         }
@@ -95,7 +114,14 @@ mod tests {
     fn both(mime: &std::path::Path) -> (Folder, Folder) {
         let mut from_text = Folder::default();
         let mut diagnostics = Vec::new();
-        text::read(mime, text::Parts::All, &mut from_text, &mut diagnostics);
+        let limits = &crate::Limits::default();
+        text::read(
+            mime,
+            text::Parts::All,
+            &mut from_text,
+            &mut diagnostics,
+            limits,
+        );
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
         let mut from_cache = Folder::default();
         let bytes = std::fs::read(mime.join("mime.cache")).unwrap();
@@ -104,6 +130,7 @@ mod tests {
             &bytes,
             &mut from_cache,
             &mut diagnostics,
+            limits,
         )
         .unwrap();
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
@@ -180,6 +207,122 @@ mod tests {
         assert!(!from_text.no_globs.is_empty() && !from_text.no_magic.is_empty());
         assert_eq!(from_text.globs.len(), 4, "{:?}", from_text.globs);
         agree(&from_text, &from_cache);
+    }
+
+    /// One package of `globs` (pattern, type), built, then loaded with
+    /// its `mime.cache` and from its text files alone.
+    fn with_and_without_the_cache(globs: &[(&str, &str)]) -> [crate::MimeDatabase; 2] {
+        use std::fmt::Write as _;
+        let mut package = String::from(
+            r#"<?xml version="1.0"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">"#,
+        );
+        for (pattern, mime) in globs {
+            write!(
+                package,
+                r#"<mime-type type="{mime}"><glob pattern="{pattern}"/></mime-type>"#
+            )
+            .unwrap();
+        }
+        package.push_str("</mime-info>");
+        let dir = tempfile::tempdir().unwrap();
+        let mime = testing::build(dir.path(), &[("globs.xml", &package)]);
+        let (from_text, from_cache) = both(&mime);
+        agree(&from_text, &from_cache);
+        let cached = crate::MimeDatabase::from_dirs([&mime]);
+        std::fs::remove_file(mime.join("mime.cache")).unwrap();
+        let text = crate::MimeDatabase::from_dirs([&mime]);
+        for db in [&cached, &text] {
+            assert!(db.diagnostics().is_empty(), "{:?}", db.diagnostics());
+        }
+        [cached, text]
+    }
+
+    /// The type `name` gets from each of `dbs`, if any.
+    fn named(dbs: &[crate::MimeDatabase], name: &str) -> Vec<Option<String>> {
+        dbs.iter()
+            .map(|db| {
+                db.type_for_name(name)
+                    .best()
+                    .map(|found| found.mime.to_string())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_set_with_a_colon_reads_the_same_with_and_without_the_cache() {
+        let dbs = with_and_without_the_cache(&[("*[[:digit:]].foo", "application/x-digit")]);
+        let digit = Some("application/x-digit".to_owned());
+        assert_eq!(named(&dbs, "A1.foo"), [digit.clone(), digit]);
+        assert_eq!(named(&dbs, "AB.foo"), [None, None]);
+    }
+
+    #[test]
+    fn a_bracket_that_never_matches_matches_nothing_with_and_without_the_cache() {
+        // `[.` with no `.]` after it: glibc's `fnmatch` gives up on the
+        // bracket. The text files then hold the flags inside the pattern,
+        // so the readers' globs differ, but neither matches anything.
+        let package = r#"<?xml version="1.0"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+<mime-type type="text/x-p"><glob pattern="*[a:b[.x" case-sensitive="true"/></mime-type>
+</mime-info>"#;
+        let dir = tempfile::tempdir().unwrap();
+        let mime = testing::build(dir.path(), &[("p.xml", package)]);
+        let globs2 = std::fs::read_to_string(mime.join("globs2")).unwrap();
+        assert!(
+            globs2.ends_with("50:text/x-p:*[a:b[.x:cs\n50:text/x-p:*[a:b[.x\n"),
+            "{globs2}"
+        );
+        let cached = crate::MimeDatabase::from_dirs([&mime]);
+        std::fs::remove_file(mime.join("mime.cache")).unwrap();
+        let text = crate::MimeDatabase::from_dirs([&mime]);
+        let dbs = [cached, text];
+        for name in ["foo[a", "foo[a:b[.x", "foo[a:b[.x:cs", "a"] {
+            assert_eq!(named(&dbs, name), [None, None], "{name}");
+        }
+        // The text files' flagless copy is another pattern: both listed.
+        let p = crate::MimeType::new("text/x-p").unwrap();
+        assert_eq!(dbs[0].patterns_for(&p), ["*[a:b[.x"]);
+        assert_eq!(dbs[1].patterns_for(&p), ["*[a:b[.x:cs", "*[a:b[.x"]);
+        for db in &dbs {
+            assert!(db.diagnostics().is_empty(), "{:?}", db.diagnostics());
+        }
+    }
+
+    #[test]
+    fn case_is_folded_per_character_with_and_without_the_cache() {
+        let dbs = with_and_without_the_cache(&[("*Σ", "application/x-sigma")]);
+        let sigma = Some("application/x-sigma".to_owned());
+        for name in ["AΣ", "aΣ", "aσ", "ΣΣ"] {
+            assert_eq!(named(&dbs, name), [sigma.clone(), sigma.clone()], "{name}");
+        }
+        // `ς` is lowercase already: no context makes `Σ` into it.
+        assert_eq!(named(&dbs, "aς"), [None, None]);
+    }
+
+    /// The class rows need the matcher's fold (151). `update-mime-database`
+    /// writes `*[A-C].x` as `*[a-c].x`, so the range rows check only that
+    /// both readers agree; `fnmatch`'s unit tests cover folded ranges.
+    #[test]
+    fn case_insensitive_sets_match_either_case_with_and_without_the_cache() {
+        let dbs = with_and_without_the_cache(&[
+            ("*[[:upper:]].up", "application/x-upper"),
+            ("*[[:lower:]].low", "application/x-lower"),
+            ("*[A-C].x", "application/x-range"),
+        ]);
+        for (name, mime) in [
+            ("A.up", Some("application/x-upper")),
+            ("a.up", Some("application/x-upper")),
+            ("É.UP", Some("application/x-upper")),
+            ("1.up", None),
+            ("A.LOW", Some("application/x-lower")),
+            ("b.x", Some("application/x-range")),
+            ("B.x", Some("application/x-range")),
+            ("d.x", None),
+        ] {
+            let mime = mime.map(str::to_owned);
+            assert_eq!(named(&dbs, name), [mime.clone(), mime], "{name}");
+        }
     }
 
     #[test]

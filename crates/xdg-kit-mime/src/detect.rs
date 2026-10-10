@@ -382,6 +382,16 @@ impl MimeDatabase {
     ///
     /// The prefix is not always enough: it misses magic matches beyond
     /// 64 KiB and XML root elements beyond the prefix.
+    ///
+    /// Reads an XML root element as UTF-8, or as UTF-16 if the document
+    /// starts with its byte order mark. If the declared encoding conflicts
+    /// with the mark, or declares UTF-16 without a mark, keeps the type
+    /// found by magic without a root-element match. Other encodings are
+    /// not decoded: without a mark, the document is read as UTF-8, which
+    /// handles only its ASCII text correctly. Ignores the whole
+    /// declaration if it violates XML's grammar: `version`, then optional
+    /// `encoding`, then optional `standalone`, each appearing once with
+    /// a valid value.
     #[must_use]
     pub fn type_for_data(&self, data: &[u8]) -> Detection {
         if data.is_empty() {
@@ -417,6 +427,16 @@ impl MimeDatabase {
     ///
     /// The prefix is not always enough: it misses magic matches beyond
     /// 64 KiB and XML root elements beyond the prefix.
+    ///
+    /// Reads an XML root element as UTF-8, or as UTF-16 if the document
+    /// starts with its byte order mark. If the declared encoding conflicts
+    /// with the mark, or declares UTF-16 without a mark, keeps the type
+    /// found by magic without a root-element match. Other encodings are
+    /// not decoded: without a mark, the document is read as UTF-8, which
+    /// handles only its ASCII text correctly. Ignores the whole
+    /// declaration if it violates XML's grammar: `version`, then optional
+    /// `encoding`, then optional `standalone`, each appearing once with
+    /// a valid value.
     #[must_use]
     pub fn type_for_name_and_data(&self, name: impl AsRef<OsStr>, data: &[u8]) -> Detection {
         let names = self.type_for_name(name);

@@ -1633,6 +1633,29 @@ mod tests {
     }
 
     #[test]
+    fn kde_and_lxqt_hint_at_the_registered_qt() {
+        let hints = |value: &str| -> Vec<String> {
+            let text =
+                format!("[Desktop Entry]\nType=Application\nName=a\nExec=a\nCategories={value}\n");
+            validate(&KeyFile::parse(text.as_bytes()))
+                .into_iter()
+                .filter(|issue| issue.level == Level::Hint)
+                .map(|issue| issue.message)
+                .collect()
+        };
+        for desktop in ["KDE", "LXQt"] {
+            assert_eq!(
+                hints(&format!("Utility;{desktop};Qt;")),
+                Vec::<String>::new()
+            );
+            assert_eq!(
+                hints(&format!("Utility;{desktop};")),
+                [format!("Categories: {desktop} should come with one of Qt")]
+            );
+        }
+    }
+
+    #[test]
     fn long_category_lists_are_checked_in_linear_time() {
         work::assert_linear(
             5_000,

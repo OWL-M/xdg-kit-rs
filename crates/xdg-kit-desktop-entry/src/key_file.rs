@@ -23,8 +23,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use xdg_kit_locale::Locales;
 
-use crate::Diagnostic;
 use crate::error::quoted;
+use crate::{Diagnostic, Limits};
 
 /// What one line is.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -922,8 +922,23 @@ impl KeyFile {
     /// than [`xdg_kit_basedir::MAX_FILE_LEN`]. Problems in its text are
     /// diagnostics.
     pub fn read_with(path: impl AsRef<Path>, key_names: KeyNames) -> io::Result<Self> {
+        Self::read_with_limits(path, key_names, &Limits::default())
+    }
+
+    /// Reads the key file at `path`, whose keys follow `key_names`, within
+    /// `limits`.
+    ///
+    /// # Errors
+    ///
+    /// When the file cannot be read, is not a regular file or is larger
+    /// than [`Limits::max_file_len`]. Problems in its text are diagnostics.
+    pub fn read_with_limits(
+        path: impl AsRef<Path>,
+        key_names: KeyNames,
+        limits: &Limits,
+    ) -> io::Result<Self> {
         let path = path.as_ref();
-        let bytes = xdg_kit_basedir::read_regular_file(path)?;
+        let bytes = xdg_kit_basedir::read_regular_file_with(path, limits.max_file_len)?;
         Ok(Self::parse_from(&bytes, Some(path.to_owned()), key_names))
     }
 

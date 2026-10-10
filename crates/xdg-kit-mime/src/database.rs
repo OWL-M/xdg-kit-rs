@@ -13,7 +13,7 @@ use crate::model::{Folder, Glob, MagicRule};
 use crate::read::{cache, text};
 use crate::work;
 use crate::xml::TypeInfo;
-use crate::{Diagnostic, MimeType};
+use crate::{Diagnostic, Limits, MimeType};
 
 /// The most [`MimeDatabase::sniff_len`] asks for.
 const MAX_SNIFF_LEN: usize = 64 * 1024;
@@ -44,7 +44,7 @@ struct Loaded {
 }
 
 impl Loaded {
-    fn read(dir: &Path) -> Self {
+    fn read(dir: &Path, limits: &Limits) -> Self {
         // Stamps first: a change during the read is then seen by `refresh`.
         let stamps = std::iter::once(dir.to_owned())
             .chain(SOURCE_FILES.iter().map(|name| dir.join(name)))
@@ -58,19 +58,22 @@ impl Loaded {
         let mut folder = Folder::default();
         let mut diagnostics = Vec::new();
         let cache_path = dir.join("mime.cache");
-        let parts = match xdg_kit_basedir::read_regular_file(&cache_path) {
-            Ok(bytes) => match cache::read(&cache_path, &bytes, &mut folder, &mut diagnostics) {
-                Ok(()) => text::Parts::NotInCache,
-                Err(unusable) => {
-                    diagnostics.push(Diagnostic::new(
-                        &cache_path,
-                        None,
-                        format!("{unusable}; the text files are read instead"),
-                    ));
-                    folder = Folder::default();
-                    text::Parts::All
+        let parts = match xdg_kit_basedir::read_regular_file_with(&cache_path, limits.max_file_len)
+        {
+            Ok(bytes) => {
+                match cache::read(&cache_path, &bytes, &mut folder, &mut diagnostics, limits) {
+                    Ok(()) => text::Parts::NotInCache,
+                    Err(unusable) => {
+                        diagnostics.push(Diagnostic::new(
+                            &cache_path,
+                            None,
+                            format!("{unusable}; the text files are read instead"),
+                        ));
+                        folder = Folder::default();
+                        text::Parts::All
+                    }
                 }
-            },
+            }
             Err(err) if err.kind() == io::ErrorKind::NotFound => text::Parts::All,
             Err(err) => {
                 diagnostics.push(Diagnostic::new(
@@ -81,7 +84,7 @@ impl Loaded {
                 text::Parts::All
             }
         };
-        text::read(dir, parts, &mut folder, &mut diagnostics);
+        text::read(dir, parts, &mut folder, &mut diagnostics, limits);
         Self {
             dir: dir.to_owned(),
             stamps,
@@ -102,7 +105,14 @@ impl Loaded {
                 let mut folder = Folder::default();
                 let mut diagnostics = Vec::new();
                 for (name, bytes) in files {
-                    text::parse(name, &dir.join(name), bytes, &mut folder, &mut diagnostics);
+                    text::parse(
+                        name,
+                        &dir.join(name),
+                        bytes,
+                        &mut folder,
+                        &mut diagnostics,
+                        &Limits::default(),
+                    );
                 }
                 // As `text::read` finishes a folder.
                 folder.max_extent = folder.magic_extent();
@@ -213,11 +223,15 @@ pub(crate) enum PatternKind {
     Full,
 }
 
-/// Lowercasing for case-insensitive matching: Unicode-aware for UTF-8,
-/// ASCII-only otherwise.
+/// Lowercasing for case-insensitive matching: each character on its own,
+/// without context (`Σ` is always `σ`), for UTF-8; ASCII-only otherwise.
 pub(crate) fn lowercase(text: &[u8]) -> Vec<u8> {
     match std::str::from_utf8(text) {
-        Ok(text) => text.to_lowercase().into_bytes(),
+        Ok(text) => text
+            .chars()
+            .flat_map(char::to_lowercase)
+            .collect::<String>()
+            .into_bytes(),
         Err(_) => text.to_ascii_lowercase(),
     }
 }
@@ -253,7 +267,10 @@ impl GlobIndex {
                         .or_default()
                         .push(at);
                 }
-                PatternKind::Full => index.full.push((at, Pattern::new(&compared))),
+                // Folded by the matcher, which keeps sets as written.
+                PatternKind::Full => index
+                    .full
+                    .push((at, Pattern::new(&glob.pattern, !glob.case_sensitive))),
             }
             index.all.push(IndexedGlob {
                 mime: glob.mime.clone(),
@@ -354,7 +371,8 @@ fn present(candidates: &[(PathBuf, FileStamp)]) -> Vec<&Path> {
     dirs
 }
 
-/// A type's per-type XML, with the stamps of every place its file may be.
+/// A type's per-type XML, with the stamps of every place its file may be
+/// and of the media folders listed to find it.
 type Described = (Arc<TypeInfo>, Vec<(PathBuf, FileStamp)>);
 
 /// The Shared MIME-info database: an immutable snapshot of every database
@@ -372,9 +390,12 @@ pub struct MimeDatabase {
     pub(crate) globs: GlobIndex,
     pub(crate) magic: Vec<IndexedMagic>,
     /// Cached per-type XML, keyed by canonical type. Stamps for every
-    /// possible file location let `refresh` detect changes.
+    /// possible file location, and every media folder listed, let
+    /// `refresh` detect changes.
     descriptions: Mutex<HashMap<MimeType, Described>>,
     diagnostics: Vec<Diagnostic>,
+    /// The limits used to read this database and its descriptions.
+    limits: Limits,
 }
 
 /// Shows the folders and rule counts.
@@ -395,6 +416,14 @@ impl MimeDatabase {
     /// directories: `$XDG_DATA_HOME/mime`, then each of `$XDG_DATA_DIRS`.
     #[must_use]
     pub fn load(base_dirs: &BaseDirs) -> Self {
+        Self::load_with(base_dirs, &Limits::default())
+    }
+
+    /// Loads the database as [`MimeDatabase::load`] does, using `limits`.
+    /// [`MimeDatabase::refresh`] and reads of per-type XML files use the
+    /// same limits.
+    #[must_use]
+    pub fn load_with(base_dirs: &BaseDirs, limits: &Limits) -> Self {
         // Most important first, as base dirs list them; reversed below.
         // A folder listed again (the data home in `$XDG_DATA_DIRS`) is read
         // once, at its first place.
@@ -409,14 +438,31 @@ impl MimeDatabase {
                 seen.insert(mime.clone())
             })
             .collect();
-        Self::from_candidates(candidates)
+        Self::from_candidates(candidates, limits)
     }
 
     /// Loads the database from exactly `dirs`, each a `mime` folder, most
     /// important first.
     #[must_use]
     pub fn from_dirs(dirs: impl IntoIterator<Item = impl Into<PathBuf>>) -> Self {
-        Self::from_candidates(dirs.into_iter().map(Into::into).collect())
+        Self::from_dirs_with(dirs, &Limits::default())
+    }
+
+    /// Reads folders as [`MimeDatabase::from_dirs`] does, using `limits`.
+    /// [`MimeDatabase::refresh`] and reads of per-type XML files use the
+    /// same limits.
+    #[must_use]
+    pub fn from_dirs_with(
+        dirs: impl IntoIterator<Item = impl Into<PathBuf>>,
+        limits: &Limits,
+    ) -> Self {
+        Self::from_candidates(dirs.into_iter().map(Into::into).collect(), limits)
+    }
+
+    /// The limits it was read within.
+    #[must_use]
+    pub fn limits(&self) -> &Limits {
+        &self.limits
     }
 
     /// Builds a database from folders held in memory, most important first.
@@ -429,10 +475,10 @@ impl MimeDatabase {
     #[doc(hidden)]
     #[must_use]
     pub fn from_files(folders: &[Vec<(&str, &[u8])>]) -> Self {
-        Self::assemble(Vec::new(), Loaded::in_memory(folders))
+        Self::assemble(Vec::new(), Loaded::in_memory(folders), Limits::default())
     }
 
-    fn from_candidates(candidates: Vec<PathBuf>) -> Self {
+    fn from_candidates(candidates: Vec<PathBuf>, limits: &Limits) -> Self {
         let stamped: Vec<(PathBuf, FileStamp)> = candidates
             .into_iter()
             .map(|dir| {
@@ -441,11 +487,18 @@ impl MimeDatabase {
                 (dir, stamp)
             })
             .collect();
-        let folders = present(&stamped).into_iter().map(Loaded::read).collect();
-        Self::assemble(stamped, folders)
+        let folders = present(&stamped)
+            .into_iter()
+            .map(|dir| Loaded::read(dir, limits))
+            .collect();
+        Self::assemble(stamped, folders, *limits)
     }
 
-    fn assemble(candidates: Vec<(PathBuf, FileStamp)>, folders: Vec<Loaded>) -> Self {
+    fn assemble(
+        candidates: Vec<(PathBuf, FileStamp)>,
+        folders: Vec<Loaded>,
+        limits: Limits,
+    ) -> Self {
         let merged = merge::merge(folders.iter().map(|loaded| &*loaded.folder));
         let globs = GlobIndex::new(&merged.globs, &merged);
         let magic = merged
@@ -477,6 +530,7 @@ impl MimeDatabase {
             magic,
             descriptions: Mutex::new(HashMap::new()),
             diagnostics,
+            limits,
         }
     }
 
@@ -484,8 +538,10 @@ impl MimeDatabase {
     /// was read, or `None` if nothing changed. Compares each file's
     /// [`FileStamp`] (modification and status change times, size, device
     /// and inode, so a `chmod` counts), then re-reads the changed folders.
-    /// Also checks per-type XML files for cached descriptions.
-    /// The new snapshot reads descriptions afresh.
+    /// Also checks the per-type XML files of cached descriptions, and the
+    /// media folders listed to find them in a folder without `types`.
+    /// The new snapshot reads descriptions afresh, and keeps to the same
+    /// [`MimeDatabase::limits`].
     ///
     /// Two changes within the filesystem's time resolution that keep the
     /// size and inode can go unnoticed.
@@ -534,11 +590,11 @@ impl MimeDatabase {
                 work::count(1 + 2 * dir.as_os_str().len());
                 match earlier.get(dir) {
                     Some(loaded) if loaded.unchanged() => loaded.kept(),
-                    _ => Loaded::read(dir),
+                    _ => Loaded::read(dir, &self.limits),
                 }
             })
             .collect();
-        Some(Self::assemble(stamped, folders))
+        Some(Self::assemble(stamped, folders, self.limits))
     }
 
     /// The `mime` folders read, most important first.
@@ -722,6 +778,11 @@ impl MimeDatabase {
     /// The spec calls a type's first `<glob>` its main extension, but the
     /// generated files order globs by weight, so that cannot be recovered;
     /// the first pattern here is only one of the highest weight.
+    ///
+    /// From text files, a bracket that can never match keeps the flags in
+    /// its pattern, so `*[a:b[.x` written case-sensitive lists as
+    /// `*[a:b[.x:cs` and `*[a:b[.x`, where `mime.cache` gives only
+    /// `*[a:b[.x`; none of them matches a name.
     #[must_use]
     pub fn patterns_for(&self, mime: &MimeType) -> Vec<String> {
         let mut patterns: Vec<String> = Vec::new();
@@ -742,29 +803,42 @@ impl MimeDatabase {
     /// Lists every type the database defines, sorted. Reads each folder's
     /// `types` file, which `update-mime-database` writes but the spec does
     /// not define. For folders without that file, lists the
-    /// `MEDIA/SUBTYPE.xml` files on each call.
+    /// `MEDIA/SUBTYPE.xml` files on each call. Errors listing them are left
+    /// out; [`MimeDatabase::all_types_with_diagnostics`] gives them.
     #[must_use]
     pub fn all_types(&self) -> Vec<MimeType> {
+        self.all_types_with_diagnostics().0
+    }
+
+    /// Lists types as [`MimeDatabase::all_types`] does, with diagnostics for
+    /// failures to open or fully list folders of `MEDIA/SUBTYPE.xml` files.
+    /// Missing folders are not reported. Entries read before a listing error
+    /// are kept.
+    #[must_use]
+    pub fn all_types_with_diagnostics(&self) -> (Vec<MimeType>, Vec<Diagnostic>) {
         let mut all: Vec<MimeType> = Vec::new();
+        let mut diagnostics = Vec::new();
         for loaded in &self.folders {
             match &loaded.folder.types {
                 Some(types) => all.extend(types.iter().cloned()),
-                None => all.extend(crate::xml::types_in(&loaded.dir)),
+                None => all.extend(crate::xml::types_in(&loaded.dir, &mut diagnostics)),
             }
         }
         all.sort();
         all.dedup();
-        all
-    }
-
-    /// The folders' paths, least important first, for the per-type XML.
-    pub(crate) fn folder_dirs(&self) -> impl Iterator<Item = &Path> {
-        self.folders.iter().map(|loaded| loaded.dir.as_path())
+        (all, diagnostics)
     }
 
     /// The per-type XML of `mime`, read on first use. The files are read
     /// without holding the lock; only types that have a file are kept, so
-    /// asking about made-up types does not grow the cache.
+    /// asking about made-up types does not grow the cache. An answer from
+    /// a folder listing that failed is not kept either, so the next lookup
+    /// lists again.
+    ///
+    /// Each folder's file is looked up by the spellings the folder
+    /// registers for the type ([`registered`]), then by the lowercase
+    /// name, whatever spelling `mime` has, so the answer does not depend
+    /// on which spelling was asked first.
     pub(crate) fn type_info(&self, mime: &MimeType) -> Arc<TypeInfo> {
         let canonical = self.canonical(mime);
         let cache = || {
@@ -772,24 +846,86 @@ impl MimeDatabase {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
         };
+        // Looked up: hashed and compared.
+        work::count(2 * canonical.as_str().len());
         if let Some((info, _)) = cache().get(&canonical) {
             return Arc::clone(info);
         }
-        // Stamps first: a change during the read is then seen by `refresh`.
-        let stamps = self
-            .folder_dirs()
-            .flat_map(|dir| crate::xml::type_file_paths(dir, &canonical))
-            .map(|path| {
-                let stamp = FileStamp::of(&path);
-                (path, stamp)
+        let mut listing = Vec::new();
+        // The media folders listed, stamped before.
+        let mut stamps = Vec::new();
+        let paths: Vec<Vec<PathBuf>> = self
+            .folders
+            .iter()
+            .map(|loaded| {
+                let spellings = registered(loaded, &canonical, &mut listing, &mut stamps);
+                crate::xml::type_file_paths(&loaded.dir, &spellings, &canonical)
             })
             .collect();
-        let info = Arc::new(TypeInfo::read(&canonical, self.folder_dirs()));
-        if !info.found() {
+        // Stamps first: a change during the read is then seen by `refresh`.
+        stamps.extend(paths.iter().flatten().map(|path| {
+            // Copied.
+            work::count(path.as_os_str().len());
+            (path.clone(), FileStamp::of(path))
+        }));
+        // Not kept after a listing error: the next lookup lists again.
+        let listed = listing.is_empty();
+        let info = Arc::new(TypeInfo::read(paths, listing, &self.limits));
+        if !info.found() || !listed {
             return info;
         }
+        // Hashed, compared and kept.
+        work::count(3 * canonical.as_str().len());
         Arc::clone(&cache().entry(canonical).or_insert((info, stamps)).0)
     }
+}
+
+/// Returns the spellings `loaded` registers for `mime` ([`spellings_in`]): from
+/// its `types` file, or from per-type filenames if it has no `types` file. Only
+/// lists media folders whose names match `mime`'s media part, ignoring ASCII
+/// case ([`crate::xml::types_in_media`]). Adds listing errors to `diagnostics`
+/// and stamped folders to `stamps`.
+fn registered(
+    loaded: &Loaded,
+    mime: &MimeType,
+    diagnostics: &mut Vec<Diagnostic>,
+    stamps: &mut Vec<(PathBuf, FileStamp)>,
+) -> Vec<MimeType> {
+    if let Some(types) = &loaded.folder.types {
+        spellings_in(types, mime, false)
+    } else {
+        let types = crate::xml::types_in_media(&loaded.dir, mime.media(), diagnostics, stamps);
+        spellings_in(&types, mime, true)
+    }
+}
+
+/// Returns each spelling of `mime` in `types` once. Preserves their order
+/// unless they were `listed` from a folder; then sorts by byte order so lookup
+/// results do not depend on directory listing order.
+fn spellings_in(types: &[MimeType], mime: &MimeType, listed: bool) -> Vec<MimeType> {
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut spellings: Vec<MimeType> = Vec::new();
+    for spelling in types {
+        // Compared.
+        work::count(1 + spelling.as_str().len());
+        if spelling != mime {
+            continue;
+        }
+        // Hashed and compared; copied when new.
+        work::count(1 + 2 * spelling.as_str().len());
+        if seen.insert(spelling.as_str()) {
+            work::count(spelling.as_str().len());
+            spellings.push(spelling.clone());
+        }
+    }
+    if listed {
+        spellings.sort_unstable_by(|a, b| {
+            // Each comparison a sort makes.
+            work::count(1 + a.as_str().len().min(b.as_str().len()));
+            a.as_str().cmp(b.as_str())
+        });
+    }
+    spellings
 }
 
 #[cfg(test)]
@@ -936,6 +1072,68 @@ mod tests {
     }
 
     #[test]
+    fn listing_errors_reach_the_type_list_and_the_lookup() {
+        use crate::xml::LISTING_FAULT;
+        let dir = tempfile::tempdir().unwrap();
+        let top = dir.path().to_owned();
+        let text = top.join("text");
+        fs::create_dir_all(&text).unwrap();
+        fs::create_dir_all(top.join("image")).unwrap();
+        for name in ["text/plain.xml", "text/x-a.xml", "image/png.xml"] {
+            fs::write(
+                top.join(name),
+                r#"<mime-type xmlns="http://www.freedesktop.org/standards/shared-mime-info"><comment>A</comment></mime-type>"#,
+            )
+            .unwrap();
+        }
+        let db = MimeDatabase::from_dirs([&top]);
+        let mime = |name: &str| MimeType::new(name).unwrap();
+        let png = mime("image/png");
+        let first = fs::read_dir(&text).unwrap().next().unwrap().unwrap();
+        let first = first.file_name();
+        let first = mime(&format!(
+            "text/{}",
+            first.to_str().unwrap().strip_suffix(".xml").unwrap()
+        ));
+        let denied = io::ErrorKind::PermissionDenied;
+        let err = io::Error::from(denied);
+        let unopened = format!("cannot be listed: {err}");
+        let cut = format!("cannot be listed in full: {err}");
+        for (at, message, kept) in [
+            (None, &unopened, vec![png.clone()]),
+            (Some(1), &cut, vec![png.clone(), first]),
+        ] {
+            LISTING_FAULT.set(Some((text.clone(), at, denied)));
+            let (types, diagnostics) = db.all_types_with_diagnostics();
+            assert_eq!(types, kept, "{at:?}");
+            assert_eq!(
+                diagnostics,
+                [Diagnostic::new(&text, None, message.as_str())],
+                "{at:?}"
+            );
+        }
+        // Left out by `all_types`.
+        LISTING_FAULT.set(Some((text.clone(), None, denied)));
+        assert_eq!(db.all_types(), std::slice::from_ref(&png));
+        assert!(LISTING_FAULT.with_borrow(Option::is_none));
+        // A lookup's listing error is that type's, though the file is
+        // still found by its lowercase name. That answer is not cached:
+        // the next lookup lists again, and its answer is.
+        let plain = mime("text/plain");
+        LISTING_FAULT.set(Some((top.clone(), None, denied)));
+        let reported = [Diagnostic::new(&top, None, unopened.as_str())];
+        let faulty = db.type_info(&plain);
+        assert!(faulty.found());
+        assert_eq!(faulty.diagnostics(), reported);
+        assert!(LISTING_FAULT.with_borrow(Option::is_none));
+        assert!(db.descriptions.lock().unwrap().is_empty());
+        let fresh = db.type_info(&plain);
+        assert!(fresh.diagnostics().is_empty(), "{:?}", fresh.diagnostics());
+        assert!(Arc::ptr_eq(&fresh, &db.type_info(&plain)));
+        assert!(db.type_diagnostics(&png).is_empty());
+    }
+
+    #[test]
     fn only_types_with_an_xml_file_are_kept() {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join("text")).unwrap();
@@ -957,6 +1155,59 @@ mod tests {
         assert_eq!(kept(), 1);
     }
 
+    /// A per-type file under the spelling a folder registers, by its
+    /// `types` file or else by its file names: the same answer for every
+    /// spelling asked, in any order, on any database.
+    #[test]
+    fn a_per_type_file_is_found_by_the_registered_spelling() {
+        use crate::Locales;
+        let body = |comment: &str| {
+            format!(
+                r#"<mime-type xmlns="http://www.freedesktop.org/standards/shared-mime-info"><comment>{comment}</comment></mime-type>"#
+            )
+        };
+        let asked = [
+            m("application/x-mixed"),
+            m("application/x-Mixed"),
+            m("application/X-MIXED"),
+        ];
+        let un = Locales::untranslated();
+        for (file, types, found) in [
+            ("x-Mixed", None, true),
+            ("x-Mixed", Some("application/x-Mixed\n"), true),
+            // As `update-mime-database` names it.
+            ("x-mixed", Some("application/x-Mixed\n"), true),
+            // Neither the registered spelling nor lowercase.
+            ("x-MIXED", Some("application/x-Mixed\n"), false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            fs::create_dir_all(dir.path().join("application")).unwrap();
+            let xml = dir.path().join(format!("application/{file}.xml"));
+            fs::write(&xml, body("Mixed")).unwrap();
+            if let Some(types) = types {
+                fs::write(dir.path().join("types"), types).unwrap();
+            }
+            for first in &asked {
+                let db = MimeDatabase::from_dirs([dir.path()]);
+                for mime in std::iter::once(first).chain(&asked) {
+                    assert_eq!(
+                        db.description(mime, &un).as_deref(),
+                        found.then_some("Mixed"),
+                        "{file} {types:?}: {first}, then {mime}"
+                    );
+                }
+            }
+            if found {
+                // `refresh` sees the file found, whatever spelling asked.
+                let db = MimeDatabase::from_dirs([dir.path()]);
+                assert!(db.type_info(&asked[0]).found());
+                fs::write(&xml, body("Changed")).unwrap();
+                let db = db.refresh().expect("the rewritten file was noticed");
+                assert_eq!(db.description(&asked[2], &un).as_deref(), Some("Changed"));
+            }
+        }
+    }
+
     #[test]
     fn database_is_send_and_sync() {
         fn shareable<T: Send + Sync>() {}
@@ -975,7 +1226,7 @@ mod tests {
             .map(|(name, text)| (*name, text.as_bytes()))
             .collect();
         let loaded = Loaded::in_memory(&[folder]);
-        work::steps(|| MimeDatabase::assemble(Vec::new(), loaded))
+        work::steps(|| MimeDatabase::assemble(Vec::new(), loaded, Limits::default()))
     }
 
     /// The aliases of an alias chain `text/x-a0` → `text/x-a1` → … →
@@ -1142,5 +1393,213 @@ mod tests {
             // and compared twice).
             |items, bytes| 2 * (150 * items + 18 * bytes),
         );
+    }
+
+    /// `n` spellings of one type: `text/x-` and fourteen letters whose
+    /// cases spell the number's bits (distinct up to 2^14).
+    fn spellings(n: usize) -> Vec<String> {
+        (0..n)
+            .map(|at| {
+                let subtype: String = "abcdefghijklmn"
+                    .chars()
+                    .enumerate()
+                    .map(|(bit, c)| {
+                        if at >> bit & 1 == 1 {
+                            c.to_ascii_uppercase()
+                        } else {
+                            c
+                        }
+                    })
+                    .collect();
+                format!("text/x-{subtype}")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_type_with_many_registered_spellings_is_looked_up_in_linear_time() {
+        let root = tempfile::tempdir().unwrap();
+        // Registered by a `types` file (none has a file, so nothing is
+        // kept and each lookup does it all again), or by file names.
+        for listed in [false, true] {
+            work::assert_linear(
+                1000,
+                |n| {
+                    let dir = root.path().join(format!("{listed}-{n}"));
+                    fs::create_dir_all(dir.join("text")).unwrap();
+                    let spellings = spellings(n);
+                    if listed {
+                        for spelling in &spellings {
+                            fs::write(dir.join(format!("{spelling}.xml")), "").unwrap();
+                        }
+                    } else {
+                        let types = lines(n, |at| spellings[at].clone());
+                        fs::write(dir.join("types"), types).unwrap();
+                    }
+                    let db = MimeDatabase::from_dirs([&dir]);
+                    let mime = m(&spellings[0]);
+                    let (info, steps) = work::steps(|| db.type_info(&mime));
+                    assert_eq!(info.found(), listed);
+                    // Each spelling's path.
+                    let bytes = spellings
+                        .iter()
+                        .map(|spelling| dir.as_os_str().len() + spelling.len() + 5)
+                        .sum();
+                    (steps, bytes)
+                },
+                // Twice the analysed cost: per spelling a few steps, and
+                // per byte of its path about five (the spelling, a third
+                // of it, compared, hashed and copied; the path copied by
+                // two joins and by its stamp); listed, five more (each
+                // name read, checked and copied, then sorted with about
+                // ten comparisons of a spelling each).
+                |items, bytes| 2 * (10 * items + if listed { 10 } else { 5 } * bytes),
+            );
+        }
+    }
+
+    #[test]
+    fn a_lookup_lists_only_its_own_media_folders() {
+        use crate::Locales;
+        use crate::xml::LISTING_FAULT;
+        let dir = tempfile::tempdir().unwrap();
+        let top = dir.path().to_owned();
+        for folder in ["text", "Text", "video"] {
+            fs::create_dir_all(top.join(folder)).unwrap();
+        }
+        fs::write(
+            top.join("Text/x-A.xml"),
+            r#"<mime-type xmlns="http://www.freedesktop.org/standards/shared-mime-info"><comment>A</comment></mime-type>"#,
+        )
+        .unwrap();
+        let db = MimeDatabase::from_dirs([&top]);
+        let a = m("text/x-a");
+        // `video/` cannot be listed, and is not listed for `text/x-a`; its
+        // media folders are, in any case.
+        LISTING_FAULT.set(Some((
+            top.join("video"),
+            None,
+            io::ErrorKind::PermissionDenied,
+        )));
+        let info = db.type_info(&a);
+        assert!(info.diagnostics().is_empty(), "{:?}", info.diagnostics());
+        assert_eq!(
+            db.description(&a, &Locales::untranslated()).as_deref(),
+            Some("A")
+        );
+        assert!(Arc::ptr_eq(&info, &db.type_info(&a)), "kept");
+        assert!(LISTING_FAULT.with_borrow(Option::is_some), "video/ listed");
+        LISTING_FAULT.set(None);
+    }
+
+    #[test]
+    fn spellings_found_by_listing_are_taken_in_byte_order() {
+        use crate::Locales;
+        let body = |comment: &str| {
+            format!(
+                r#"<mime-type xmlns="http://www.freedesktop.org/standards/shared-mime-info"><comment>{comment}</comment></mime-type>"#
+            )
+        };
+        // Every case of `x-bar`, written in each order, so that the order
+        // a listing gives cannot pick the first in byte order by chance.
+        let mut names: Vec<String> = (0..8)
+            .map(|at: usize| {
+                "bar"
+                    .chars()
+                    .enumerate()
+                    .map(|(bit, c)| {
+                        if at >> bit & 1 == 1 {
+                            c
+                        } else {
+                            c.to_ascii_uppercase()
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        let un = Locales::untranslated();
+        for reverse in [false, true] {
+            if reverse {
+                names.reverse();
+            }
+            let dir = tempfile::tempdir().unwrap();
+            fs::create_dir_all(dir.path().join("text")).unwrap();
+            for name in &names {
+                fs::write(dir.path().join(format!("text/x-{name}.xml")), body(name)).unwrap();
+            }
+            let db = MimeDatabase::from_dirs([dir.path()]);
+            assert_eq!(
+                db.description(&m("text/x-bar"), &un).as_deref(),
+                Some("BAR"),
+                "{names:?}"
+            );
+            // A `types` file's own order stays.
+            fs::write(dir.path().join("types"), "text/x-Bar\ntext/x-BAR\n").unwrap();
+            let db = MimeDatabase::from_dirs([dir.path()]);
+            assert_eq!(
+                db.description(&m("text/x-BAR"), &un).as_deref(),
+                Some("Bar")
+            );
+        }
+    }
+
+    #[test]
+    fn a_listing_is_taken_in_byte_order_and_a_types_file_in_its_own() {
+        // Not in byte order, with a repeat and another type.
+        let types: Vec<MimeType> = [
+            "text/x-bar",
+            "text/x-Bar",
+            "text/plain",
+            "text/x-BAR",
+            "text/x-bar",
+            "text/x-bAr",
+        ]
+        .into_iter()
+        .map(m)
+        .collect();
+        let found = |listed| -> Vec<String> {
+            spellings_in(&types, &m("text/x-BAR"), listed)
+                .iter()
+                .map(ToString::to_string)
+                .collect()
+        };
+        assert_eq!(
+            found(true),
+            ["text/x-BAR", "text/x-Bar", "text/x-bAr", "text/x-bar"]
+        );
+        assert_eq!(
+            found(false),
+            ["text/x-bar", "text/x-Bar", "text/x-BAR", "text/x-bAr"]
+        );
+    }
+
+    #[test]
+    fn refresh_notices_a_spelling_added_to_a_listed_folder() {
+        use crate::Locales;
+        let body = |comment: &str| {
+            format!(
+                r#"<mime-type xmlns="http://www.freedesktop.org/standards/shared-mime-info"><comment>{comment}</comment></mime-type>"#
+            )
+        };
+        let un = Locales::untranslated();
+        let dir = tempfile::tempdir().unwrap();
+        let text = dir.path().join("text");
+        fs::create_dir_all(&text).unwrap();
+        fs::write(text.join("x-a.xml"), body("a")).unwrap();
+        let db = MimeDatabase::from_dirs([dir.path()]);
+        let a = m("text/x-a");
+        assert_eq!(db.description(&a, &un).as_deref(), Some("a"));
+        assert!(db.refresh().is_none(), "nothing changed");
+        // First in byte order, so a fresh database takes it.
+        fs::write(text.join("x-A.xml"), body("A")).unwrap();
+        // Past a coarse clock's tick, as the listing changed in any case.
+        fs::File::open(&text)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(10))
+            .unwrap();
+        let fresh = MimeDatabase::from_dirs([dir.path()]);
+        assert_eq!(fresh.description(&a, &un).as_deref(), Some("A"));
+        let db = db.refresh().expect("the added spelling was noticed");
+        assert_eq!(db.description(&a, &un), fresh.description(&a, &un));
     }
 }

@@ -7,12 +7,13 @@ use std::path::{Path, PathBuf};
 
 use quick_xml::escape::resolve_xml_entity;
 use quick_xml::events::attributes::{AttrError, Attribute};
-use quick_xml::events::{BytesRef, BytesStart, Event};
+use quick_xml::events::{BytesDecl, BytesRef, BytesStart, Event};
 use quick_xml::name::{Namespace, PrefixDeclaration, QName, ResolveResult};
 use quick_xml::{NsReader, XmlVersion};
 
 /// The namespace of the database's XML files.
 const NAMESPACE: &str = "http://www.freedesktop.org/standards/shared-mime-info";
+use xdg_kit_basedir::FileStamp;
 use xdg_kit_locale::Locales;
 
 use crate::error::quoted;
@@ -40,15 +41,24 @@ impl Localized {
 /// What a type's XML files say, merged over the folders.
 ///
 /// Each file is read using the XML version declared at its start, or 1.0
-/// if there is no declaration. The root must be `mime-type` in the spec's
-/// namespace, with a valid `QName`. Files with another root or an invalid
-/// name (`<1p:mime-type>`, `<:mime-type>`, `<x:y:mime-type>`) are ignored
-/// with a diagnostic ([`structure_problem`]).
+/// if there is no declaration or its version is not 1.0 or 1.1. A
+/// declaration outside XML's grammar ([`declaration_grammar_problem`]),
+/// or a processing instruction named `xml` in any casing at the start
+/// ([`named_xml`]), is ignored with a diagnostic, and the file read as
+/// 1.0. The root must be `mime-type` in the spec's namespace, with a
+/// valid `QName`. Files with another root or an invalid name
+/// (`<1p:mime-type>`, `<:mime-type>`, `<x:y:mime-type>`) are ignored with
+/// a diagnostic ([`structure_problem`]).
 ///
 /// A field is an element directly inside the root, in the spec's namespace
 /// or in none, named `comment`, `acronym` or `expanded-acronym`. For this
 /// check, the name is the part after the last `:`, or the whole name if
-/// there is no `:`. A field is dropped with a diagnostic when:
+/// there is no `:`. Its language is its own `xml:lang`, else the root's
+/// (XML 1.0, 2.12); an empty one means untranslated. A field is dropped
+/// with a diagnostic when:
+/// - it takes the root's `xml:lang` and that cannot be read: any attribute
+///   of the root's tag fails the checks a field's tag has (below), so the
+///   language is not known ([`root_language`]);
 /// - its text, inside tags in it too, holds a reference that cannot be
 ///   replaced, a character the version does not allow written as it is, or
 ///   `]]>`. Only references to the five entities XML predefines and
@@ -115,18 +125,32 @@ pub(crate) struct TypeInfo {
 }
 
 impl TypeInfo {
-    /// Reads `mime`'s XML file from each of `dirs`, least important first,
+    /// Reads the type's XML file from each folder, least important first,
     /// so a more important folder's value replaces a less important one for
-    /// the same language.
-    pub(crate) fn read<'a>(mime: &MimeType, dirs: impl Iterator<Item = &'a Path>) -> Self {
-        let mut info = Self::default();
-        for dir in dirs {
-            let Some(path) = type_file(dir, mime) else {
+    /// the same language. Each folder gives the paths its file may have
+    /// ([`type_file_paths`]); the first that is a file is read, within
+    /// `limits`. The diagnostics start with `listing`, from listing the
+    /// folders.
+    pub(crate) fn read(
+        folders: impl IntoIterator<Item = Vec<PathBuf>>,
+        listing: Vec<Diagnostic>,
+        limits: &crate::Limits,
+    ) -> Self {
+        let mut info = Self {
+            diagnostics: listing,
+            ..Self::default()
+        };
+        for paths in folders {
+            let Some(path) = paths.into_iter().find(|path| {
+                // Each path looked at.
+                crate::work::count(1);
+                path.is_file()
+            }) else {
                 continue;
             };
             info.found = true;
-            match xdg_kit_basedir::read_regular_file(&path) {
-                Ok(bytes) => info.parse(&path, &bytes),
+            match xdg_kit_basedir::read_regular_file_with(&path, limits.max_file_len) {
+                Ok(bytes) => info.parse_within(&path, &bytes, limits.max_diagnostics),
                 Err(err) => info.diagnostics.push(Diagnostic::new(
                     &path,
                     None,
@@ -169,8 +193,15 @@ impl TypeInfo {
         self.found
     }
 
+    /// Parses one file within the default limits.
+    #[cfg(any(test, fuzzing))]
     fn parse(&mut self, path: &Path, bytes: &[u8]) {
-        let mut problems = Problems::new(path, &mut self.diagnostics);
+        self.parse_within(path, bytes, crate::Limits::default().max_diagnostics);
+    }
+
+    /// Parses one file, listing at most `max_diagnostics` problems.
+    fn parse_within(&mut self, path: &Path, bytes: &[u8], max_diagnostics: Option<usize>) {
+        let mut problems = Problems::new(path, &mut self.diagnostics, max_diagnostics);
         let mut reader = NsReader::from_reader(bytes);
         // `<comment/>` is read as `<comment></comment>`: an empty value.
         reader.config_mut().expand_empty_elements = true;
@@ -183,6 +214,8 @@ impl TypeInfo {
         let mut seen = Seen::default();
         // The element being collected and its language.
         let mut field: Option<(Field, Option<String>, String)> = None;
+        // The root's language, which a field without one takes.
+        let mut inherited: Result<Option<String>, String> = Ok(None);
         // The version the declaration at the start gives, if any.
         let mut version = XmlVersion::Implicit1_0;
         loop {
@@ -228,15 +261,18 @@ impl TypeInfo {
             match event {
                 // Only a declaration at the start is one (only a byte order
                 // mark, which `quick-xml` does not count, may come before).
-                Event::Decl(declaration) if at == 0 => {
-                    if let Ok(declared) = declaration.xml_version() {
-                        version = declared;
-                    }
-                }
+                Event::Decl(_) | Event::PI(_) if at == 0 => match declared_at_start(&event) {
+                    Some(Ok(declared)) => version = declared,
+                    Some(Err(problem)) => problems.report(location(at), problem),
+                    None => {}
+                },
                 Event::Start(start) => {
                     depth += 1;
+                    if depth == 1 {
+                        inherited = root_language(&start, version);
+                    }
                     let read = if depth == 2 {
-                        Field::starting(&start, &namespace, version)
+                        Field::starting(&start, &namespace, version, &inherited)
                     } else {
                         // A tag inside a field is read as the field's own.
                         field
@@ -515,7 +551,8 @@ impl Problem {
 /// 1.0, 3rd ed., 5 and 7), is not a per-type file, and is ignored. An
 /// XML declaration or a document type anywhere else is a problem: inside
 /// the root, the values are still read; after it, the rest is skipped, as
-/// for other content there.
+/// for other content there. A processing instruction named `xml` in any
+/// casing ([`named_xml`]) counts as a declaration here.
 fn structure_problem(
     event: &Event<'_>,
     namespace: &ResolveResult<'_>,
@@ -546,6 +583,11 @@ fn structure_problem(
         (blank < text.len()).then_some(at + blank)
     };
     let problem = |message: &str, rest_skipped| Some(Problem::new(Some(at), message, rest_skipped));
+    let declaration = match event {
+        Event::Decl(_) => true,
+        Event::PI(instruction) => named_xml(instruction).is_some(),
+        _ => false,
+    };
     // The arms are checked in order: inside the root (`depth > 0`), then
     // before its end (`!ended`), then after it.
     match event {
@@ -555,7 +597,7 @@ fn structure_problem(
             false,
         ),
         Event::Eof if !ended => Some(Problem::new(None, "bad XML (no root element)", false)),
-        Event::Decl(_) if depth > 0 => problem(LATE, false),
+        _ if declaration && depth > 0 => problem(LATE, false),
         Event::DocType(_) if depth > 0 => problem(DOCTYPE, false),
         _ if depth > 0 => None,
         Event::Start(element) if !ended => {
@@ -580,7 +622,7 @@ fn structure_problem(
             };
             problem(&format!("not a per-type file: {what}; it is ignored"), true)
         }
-        Event::Decl(_) if !ended && at != 0 => problem(LATE, false),
+        _ if declaration && !ended && at != 0 => problem(LATE, false),
         Event::DocType(_) if !ended && doctype_read => {
             problem("bad XML (a second document type declaration)", false)
         }
@@ -592,7 +634,7 @@ fn structure_problem(
         Event::CData(_) | Event::GeneralRef(_) if !ended => problem(BEFORE, false),
         _ if !ended => None,
         Event::Start(_) => problem("bad XML (a second root element); the rest is skipped", true),
-        Event::Decl(_) => problem(&format!("{LATE}; the rest is skipped"), true),
+        _ if declaration => problem(&format!("{LATE}; the rest is skipped"), true),
         Event::DocType(_) => problem(&format!("{DOCTYPE}; the rest is skipped"), true),
         Event::Text(text) => text_at(text).map(|at| Problem::new(Some(at), AFTER, true)),
         Event::Comment(_) | Event::PI(_) | Event::Eof => None,
@@ -629,7 +671,8 @@ enum Field {
 impl Field {
     /// The field that `start`, an element in `namespace` directly inside
     /// the root of a document of XML `version`, begins, if any, and its
-    /// language ([`language`]).
+    /// language: its own ([`language`]), else the root's, `inherited`
+    /// ([`field_language`]).
     ///
     /// A field is named by what follows the last `:` in the element's
     /// name, or all of it without one (`<x:y:comment>` is a comment, whose
@@ -647,6 +690,7 @@ impl Field {
         start: &BytesStart<'_>,
         namespace: &ResolveResult<'_>,
         version: XmlVersion,
+        inherited: &Result<Option<String>, String>,
     ) -> Option<(Self, Result<Option<String>, TagProblem>)> {
         // Named by what follows the last `:`, so `<x:y:comment>`, not a
         // `QName`, is a field whose tag cannot be read.
@@ -680,11 +724,13 @@ impl Field {
         // even when the namespace's declaration is one of them; one in a
         // declaration further up at the tag.
         let lang = language(start, version).and_then(|lang| {
-            namespace
-                .map(|()| lang)
-                .map_err(|message| TagProblem { at: None, message })
+            namespace.map(|()| lang).map_err(|message| TagProblem {
+                at: None,
+                name: None,
+                message,
+            })
         });
-        Some((kind, lang))
+        Some((kind, lang.and_then(|own| field_language(own, inherited))))
     }
 }
 
@@ -693,6 +739,9 @@ struct TagProblem {
     /// Where, as an offset in the tag from after its `<` (`None` for the
     /// `<`).
     at: Option<usize>,
+    /// Where the name of the attribute it is in starts, as `at`, if it is
+    /// in one.
+    name: Option<usize>,
     message: String,
 }
 
@@ -733,8 +782,10 @@ fn declaration_problem(start: &BytesStart<'_>, version: XmlVersion) -> Option<Ta
                     reserved_default(name, &namespace_value(&Namespace(&value), version).ok()?)
                 })?
             };
+            let at = offset_in(start, name);
             Some(TagProblem {
-                at: offset_in(start, name),
+                at,
+                name: at,
                 message,
             })
         })
@@ -752,7 +803,7 @@ fn empty_prefix(name: &str, value: &str, version: XmlVersion) -> Option<String> 
 }
 
 /// The language `start`'s `xml:lang` gives in a document of XML `version`
-/// (`None` without one, or for an empty one), normalised as an attribute
+/// (`None` without one; empty for an empty one), normalised as an attribute
 /// value. Gives what is wrong when any of `start`'s attributes, before or
 /// after it, cannot be read: it is not well formed or appears twice
 /// ([`attribute_error`]), its name is not a `QName` ([`is_qname`]), its
@@ -770,6 +821,7 @@ fn language(start: &BytesStart<'_>, version: XmlVersion) -> Result<Option<String
         let name = attribute.key.as_ref();
         let problem = |message| TagProblem {
             at: offset_in(start, name),
+            name: offset_in(start, name),
             message,
         };
         if !is_qname(name) {
@@ -787,7 +839,55 @@ fn language(start: &BytesStart<'_>, version: XmlVersion) -> Result<Option<String
         after =
             offset_in(start, &attribute.value).map_or(after, |at| at + attribute.value.len() + 1);
     }
+    Ok(lang)
+}
+
+/// Returns the field's own `xml:lang` (`own`) if present, otherwise the root's
+/// `inherited` language ([`root_language`]; XML 1.0, 2.12). An empty value
+/// becomes `None`, meaning untranslated. If the field inherits an unreadable
+/// root language, reports the field as unreadable at its `<`.
+fn field_language(
+    own: Option<String>,
+    inherited: &Result<Option<String>, String>,
+) -> Result<Option<String>, TagProblem> {
+    let lang = match (own, inherited) {
+        (Some(own), _) => Some(own),
+        (None, Ok(lang)) => lang.clone(),
+        (None, Err(problem)) => {
+            return Err(TagProblem {
+                at: None,
+                name: None,
+                message: problem.clone(),
+            });
+        }
+    };
     Ok(lang.filter(|lang| !lang.is_empty()))
+}
+
+/// Reads and normalises `root`'s `xml:lang` using the document's XML `version`,
+/// for fields without their own language. Returns `None` if absent and an empty
+/// string if empty. Checks the root's attributes as [`language`] checks a
+/// field's. Any invalid attribute makes the language unknown; the error
+/// identifies whether the problem is in `xml:lang` or another attribute.
+fn root_language(root: &BytesStart<'_>, version: XmlVersion) -> Result<Option<String>, String> {
+    language(root, version).map_err(|problem| {
+        let at_lang = problem
+            .name
+            .and_then(|at| root.get(at..))
+            .and_then(|rest| rest.strip_prefix("xml:lang"))
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(['=', ' ', '\t', '\r', '\n']));
+        if at_lang {
+            format!(
+                "the root element's `xml:lang` cannot be read: {}",
+                problem.message
+            )
+        } else {
+            format!(
+                "the root element's tag cannot be read, so its language is unknown: {}",
+                problem.message
+            )
+        }
+    })
 }
 
 /// The problem with the first of `start`'s attributes that `quick-xml`
@@ -810,16 +910,18 @@ fn unreadable_attribute(start: &BytesStart<'_>) -> Option<TagProblem> {
 /// The problem `err`, which `quick-xml` met reading `start`'s attributes
 /// from `after` on, and where it is.
 fn attribute_error(start: &BytesStart<'_>, err: &AttrError, after: usize) -> TagProblem {
+    // Where the attribute's name starts: the first thing after the
+    // attribute before.
+    let name = start
+        .get(after..)
+        .and_then(|rest| rest.find(|c| !matches!(c, ' ' | '\t' | '\r' | '\n')))
+        .map(|blank| after + blank);
     let (at, what) = match *err {
-        // `quick-xml` gives what follows the name: the name is the first
-        // thing after the attribute before.
-        AttrError::ExpectedEq(at) => {
-            let name = start
-                .get(after..)
-                .and_then(|rest| rest.find(|c| !matches!(c, ' ' | '\t' | '\r' | '\n')))
-                .map_or(at, |blank| after + blank);
-            (name, "a name is not followed by `=`".to_owned())
-        }
+        // `quick-xml` gives what follows the name.
+        AttrError::ExpectedEq(at) => (
+            name.unwrap_or(at),
+            "a name is not followed by `=`".to_owned(),
+        ),
         AttrError::ExpectedValue(at) => (at, "`=` is not followed by a value".to_owned()),
         AttrError::UnquotedValue(at) => (at, "a value is not quoted".to_owned()),
         AttrError::ExpectedQuote(at, _) => (at, "a value is not closed".to_owned()),
@@ -830,12 +932,14 @@ fn attribute_error(start: &BytesStart<'_>, err: &AttrError, after: usize) -> Tag
                 .unwrap_or_default();
             return TagProblem {
                 at: Some(at),
+                name: Some(at),
                 message: twice(name),
             };
         }
     };
     TagProblem {
         at: Some(at),
+        name,
         message: format!("{UNREADABLE}{what}"),
     }
 }
@@ -907,6 +1011,7 @@ fn name_problem(start: &BytesStart<'_>) -> Option<TagProblem> {
     };
     Some(TagProblem {
         at: Some(0),
+        name: None,
         message: message.to_owned(),
     })
 }
@@ -964,51 +1069,108 @@ fn attribute_value<'a>(
         .map_err(|err| reader_error(&err))
 }
 
-/// Where `mime`'s file in `dir` may be: `<dir>/<media>/<subtype>.xml` as
-/// spelled, then lowercased (as `update-mime-database` names the files).
-pub(crate) fn type_file_paths(dir: &Path, mime: &MimeType) -> [PathBuf; 2] {
-    [
-        dir.join(mime.media())
-            .join(format!("{}.xml", mime.subtype())),
-        dir.join(mime.media().to_ascii_lowercase())
-            .join(format!("{}.xml", mime.subtype().to_ascii_lowercase())),
-    ]
-}
-
-/// The first of [`type_file_paths`] that exists.
-fn type_file(dir: &Path, mime: &MimeType) -> Option<PathBuf> {
-    type_file_paths(dir, mime)
-        .into_iter()
-        .find(|path| path.is_file())
+/// Returns possible paths for `mime` in `dir`, in order, without duplicates:
+/// `<dir>/<media>/<subtype>.xml` for each `registered` spelling (already
+/// unique), then the lowercase path used by `update-mime-database` if not
+/// already included.
+pub(crate) fn type_file_paths(
+    dir: &Path,
+    registered: &[MimeType],
+    mime: &MimeType,
+) -> Vec<PathBuf> {
+    let path = |media: &str, subtype: &str| {
+        let path = dir.join(media).join(format!("{subtype}.xml"));
+        // Copied twice: by each join.
+        crate::work::count(2 * path.as_os_str().len());
+        path
+    };
+    // Copied.
+    crate::work::count(mime.as_str().len());
+    let lowercase = mime.as_str().to_ascii_lowercase();
+    let mut listed = false;
+    let mut paths: Vec<PathBuf> = registered
+        .iter()
+        .map(|spelling| {
+            // Compared.
+            crate::work::count(1 + spelling.as_str().len());
+            listed |= spelling.as_str() == lowercase;
+            path(spelling.media(), spelling.subtype())
+        })
+        .collect();
+    if !listed && let Some((media, subtype)) = lowercase.split_once('/') {
+        paths.push(path(media, subtype));
+    }
+    paths
 }
 
 /// The types with an XML file in `dir`, for a folder without a `types` file.
-pub(crate) fn types_in(dir: &Path) -> Vec<MimeType> {
+/// Listing errors go to `diagnostics` ([`entries`]).
+pub(crate) fn types_in(dir: &Path, diagnostics: &mut Vec<Diagnostic>) -> Vec<MimeType> {
+    types_under(dir, |_| true, diagnostics, None)
+}
+
+/// Lists types as [`types_in`] does, but only in folders whose names match
+/// `media`, ignoring ASCII case. A lookup skips unrelated media folders and
+/// their errors. Adds each listed folder to `stamps` before listing it, so
+/// later file additions are detected.
+pub(crate) fn types_in_media(
+    dir: &Path,
+    media: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+    stamps: &mut Vec<(PathBuf, FileStamp)>,
+) -> Vec<MimeType> {
+    types_under(
+        dir,
+        |name| {
+            // Compared.
+            crate::work::count(1 + name.len().min(media.len()));
+            name.eq_ignore_ascii_case(media)
+        },
+        diagnostics,
+        Some(stamps),
+    )
+}
+
+/// Lists types as [`types_in`] does, but only in media folders accepted by
+/// `listed`. If `stamps` is supplied, stamps each folder before listing it.
+fn types_under(
+    dir: &Path,
+    listed: impl Fn(&str) -> bool,
+    diagnostics: &mut Vec<Diagnostic>,
+    mut stamps: Option<&mut Vec<(PathBuf, FileStamp)>>,
+) -> Vec<MimeType> {
+    use crate::work::count;
     let mut types = Vec::new();
-    let Ok(media_dirs) = std::fs::read_dir(dir) else {
-        return types;
-    };
-    for media_dir in media_dirs.flatten() {
+    for media_dir in entries(dir, diagnostics) {
         let media = media_dir.file_name();
+        // Copied, then checked as UTF-8.
+        count(1 + 2 * media.len());
         let Some(media) = media.to_str() else {
             continue;
         };
-        if media == "packages" || !media_dir.path().is_dir() {
+        if media == "packages" || !listed(media) {
             continue;
         }
-        let Ok(files) = std::fs::read_dir(media_dir.path()) else {
+        let media_path = media_dir.path();
+        count(media_path.as_os_str().len());
+        if !media_path.is_dir() {
             continue;
-        };
-        for file in files.flatten() {
+        }
+        let stamp = stamps.is_some().then(|| FileStamp::of(&media_path));
+        for file in entries(&media_path, diagnostics) {
             let name = file.file_name();
+            // Copied, checked as UTF-8, its end compared.
+            count(1 + 2 * name.len());
             let Some(subtype) = name.to_str().and_then(|name| name.strip_suffix(".xml")) else {
                 continue;
             };
+            // Copied, then checked as a type (counted there).
+            count(media.len() + subtype.len());
             let Ok(mime) = MimeType::new(&format!("{media}/{subtype}")) else {
                 continue;
             };
-            // Regular files only (links followed), as `type_file` finds them;
-            // only a link needs another look.
+            // Regular files only (links followed), as `TypeInfo::read`
+            // finds them; only a link needs another look.
             let regular = match file.file_type() {
                 Ok(kind) if kind.is_symlink() => file.path().is_file(),
                 Ok(kind) => kind.is_file(),
@@ -1018,15 +1180,103 @@ pub(crate) fn types_in(dir: &Path) -> Vec<MimeType> {
                 types.push(mime);
             }
         }
+        if let (Some(stamps), Some(stamp)) = (stamps.as_deref_mut(), stamp) {
+            stamps.push((media_path, stamp));
+        }
     }
     types
+}
+
+/// Lists `dir`, discarding the partial listing and restarting after `EINTR`.
+/// Other errors while opening the folder or reading an entry go to
+/// `diagnostics`; entries read before the error are kept. A missing `dir`
+/// returns no entries and no diagnostic.
+fn entries(dir: &Path, diagnostics: &mut Vec<Diagnostic>) -> Vec<std::fs::DirEntry> {
+    use std::io::ErrorKind;
+    'list: loop {
+        let mut entries = Vec::new();
+        let listing = match listing_fault(dir, None).map_or_else(|| std::fs::read_dir(dir), Err) {
+            Ok(listing) => listing,
+            Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+            Err(err) if err.kind() == ErrorKind::NotFound => return entries,
+            Err(err) => {
+                diagnostics.push(Diagnostic::new(
+                    dir,
+                    None,
+                    format!("cannot be listed: {err}"),
+                ));
+                return entries;
+            }
+        };
+        for entry in listing {
+            match listing_fault(dir, Some(entries.len())).map_or(entry, Err) {
+                Ok(entry) => entries.push(entry),
+                Err(err) if err.kind() == ErrorKind::Interrupted => continue 'list,
+                Err(err) => {
+                    diagnostics.push(Diagnostic::new(
+                        dir,
+                        None,
+                        format!("cannot be listed in full: {err}"),
+                    ));
+                    break;
+                }
+            }
+        }
+        return entries;
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Makes listing a folder fail once ([`listing_fault`]).
+    #[allow(
+        clippy::missing_const_for_thread_local,
+        reason = "already const; clippy flags it on targets without native thread locals (Android, OpenBSD, illumos)"
+    )]
+    pub(crate) static LISTING_FAULT:
+        std::cell::RefCell<Option<(PathBuf, Option<usize>, std::io::ErrorKind)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The error the test hook gives for listing `dir`: opening it (`None`)
+/// or reading its entry after `read` others.
+#[cfg(test)]
+fn listing_fault(dir: &Path, read: Option<usize>) -> Option<std::io::Error> {
+    LISTING_FAULT.with_borrow_mut(|fault| {
+        let (faulty, at, _) = fault.as_ref()?;
+        if faulty != dir || *at != read {
+            return None;
+        }
+        // One call fails, not the next, as a signal interrupts one.
+        fault.take().map(|(_, _, kind)| kind.into())
+    })
+}
+
+#[cfg(not(test))]
+const fn listing_fault(_: &Path, _: Option<usize>) -> Option<std::io::Error> {
+    None
 }
 
 /// The namespace URI (empty when there is none) and local name of the root
 /// element of the XML document `bytes` starts, if it gets that far.
 ///
+/// Reads UTF-8, or UTF-16 starting with a byte order mark (`FF FE` for
+/// little endian, `FE FF` for big endian), as every XML processor must
+/// support (XML 1.0, 4.3.3). Transcodes UTF-16 first ([`utf16_as_utf8`]).
+/// A declared encoding must agree with the mark ([`Mark::agrees`]); a
+/// conflicting encoding, or UTF-16 declared without a mark, returns no
+/// root element. Other encodings are not decoded. Without a mark, such a
+/// document is read as UTF-8, which handles only its ASCII text correctly.
+///
+/// Ignores the whole declaration if it violates XML's grammar
+/// ([`declaration_grammar_problem`]). In that case, the mark alone decides
+/// the encoding and the document is read as XML 1.0. The same applies to
+/// a processing instruction named `xml` in any casing ([`named_xml`]),
+/// which is skipped.
+///
 /// The namespace is the declaring attribute's value, normalised using the
-/// XML version declared at the start, or 1.0 if there is no declaration.
+/// XML version declared at the start, or 1.0 if there is no declaration or
+/// its version cannot be read.
 /// References to the five predefined XML entities and character references
 /// are replaced (`urn:a&amp;b` becomes `urn:a&b`), matching the value stored
 /// by `update-mime-database`.
@@ -1040,6 +1290,19 @@ pub(crate) fn types_in(dir: &Path) -> Vec<MimeType> {
 /// also returns no root element (`<1p:doc xmlns:1p="urn:x">`,
 /// `<x:y:doc xmlns:x="urn:x">`; Namespaces in XML 1.0, 3rd ed., 5 and 7).
 pub(crate) fn root_element(bytes: &[u8]) -> Option<(String, String)> {
+    let transcoded;
+    let (mark, bytes) = match bytes {
+        [0xFF, 0xFE, rest @ ..] => {
+            transcoded = utf16_as_utf8(rest, u16::from_le_bytes)?;
+            (Mark::Utf16Le, transcoded.as_bytes())
+        }
+        [0xFE, 0xFF, rest @ ..] => {
+            transcoded = utf16_as_utf8(rest, u16::from_be_bytes)?;
+            (Mark::Utf16Be, transcoded.as_bytes())
+        }
+        [0xEF, 0xBB, 0xBF, ..] => (Mark::Utf8, bytes),
+        _ => (Mark::None, bytes),
+    };
     let mut reader = NsReader::from_reader(bytes);
     let mut version = XmlVersion::Implicit1_0;
     loop {
@@ -1049,8 +1312,19 @@ pub(crate) fn root_element(bytes: &[u8]) -> Option<(String, String)> {
             // Only a declaration at the start is one (only a byte order
             // mark, which `quick-xml` does not count, may come before).
             Event::Decl(declaration) if at_start => {
-                if let Ok(declared) = declaration.xml_version() {
-                    version = declared;
+                // One outside XML's grammar is ignored as a whole.
+                let Ok(declared) = declared_version(&declaration) else {
+                    continue;
+                };
+                version = declared;
+                // Its encoding looked for.
+                crate::work::count(declaration.len());
+                // `quick-xml` notes the encoding with its `encoding`
+                // feature, but reads `&[u8]` as UTF-8 with or without it.
+                if let Some(Ok(encoding)) = declaration.encoding()
+                    && !mark.agrees(&encoding)
+                {
+                    return None;
                 }
             }
             Event::Start(element) | Event::Empty(element) => {
@@ -1075,6 +1349,193 @@ pub(crate) fn root_element(bytes: &[u8]) -> Option<(String, String)> {
     }
 }
 
+/// Returns the XML version from `declaration`: 1.0 or 1.1, with unknown
+/// versions treated as 1.0. If the declaration is outside XML's grammar
+/// ([`declaration_grammar_problem`]), returns the problem explaining why it is
+/// ignored.
+fn declared_version(declaration: &BytesDecl<'_>) -> Result<XmlVersion, String> {
+    if let Some(problem) = declaration_grammar_problem(declaration) {
+        return Err(format!(
+            "bad XML (the XML declaration {problem}); it is ignored"
+        ));
+    }
+    // Its version looked for.
+    crate::work::count(declaration.len());
+    Ok(declaration.xml_version().unwrap_or(XmlVersion::Implicit1_0))
+}
+
+/// Applies [`declared_version`] to `event` if it is a declaration at the start
+/// of a per-type file. A processing instruction named `xml` in any casing
+/// ([`named_xml`]) is treated as a declaration outside XML's grammar.
+fn declared_at_start(event: &Event<'_>) -> Option<Result<XmlVersion, String>> {
+    let problem = match event {
+        Event::Decl(declaration) => return Some(declared_version(declaration)),
+        Event::PI(instruction) => match named_xml(instruction)? {
+            // Not followed by a `NameChar`, so by no name.
+            "xml" => STRAY.to_owned(),
+            name => format!("is named `{name}`, not `xml`"),
+        },
+        _ => return None,
+    };
+    Some(Err(format!(
+        "bad XML (the XML declaration {problem}); it is ignored"
+    )))
+}
+
+/// Checks `declaration`, starting at its name `xml`, against XML's grammar (XML
+/// 1.0, 5th ed., and 1.1, 2.8, `XMLDecl`). Requires `version`, then optional
+/// `encoding`, then optional `standalone`, each preceded by white space and
+/// holding a valid value in single or double quotes. A version follows XML
+/// 1.0's `VersionNum`: `1.` followed by digits. Returns the problem, if any.
+fn declaration_grammar_problem(declaration: &str) -> Option<&'static str> {
+    const NAMES: [&str; 3] = ["version", "encoding", "standalone"];
+    const START: &str = "does not start with `version`";
+    let is_blank = |c: char| matches!(c, ' ' | '\t' | '\r' | '\n');
+    // Each byte scanned at most twice: found, then checked.
+    crate::work::count(1 + 2 * declaration.len());
+    let mut rest = declaration.strip_prefix("xml").unwrap_or(declaration);
+    // Where in `NAMES` the next attribute may be, at the earliest.
+    let mut next = 0;
+    loop {
+        let after_blank = rest.trim_start_matches(is_blank);
+        let blank = after_blank.len() < rest.len();
+        rest = after_blank;
+        if rest.is_empty() {
+            return (next == 0).then_some(START);
+        }
+        let end = rest.find(|c| c == '=' || is_blank(c)).unwrap_or(rest.len());
+        let (name, after) = rest.split_at(end);
+        let mut chars = name.chars();
+        if !(chars.next().is_some_and(is_name_start) && chars.all(is_name_char)) {
+            return Some(STRAY);
+        }
+        if !blank {
+            return Some(NO_BLANK);
+        }
+        let Some(at) = NAMES.iter().position(|&known| known == name) else {
+            return Some(if next == 0 {
+                START
+            } else {
+                "has a name other than `version`, `encoding` and `standalone`"
+            });
+        };
+        if next == 0 && at != 0 {
+            return Some(START);
+        }
+        if at < next {
+            return Some("has `version`, `encoding` or `standalone` repeated or out of order");
+        }
+        next = at + 1;
+        let Some(after) = after.trim_start_matches(is_blank).strip_prefix('=') else {
+            return Some("has a name not followed by `=`");
+        };
+        let after = after.trim_start_matches(is_blank);
+        let Some(quote) = after.chars().next().filter(|&c| c == '"' || c == '\'') else {
+            return Some("has a value that is not quoted");
+        };
+        let Some((value, after)) = after[1..].split_once(quote) else {
+            return Some("has a value that is not closed");
+        };
+        match at {
+            0 if !value.strip_prefix("1.").is_some_and(|digits| {
+                !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+            }) =>
+            {
+                return Some("has a version other than `1.` and digits");
+            }
+            1 if !is_encoding_name(value) => {
+                return Some("has an encoding that is not an encoding name");
+            }
+            2 if value != "yes" && value != "no" => {
+                return Some("has a `standalone` other than `yes` or `no`");
+            }
+            _ => {}
+        }
+        rest = after;
+    }
+}
+
+/// A declaration's problem: no white space before a name.
+const NO_BLANK: &str = "has no white space before a name";
+
+/// A declaration's problem: where a name or white space must come, text
+/// up to `=` or white space that is not an XML name (`<?xml\u{85}?>`).
+const STRAY: &str = "has a character that is not allowed there";
+
+/// The name of `instruction`, a processing instruction's text from its
+/// name on, if that is `xml` in any casing (`XML`, `Xml`), which no
+/// processing instruction may have (XML 1.0, 5th ed., and 1.1, 2.6,
+/// `PITarget`). The name ends before the first character that is not a
+/// `NameChar`, so `<?xml-stylesheet?>` is not one, and `<?xml\u{85}?>` is:
+/// `quick-xml` reads `<?xml` as a declaration only if ASCII white space
+/// or `?>` follows. Such an instruction is a declaration outside XML's
+/// grammar.
+fn named_xml(instruction: &str) -> Option<&str> {
+    let name = instruction.get(..3)?;
+    (name.eq_ignore_ascii_case("xml") && !instruction[3..].starts_with(is_name_char))
+        .then_some(name)
+}
+
+/// Whether `name` is an `EncName` (XML 1.0, 5th ed., and 1.1, 4.3.3): an
+/// ASCII letter, then ASCII letters, digits, `.`, `_` and `-`.
+fn is_encoding_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    bytes.next().is_some_and(|b| b.is_ascii_alphabetic())
+        && bytes.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// The byte order mark an XML document starts with, if any.
+#[derive(Clone, Copy)]
+enum Mark {
+    None,
+    Utf8,
+    Utf16Le,
+    Utf16Be,
+}
+
+impl Mark {
+    /// Whether the declared `encoding` agrees with the byte order mark,
+    /// ignoring ASCII case. With a mark, accepts its encoding (for UTF-16, the
+    /// matching byte-order name or plain UTF-16). Without a mark, accepts any
+    /// encoding except UTF-16; other names are read as UTF-8.
+    fn agrees(self, encoding: &str) -> bool {
+        let is = |name: &str| encoding.eq_ignore_ascii_case(name);
+        match self {
+            Self::None => !(is("UTF-16") || is("UTF-16LE") || is("UTF-16BE")),
+            Self::Utf8 => is("UTF-8"),
+            Self::Utf16Le => is("UTF-16") || is("UTF-16LE"),
+            Self::Utf16Be => is("UTF-16") || is("UTF-16BE"),
+        }
+    }
+}
+
+/// Converts `bytes` from UTF-16 after its byte order mark to UTF-8, reading
+/// units with `unit`. The bytes may be only a prefix of the document. Omits an
+/// incomplete final character (an odd last byte or a trailing high surrogate),
+/// as the rest of the document is omitted. An unpaired surrogate earlier in the
+/// input is invalid UTF-16, a fatal XML error (XML 1.0, 4.3.3), so returns
+/// `None`.
+fn utf16_as_utf8(bytes: &[u8], unit: fn([u8; 2]) -> u16) -> Option<String> {
+    // Each byte read.
+    crate::work::count(bytes.len());
+    let units = bytes.as_chunks::<2>().0.iter().map(|&pair| unit(pair));
+    let mut text = String::with_capacity(bytes.len());
+    let mut chars = char::decode_utf16(units).peekable();
+    while let Some(decoded) = chars.next() {
+        match decoded {
+            Ok(c) => text.push(c),
+            // Cut off: a high surrogate, last.
+            Err(err)
+                if chars.peek().is_none()
+                    && (0xD800..0xDC00).contains(&err.unpaired_surrogate()) => {}
+            Err(_) => return None,
+        }
+    }
+    // Each byte written.
+    crate::work::count(text.len());
+    Some(text)
+}
+
 /// The root `element`'s attribute that binds its prefix (or the default
 /// namespace), if it has one. Where it repeats, the last counts, as for the
 /// namespace `quick-xml` resolves.
@@ -1096,9 +1557,18 @@ fn binding_attribute<'a>(element: &'a BytesStart<'_>) -> Option<Attribute<'a>> {
 
 impl MimeDatabase {
     /// A human-readable description of `mime` ("PNG image") in the first of
-    /// `locales` that has one, else untranslated. Read from the type's XML
-    /// files on first use and kept in this snapshot. An empty `<comment/>`
-    /// is an empty description, which replaces a less important folder's.
+    /// `locales` that has one, otherwise untranslated. Reads the type's XML
+    /// files on first use and caches the result in this snapshot. If a folder
+    /// listing failed while looking for filenames, the next call retries
+    /// instead. An empty `<comment/>` supplies an empty description, replacing
+    /// a less important folder's value.
+    ///
+    /// Tries the spellings each folder registers for the type in its `types`
+    /// file, in file order. Without a `types` file, uses filenames in byte
+    /// order from media folders matching the type's media part, ignoring ASCII
+    /// case. Falls back to the lowercase filename used by
+    /// `update-mime-database`. The spelling of `mime` does not affect the
+    /// result.
     #[must_use]
     pub fn description(&self, mime: &MimeType, locales: &Locales) -> Option<String> {
         self.type_info(mime).comment.pick(locales)
@@ -1107,6 +1577,8 @@ impl MimeDatabase {
     /// The type's acronym ("PNG"), from its XML files like
     /// [`MimeDatabase::description`]. Not translated: spec 0.22 dropped
     /// translated acronyms, and any an older database has are ignored.
+    /// One without its own `xml:lang` takes the root's, so under a root
+    /// `xml:lang` it is translated and ignored too.
     #[must_use]
     pub fn acronym(&self, mime: &MimeType) -> Option<String> {
         self.type_info(mime).acronym.clone()
@@ -1120,7 +1592,7 @@ impl MimeDatabase {
     }
 
     /// Problems met reading `mime`'s XML files (reading them if not done
-    /// yet).
+    /// yet), including a folder that could not be listed to find them.
     #[must_use]
     pub fn type_diagnostics(&self, mime: &MimeType) -> Vec<Diagnostic> {
         self.type_info(mime).diagnostics().to_vec()
@@ -1136,6 +1608,16 @@ mod tests {
     /// (less the type).
     const OPEN: &str =
         r#"<mime-type xmlns="http://www.freedesktop.org/standards/shared-mime-info">"#;
+
+    /// [`TypeInfo::read`] of `mime` from `dirs`, which register no
+    /// spelling for it.
+    fn read_in<'a>(mime: &MimeType, dirs: impl Iterator<Item = &'a Path>) -> TypeInfo {
+        TypeInfo::read(
+            dirs.map(|dir| type_file_paths(dir, &[], mime)),
+            Vec::new(),
+            &crate::Limits::default(),
+        )
+    }
 
     /// Makes a FIFO at `path`.
     #[cfg(not(target_vendor = "apple"))]
@@ -1210,7 +1692,7 @@ mod tests {
                </mime-type>"#,
         );
         let png = MimeType::new("image/png").unwrap();
-        let info = TypeInfo::read(&png, [low.path(), high.path()].into_iter());
+        let info = read_in(&png, [low.path(), high.path()].into_iter());
         assert!(info.diagnostics.is_empty(), "{:?}", info.diagnostics);
         assert_eq!(
             info.comment.pick(&Locales::new(["de_AT"])).as_deref(),
@@ -1249,7 +1731,7 @@ mod tests {
         )
         .unwrap();
         let plain = MimeType::new("text/plain").unwrap();
-        let info = TypeInfo::read(&plain, [dir.path()].into_iter());
+        let info = read_in(&plain, [dir.path()].into_iter());
         assert!(info.diagnostics.is_empty(), "{:?}", info.diagnostics);
         assert_eq!(
             info.comment.pick(&Locales::untranslated()).as_deref(),
@@ -1285,7 +1767,7 @@ mod tests {
                <acronym></acronym><expanded-acronym></expanded-acronym>"#,
         ] {
             write(high.path(), fields);
-            let info = TypeInfo::read(&t, [low.path(), high.path()].into_iter());
+            let info = read_in(&t, [low.path(), high.path()].into_iter());
             assert!(info.diagnostics.is_empty(), "{:?}", info.diagnostics);
             assert_eq!(
                 info.comment.pick(&Locales::untranslated()).as_deref(),
@@ -1306,7 +1788,7 @@ mod tests {
             high.path(),
             r#"<sub-class-of type="text/plain"/><acronym>TT</acronym>"#,
         );
-        let info = TypeInfo::read(&t, [high.path()].into_iter());
+        let info = read_in(&t, [high.path()].into_iter());
         assert!(info.diagnostics.is_empty(), "{:?}", info.diagnostics);
         assert_eq!(info.acronym.as_deref(), Some("TT"));
         assert_eq!(info.comment.pick(&Locales::untranslated()), None);
@@ -1777,13 +2259,13 @@ mod tests {
             kept(v11, "a&#xD;&#x85;&#x2028;b", "a\r\u{85}\u{2028}b");
         }
         // XML 1.0, declared or not, and a declaration not at the start
-        // (which is reported) or with another version.
+        // (which is reported) or with another 1.x version.
         for v10 in [
             "",
             "<?xml version=\"1.0\"?>",
             "\u{feff}",
             "\u{feff}<?xml version=\"1.0\"?>",
-            "<?xml version=\"2.0\"?>",
+            "<?xml version=\"1.2\"?>",
         ] {
             kept(
                 v10,
@@ -1877,6 +2359,713 @@ mod tests {
                 );
                 assert_eq!(info.acronym.as_deref(), Some("A"), "{text:?}");
             }
+        }
+    }
+
+    /// `text` in UTF-16, little endian or not, after a byte order mark.
+    fn utf16(text: &str, little: bool) -> Vec<u8> {
+        let mut bytes = if little {
+            vec![0xFF, 0xFE]
+        } else {
+            vec![0xFE, 0xFF]
+        };
+        for unit in text.encode_utf16() {
+            if little {
+                bytes.extend_from_slice(&unit.to_le_bytes());
+            } else {
+                bytes.extend_from_slice(&unit.to_be_bytes());
+            }
+        }
+        bytes
+    }
+
+    #[test]
+    fn a_utf16_root_element_is_read() {
+        let doc = ("urn:test".to_owned(), "doc".to_owned());
+        for little in [true, false] {
+            for text in [
+                r#"<doc xmlns="urn:test"/>"#,
+                r#"<?xml version="1.0" encoding="UTF-16"?><doc xmlns="urn:test"/>"#,
+                "<?xml version=\"1.1\"?><doc xmlns=\"urn:\u{e9}&#x85;test\"/>",
+            ] {
+                let bytes = utf16(text, little);
+                let expected = if text.contains("1.1") {
+                    ("urn:\u{e9}\u{85}test".to_owned(), "doc".to_owned())
+                } else {
+                    doc.clone()
+                };
+                assert_eq!(root_element(&bytes), Some(expected.clone()), "{text}");
+                // A prefix cut in a character: what is whole is read.
+                let mut cut = utf16(&format!("{text}<!--\u{1F600}"), little);
+                cut.pop();
+                assert_eq!(root_element(&cut), Some(expected.clone()), "{text}");
+                cut.truncate(cut.len() - 1);
+                assert_eq!(root_element(&cut), Some(expected.clone()), "{text}");
+                cut.truncate(cut.len() - 1);
+                assert_eq!(root_element(&cut), Some(expected), "{text}");
+            }
+            // A surrogate unpaired inside: not UTF-16, so no document.
+            let mut bad = utf16("<!--x--><doc xmlns=\"urn:test\"/>", little);
+            let at = 6;
+            bad[at..at + 2].copy_from_slice(&if little {
+                0xD800u16.to_le_bytes()
+            } else {
+                0xD800u16.to_be_bytes()
+            });
+            assert_eq!(root_element(&bad), None);
+        }
+    }
+
+    #[test]
+    fn a_declared_encoding_must_agree_with_the_byte_order_mark() {
+        let doc = Some(("urn:test".to_owned(), "doc".to_owned()));
+        let text = |encoding: &str| {
+            format!(r#"<?xml version="1.0" encoding="{encoding}"?><doc xmlns="urn:test"/>"#)
+        };
+        let utf8 = |text: &str, marked: bool| {
+            let mut bytes = if marked {
+                b"\xEF\xBB\xBF".to_vec()
+            } else {
+                Vec::new()
+            };
+            bytes.extend_from_slice(text.as_bytes());
+            bytes
+        };
+        for little in [true, false] {
+            let (own, other) = if little {
+                ("utf-16le", "UTF-16BE")
+            } else {
+                ("UTF-16be", "utf-16LE")
+            };
+            for (encoding, agrees) in [
+                ("UTF-16", true),
+                ("utf-16", true),
+                (own, true),
+                (other, false),
+                ("UTF-8", false),
+                ("ISO-8859-1", false),
+            ] {
+                let found = root_element(&utf16(&text(encoding), little));
+                assert_eq!(found, agrees.then(|| doc.clone().unwrap()), "{encoding}");
+            }
+        }
+        for (encoding, marked, agrees) in [
+            ("UTF-8", true, true),
+            ("utf-8", true, true),
+            ("UTF-16", true, false),
+            ("ISO-8859-1", true, false),
+            // No mark: UTF-16 named is wrong; any other name is read as
+            // UTF-8.
+            ("UTF-16", false, false),
+            ("utf-16", false, false),
+            ("UTF-16LE", false, false),
+            ("Utf-16Be", false, false),
+            ("UTF-8", false, true),
+            ("ISO-8859-1", false, true),
+            ("US-ASCII", false, true),
+            ("UTF-16X", false, true),
+        ] {
+            let found = root_element(&utf8(&text(encoding), marked));
+            assert_eq!(
+                found,
+                agrees.then(|| doc.clone().unwrap()),
+                "{encoding} {marked}"
+            );
+        }
+    }
+
+    /// Declarations outside XML's grammar, each with what is wrong, after
+    /// "the XML declaration "; `{e}` stands for an encoding name.
+    const MALFORMED: [(&str, &str); 39] = [
+        (r#"encoding="{e}""#, START),
+        (r#"encoding="{e}" version="1.1""#, START),
+        (r#"Version="1.1" encoding="{e}""#, START),
+        (r#"junk version="1.1" encoding="{e}""#, START),
+        (r#"version="1.1" version="1.1" encoding="{e}""#, ORDER),
+        (r#"version="1.1" encoding="{e}" encoding="{e}""#, ORDER),
+        (r#"version="1.1" standalone="yes" encoding="{e}""#, ORDER),
+        (
+            r#"version="1.1" encoding="{e}" standalone="no" standalone="no""#,
+            ORDER,
+        ),
+        (r#"version="1.1" encoding="{e}" version="1.1""#, ORDER),
+        (r#"version="1.1" foo="x" encoding="{e}""#, OTHER),
+        (r#"version="1.1" encoding="{e}" foo="x""#, OTHER),
+        (r#"version="1.1" encoding="{e}" junk"#, OTHER),
+        (r#"version="1.1" a=b encoding="{e}""#, OTHER),
+        (r#"version="1.1" encoding="{e}" a="#, OTHER),
+        (r#"version="1.1"encoding="{e}""#, BLANK),
+        (r#"version="1.1" encoding="{e}"standalone="no""#, BLANK),
+        // XML 1.1's line ends are not white space in a declaration.
+        ("version=\"1.1\"\u{85}encoding=\"{e}\"", STRAY),
+        ("version=\"1.1\" encoding=\"{e}\"\u{85}", STRAY),
+        ("version=\"1.1\"\u{2028}encoding=\"{e}\"", STRAY),
+        ("version=\"1.1\" encoding=\"{e}\"\u{2028}", STRAY),
+        ("version=\"1.1\" \u{85}", STRAY),
+        ("version=\"1.1\" \u{2028}encoding=\"{e}\"", STRAY),
+        ("\u{85}version=\"1.1\" encoding=\"{e}\"", STRAY),
+        (r#"version="1.1" ="x" encoding="{e}""#, STRAY),
+        (r#"version "1.1" encoding="{e}""#, EQ),
+        (r#"version="1.1" encoding "{e}""#, EQ),
+        (r#"version=1.1 encoding="{e}""#, QUOTE),
+        (r#"version='1.1" encoding="{e}""#, CLOSE),
+        (r#"version="1.x" encoding="{e}""#, VERSION),
+        (r#"version="2.0" encoding="{e}""#, VERSION),
+        (r#"version="1." encoding="{e}""#, VERSION),
+        (r#"version="" encoding="{e}""#, VERSION),
+        (
+            r#"version="1.1" encoding="{e}" standalone="maybe""#,
+            STANDALONE,
+        ),
+        (
+            r#"version="1.1" encoding="{e}" standalone="Yes""#,
+            STANDALONE,
+        ),
+        (r#"version="1.1" encoding="{e}" standalone="""#, STANDALONE),
+        (r#"version="1.1" encoding="8bit""#, ENCODING),
+        (r#"version="1.1" encoding="""#, ENCODING),
+        (r#"version="1.1" encoding="UTF 8""#, ENCODING),
+        (r#"version="1.1" encoding="-utf8""#, ENCODING),
+    ];
+    const START: &str = "does not start with `version`";
+    const ORDER: &str = "has `version`, `encoding` or `standalone` repeated or out of order";
+    const OTHER: &str = "has a name other than `version`, `encoding` and `standalone`";
+    const BLANK: &str = "has no white space before a name";
+    const STRAY: &str = "has a character that is not allowed there";
+    const EQ: &str = "has a name not followed by `=`";
+    const QUOTE: &str = "has a value that is not quoted";
+    const CLOSE: &str = "has a value that is not closed";
+    const VERSION: &str = "has a version other than `1.` and digits";
+    const ENCODING: &str = "has an encoding that is not an encoding name";
+    const STANDALONE: &str = "has a `standalone` other than `yes` or `no`";
+
+    /// Declarations in XML's grammar, read as XML 1.1; `{e}` stands for an
+    /// encoding name.
+    const WELL_FORMED: [&str; 6] = [
+        r#"version="1.1""#,
+        r#"version = "1.1" encoding = "{e}" standalone = "yes""#,
+        "version=\"1.1\"\t\r\n",
+        "\t\r\nversion=\"1.1\"",
+        r#"version="1.1" encoding="{e}""#,
+        r#"version="1.1" standalone="no""#,
+    ];
+
+    /// `attributes` with `"` and `'` swapped.
+    fn swap_quotes(attributes: &str) -> String {
+        attributes
+            .chars()
+            .map(|c| match c {
+                '"' => '\'',
+                '\'' => '"',
+                c => c,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_declaration_outside_xmls_grammar_is_ignored_by_root_detection() {
+        let doc = Some(("urn:test".to_owned(), "doc".to_owned()));
+        // Each mark, and an encoding that contradicts it.
+        let marks: [(&[u8], &str, bool); 4] = [
+            (b"", "UTF-16", false),
+            (b"\xEF\xBB\xBF", "UTF-16", false),
+            (b"\xFF\xFE", "UTF-16BE", true),
+            (b"\xFE\xFF", "UTF-16LE", false),
+        ];
+        let bytes = |mark: &[u8], little: bool, text: &str| {
+            if mark.len() == 2 {
+                utf16(text, little)
+            } else {
+                [mark, text.as_bytes()].concat()
+            }
+        };
+        for (mark, other, little) in marks {
+            let text = |attributes: &str, root: &str| format!("<?xml {attributes}?>{root}");
+            // An encoding that agrees with the mark.
+            let own = match mark.len() {
+                0 => "a-b.c_D9",
+                3 => "UTF-8",
+                _ => "UTF-16",
+            };
+            for (attributes, _) in MALFORMED {
+                for attributes in [attributes.to_owned(), swap_quotes(attributes)] {
+                    if attributes.contains("{e}") {
+                        // The encoding is not checked: the mark alone
+                        // decides.
+                        let text = text(
+                            &attributes.replace("{e}", other),
+                            r#"<doc xmlns="urn:test"/>"#,
+                        );
+                        let found = root_element(&bytes(mark, little, &text));
+                        assert_eq!(found, doc, "{mark:?} {text}");
+                    }
+                    // Nor the version: the document is XML 1.0.
+                    let text = text(&attributes.replace("{e}", own), r#"<r xmlns="urn:&#1;"/>"#);
+                    let found = root_element(&bytes(mark, little, &text));
+                    assert_eq!(found, None, "{mark:?} {text}");
+                }
+            }
+            for attributes in WELL_FORMED {
+                for attributes in [attributes.to_owned(), swap_quotes(attributes)] {
+                    let text = text(&attributes.replace("{e}", own), r#"<r xmlns="urn:&#1;"/>"#);
+                    let found = root_element(&bytes(mark, little, &text));
+                    assert_eq!(
+                        found,
+                        Some(("urn:\u{1}".into(), "r".into())),
+                        "{mark:?} {text}"
+                    );
+                }
+            }
+            // An unknown version in the grammar is read as 1.0, and the
+            // declaration's encoding is checked.
+            let text =
+                format!(r#"<?xml version="1.2" encoding="{other}"?><doc xmlns="urn:test"/>"#);
+            assert_eq!(root_element(&bytes(mark, little, &text)), None, "{text}");
+            let text = r#"<?xml version="1.2"?><r xmlns="urn:&#1;"/>"#;
+            assert_eq!(root_element(&bytes(mark, little, text)), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_declaration_outside_xmls_grammar_is_reported_and_ignored() {
+        let field = "<comment>D&#1;E</comment><acronym>A</acronym></mime-type>";
+        for bom in ["", "\u{feff}"] {
+            for (attributes, problem) in MALFORMED {
+                for attributes in [attributes.to_owned(), swap_quotes(attributes)] {
+                    let text = format!(
+                        "{bom}<?xml {}?>{OPEN}{field}",
+                        attributes.replace("{e}", "UTF-8")
+                    );
+                    let info = parse(&text);
+                    // Ignored, so read as XML 1.0: the reference cannot be
+                    // replaced.
+                    assert_eq!(
+                        info.diagnostics.first(),
+                        Some(&Diagnostic::new(
+                            "t.xml",
+                            Some(crate::Location::Offset(bom.len())),
+                            format!("bad XML (the XML declaration {problem}); it is ignored")
+                        )),
+                        "{text:?}"
+                    );
+                    assert_eq!(info.diagnostics.len(), 2, "{text:?}");
+                    assert_eq!(comments(&info), [], "{text:?}");
+                    assert_eq!(info.acronym.as_deref(), Some("A"), "{text:?}");
+                }
+            }
+            for attributes in WELL_FORMED {
+                for attributes in [attributes.to_owned(), swap_quotes(attributes)] {
+                    let text = format!(
+                        "{bom}<?xml {}?>{OPEN}{field}",
+                        attributes.replace("{e}", "a-b.c_D9")
+                    );
+                    let info = parse(&text);
+                    assert!(
+                        info.diagnostics.is_empty(),
+                        "{text:?}: {:?}",
+                        info.diagnostics
+                    );
+                    assert_eq!(comments(&info), [(None, "D\u{1}E")], "{text:?}");
+                }
+            }
+            // An unknown version in the grammar is read as 1.0, silently.
+            let text = format!("{bom}<?xml version=\"1.2\"?>{OPEN}{field}");
+            let info = parse(&text);
+            assert_eq!(info.diagnostics.len(), 1, "{:?}", info.diagnostics);
+            assert!(
+                info.diagnostics[0].message.contains("`&#1;`"),
+                "{:?}",
+                info.diagnostics
+            );
+        }
+    }
+
+    /// Processing instructions named `xml` in some casing, which are not
+    /// the declaration, each with what is wrong, after "the XML
+    /// declaration ". `quick-xml` reads `<?xml` followed by a character
+    /// other than ASCII white space as a processing instruction.
+    const NAMED_XML: [(&str, &str); 7] = [
+        (r#"<?XML version="1.1"?>"#, "is named `XML`, not `xml`"),
+        ("<?Xml?>", "is named `Xml`, not `xml`"),
+        (
+            r#"<?xmL version="1.1" encoding="UTF-8"?>"#,
+            "is named `xmL`, not `xml`",
+        ),
+        ("<?XML\u{85}version=\"1.1\"?>", "is named `XML`, not `xml`"),
+        ("<?xml\u{85}version=\"1.1\"?>", STRAY),
+        ("<?xml\u{2028}version=\"1.1\"?>", STRAY),
+        ("<?xml\"?>", STRAY),
+    ];
+
+    /// Processing instructions whose name only starts with `xml`.
+    const NOT_NAMED_XML: [&str; 4] = [
+        r#"<?xml-stylesheet href="a"?>"#,
+        "<?XML-stylesheet?>",
+        r#"<?xmlns version="1.1"?>"#,
+        "<?xml\u{b7}?>",
+    ];
+
+    #[test]
+    fn a_processing_instruction_named_xml_is_reported_and_ignored() {
+        let field = "<comment>D&#1;E</comment><acronym>A</acronym></mime-type>";
+        for bom in ["", "\u{feff}"] {
+            for (instruction, problem) in NAMED_XML {
+                let text = format!("{bom}{instruction}{OPEN}{field}");
+                let info = parse(&text);
+                // Ignored, so read as XML 1.0: the reference cannot be
+                // replaced.
+                assert_eq!(
+                    info.diagnostics.first(),
+                    Some(&Diagnostic::new(
+                        "t.xml",
+                        Some(crate::Location::Offset(bom.len())),
+                        format!("bad XML (the XML declaration {problem}); it is ignored")
+                    )),
+                    "{text:?}"
+                );
+                assert_eq!(info.diagnostics.len(), 2, "{text:?}");
+                assert_eq!(comments(&info), [], "{text:?}");
+                assert_eq!(info.acronym.as_deref(), Some("A"), "{text:?}");
+            }
+            for instruction in NOT_NAMED_XML {
+                let text = format!("{bom}{instruction}{OPEN}{field}");
+                let info = parse(&text);
+                assert_eq!(info.diagnostics.len(), 1, "{text:?}");
+                assert!(
+                    info.diagnostics[0].message.contains("`&#1;`"),
+                    "{text:?}: {:?}",
+                    info.diagnostics
+                );
+            }
+        }
+        // Not at the start, one is reported as a late declaration is.
+        let late = "bad XML (an XML declaration not at the start of the file)";
+        let late_after =
+            "bad XML (an XML declaration not at the start of the file); the rest is skipped";
+        let root = format!("{OPEN}<comment>a</comment></mime-type>");
+        let mut cases = Vec::new();
+        for (instruction, _) in NAMED_XML {
+            cases.extend([
+                (format!("<!-- c -->{instruction}{root}"), vec![(10, late)]),
+                (
+                    format!("<?xml version=\"1.0\"?>{instruction}{root}"),
+                    vec![(21, late)],
+                ),
+                (
+                    format!("{OPEN}{instruction}<comment>a</comment></mime-type>"),
+                    vec![(OPEN.len(), late)],
+                ),
+                (
+                    format!("{root}{instruction}<!-- c -->"),
+                    vec![(root.len(), late_after)],
+                ),
+            ]);
+        }
+        for instruction in NOT_NAMED_XML {
+            cases.extend([
+                (format!("<!-- c -->{instruction}{root}"), vec![]),
+                (
+                    format!("{OPEN}{instruction}<comment>a</comment></mime-type>"),
+                    vec![],
+                ),
+                (format!("{root}{instruction}<!-- c -->"), vec![]),
+            ]);
+        }
+        check_misplaced(&cases);
+    }
+
+    #[test]
+    fn a_processing_instruction_named_xml_is_ignored_by_root_detection() {
+        let doc = Some(("urn:test".to_owned(), "doc".to_owned()));
+        for (instruction, _) in NAMED_XML {
+            let text = format!(r#"{instruction}<doc xmlns="urn:test"/>"#);
+            assert_eq!(root_element(text.as_bytes()), doc, "{text:?}");
+            // The document is XML 1.0.
+            let text = format!(r#"{instruction}<r xmlns="urn:&#1;"/>"#);
+            assert_eq!(root_element(text.as_bytes()), None, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn a_declaration_is_checked_in_linear_time() {
+        // For a declaration of D bytes (from `xml` to before `?>`), the
+        // grammar check takes 1 + 2D steps, then looking for the version
+        // D. Root detection looks for the encoding too (D more): 1 + 4D
+        // in the grammar, 1 + 2D outside it (ignored). The per-type
+        // reader does not: 1 + 3D and 1 + 2D. Each bound is twice that,
+        // with the file's bytes for D.
+        for (lead, in_grammar, root_cost, type_cost) in [("", true, 4, 3), ("8", false, 2, 2)] {
+            let declaration = |n: usize| {
+                let encoding = format!("{lead}a{}", "-".repeat(n));
+                format!(r#"<?xml version="1.0" encoding="{encoding}"?>"#)
+            };
+            crate::work::assert_linear(
+                10_000,
+                |n| {
+                    let text = format!(r#"{}<doc xmlns="u"/>"#, declaration(n));
+                    let (found, steps) = crate::work::steps(|| root_element(text.as_bytes()));
+                    assert!(found.is_some());
+                    (steps, text.len())
+                },
+                |_, bytes| 2 * (root_cost * bytes + 1),
+            );
+            crate::work::assert_linear(
+                10_000,
+                |n| {
+                    let text = format!("{}{OPEN}</mime-type>", declaration(n));
+                    let (info, steps) = crate::work::steps(|| parse(&text));
+                    assert_eq!(info.diagnostics.is_empty(), in_grammar);
+                    (steps, text.len())
+                },
+                |_, bytes| 2 * (type_cost * bytes + 1),
+            );
+        }
+    }
+
+    #[test]
+    fn a_utf16_root_element_is_transcoded_in_linear_time() {
+        crate::work::assert_linear(
+            10_000,
+            |n| {
+                let text = format!("<!--{}--><doc xmlns=\"urn:test\"/>", "\u{e9}".repeat(n));
+                let bytes = utf16(&text, true);
+                let (found, steps) = crate::work::steps(|| root_element(&bytes));
+                assert!(found.is_some());
+                // Each byte read and written.
+                assert!(steps >= bytes.len(), "{steps} steps, {} bytes", bytes.len());
+                (steps, bytes.len())
+            },
+            // Twice the analysed cost: per byte read one, and per byte
+            // written at most one.
+            |_, bytes| 2 * (2 * bytes + 100),
+        );
+    }
+
+    /// Magic says XML for UTF-8, with or without a byte order mark, and for
+    /// UTF-16 of either order; the root element refines it alike.
+    #[test]
+    fn utf16_xml_is_refined_by_its_root_element() {
+        let db = MimeDatabase::from_files(&[vec![
+            (
+                "magic",
+                b"MIME-Magic\0\n[50:application/xml]\n>0=\x00\x05<?xml\n>0=\x00\x04<doc\n\
+                  >0=\x00\x04\xff\xfe<\x00\n>0=\x00\x04\xfe\xff\x00<\n>0=\x00\x04\xef\xbb\xbf<\n"
+                    .as_slice(),
+            ),
+            ("subclasses", b"application/x-test+xml application/xml\n"),
+            ("XMLnamespaces", b"urn:test doc application/x-test+xml\n"),
+        ]]);
+        let text = r#"<doc xmlns="urn:test"/>"#;
+        let mut bom8 = b"\xEF\xBB\xBF".to_vec();
+        bom8.extend_from_slice(text.as_bytes());
+        for data in [
+            text.as_bytes().to_vec(),
+            bom8,
+            utf16(text, true),
+            utf16(text, false),
+        ] {
+            let found = db.type_for_data(&data);
+            assert_eq!(found.mime.as_str(), "application/x-test+xml", "{data:?}");
+            assert_eq!(found.decided_by, crate::DecidedBy::XmlRoot);
+        }
+    }
+
+    /// How a problem with the root's tag other than its `xml:lang` starts,
+    /// after "the root element's ".
+    const TAG: &str = "tag cannot be read, so its language is unknown: ";
+
+    /// The root's start tag with `attributes` after the namespace.
+    fn root(attributes: &str) -> String {
+        format!(r#"<mime-type xmlns="{NAMESPACE}" {attributes}>"#)
+    }
+
+    #[test]
+    fn a_field_without_a_language_takes_the_roots() {
+        let info = parse(&format!(
+            "{}<comment>Deutsch</comment><acronym>DE</acronym></mime-type>",
+            root(r#"xml:lang="de""#)
+        ));
+        assert!(info.diagnostics.is_empty(), "{:?}", info.diagnostics);
+        assert_eq!(comments(&info), [(Some("de"), "Deutsch")]);
+        assert_eq!(info.comment.pick(&Locales::untranslated()), None);
+        assert_eq!(
+            info.comment.pick(&Locales::new(["de"])).as_deref(),
+            Some("Deutsch")
+        );
+        // A translated acronym is left out.
+        assert_eq!(info.acronym, None);
+        // Its own language, an empty one too, comes first.
+        let info = parse(&format!(
+            r#"{}<comment xml:lang="">English</comment><comment xml:lang="fr">F</comment><acronym xml:lang="">A</acronym></mime-type>"#,
+            root(r#"xml:lang="de""#)
+        ));
+        assert!(info.diagnostics.is_empty(), "{:?}", info.diagnostics);
+        assert_eq!(comments(&info), [(None, "English"), (Some("fr"), "F")]);
+        assert_eq!(info.acronym.as_deref(), Some("A"));
+        // An empty one at the root is untranslated.
+        let info = parse(&format!(
+            "{}<comment>English</comment></mime-type>",
+            root(r#"xml:lang="""#)
+        ));
+        assert_eq!(comments(&info), [(None, "English")]);
+        // Normalised by the version.
+        for (declaration, lang) in [("", "de\u{85}"), ("<?xml version=\"1.1\"?>", "de ")] {
+            let info = parse(&format!(
+                "{declaration}{}<comment>D</comment></mime-type>",
+                root("xml:lang=\"de\u{85}\"")
+            ));
+            assert!(info.diagnostics.is_empty(), "{:?}", info.diagnostics);
+            assert_eq!(comments(&info), [(Some(lang), "D")], "{declaration}");
+        }
+    }
+
+    #[test]
+    fn a_field_whose_inherited_language_cannot_be_read_is_dropped() {
+        let v11 = "<?xml version=\"1.1\"?>";
+        for (declaration, attributes, problem) in [
+            (
+                "",
+                r#"xml:lang="&e;""#,
+                "`xml:lang` cannot be read: the reference `&e;` cannot be replaced".to_owned(),
+            ),
+            (
+                "",
+                r#"xml:lang="d&#1;e""#,
+                "`xml:lang` cannot be read: the reference `&#1;` cannot be replaced".to_owned(),
+            ),
+            (
+                v11,
+                "xml:lang=\"d\u{1}e\"",
+                "`xml:lang` cannot be read: a character XML does not allow, U+0001".to_owned(),
+            ),
+            (
+                "",
+                r#"xml:lang="de" xml:lang="fr""#,
+                format!("`xml:lang` cannot be read: {}", twice("xml:lang")),
+            ),
+            // `quick-xml` finds these at the value or past `=`.
+            (
+                "",
+                "xml:lang=de",
+                format!("`xml:lang` cannot be read: {UNREADABLE}a value is not quoted"),
+            ),
+            (
+                "",
+                "xml:lang = ",
+                format!("`xml:lang` cannot be read: {UNREADABLE}`=` is not followed by a value"),
+            ),
+            (
+                "",
+                r#"type="a/b" x xml:lang="de""#,
+                format!("{TAG}{UNREADABLE}a name is not followed by `=`"),
+            ),
+            (
+                "",
+                r#"type=a xml:lang="de""#,
+                format!("{TAG}{UNREADABLE}a value is not quoted"),
+            ),
+            (
+                "",
+                r#"type="a/b" x="#,
+                format!("{TAG}{UNREADABLE}`=` is not followed by a value"),
+            ),
+        ] {
+            let head = format!(
+                r#"{declaration}{}<comment xml:lang="fr">F</comment>"#,
+                root(attributes)
+            );
+            let text = format!(
+                r#"{head}<comment>D</comment><comment xml:lang="">E</comment></mime-type>"#
+            );
+            let info = parse(&text);
+            assert_eq!(
+                info.diagnostics,
+                [Diagnostic::new(
+                    "t.xml",
+                    Some(crate::Location::Offset(head.len())),
+                    format!("bad XML (the root element's {problem}); the value is left out")
+                )],
+                "{text:?}"
+            );
+            // Only the field that takes it is dropped.
+            assert_eq!(
+                comments(&info),
+                [(None, "E"), (Some("fr"), "F")],
+                "{text:?}"
+            );
+        }
+        // XML 1.1 allows a reference to a control.
+        let info = parse(&format!(
+            "{v11}{}<comment>D</comment></mime-type>",
+            root(r#"xml:lang="d&#1;e""#)
+        ));
+        assert!(info.diagnostics.is_empty(), "{:?}", info.diagnostics);
+        assert_eq!(comments(&info), [(Some("d\u{1}e"), "D")]);
+    }
+
+    #[test]
+    fn any_attribute_error_in_the_root_tag_makes_its_language_unreadable() {
+        let v11 = "<?xml version=\"1.1\"?>";
+        for (declaration, attributes, problem) in [
+            (
+                "",
+                r#"type="&e;""#,
+                format!("{TAG}the reference `&e;` cannot be replaced"),
+            ),
+            ("", r#"1x="a""#, format!("{TAG}{}", not_a_name())),
+            ("", r#"x:y:z="a""#, format!("{TAG}{}", not_a_name())),
+            (
+                "",
+                r#"type="a<b""#,
+                format!("{TAG}{UNREADABLE}`<` in a value"),
+            ),
+            (
+                "",
+                r#"xmlns:p="""#,
+                format!("{TAG}{UNREADABLE}a prefix's namespace declaration is empty in XML 1.0"),
+            ),
+            (
+                "<?xml version=\"1.0\"?>",
+                r#"type="a" xmlns:p="" xml:lang="de""#,
+                format!("{TAG}{UNREADABLE}a prefix's namespace declaration is empty in XML 1.0"),
+            ),
+        ] {
+            let head = format!(
+                r#"{declaration}{}<comment xml:lang="fr">F</comment>"#,
+                root(attributes)
+            );
+            let text = format!(
+                r#"{head}<comment>D</comment><comment xml:lang="">E</comment></mime-type>"#
+            );
+            let info = parse(&text);
+            assert_eq!(
+                info.diagnostics,
+                [Diagnostic::new(
+                    "t.xml",
+                    Some(crate::Location::Offset(head.len())),
+                    format!("bad XML (the root element's {problem}); the value is left out")
+                )],
+                "{text:?}"
+            );
+            // Fields with their own language are kept.
+            assert_eq!(
+                comments(&info),
+                [(None, "E"), (Some("fr"), "F")],
+                "{text:?}"
+            );
+        }
+        // A clean root, with no `xml:lang`, keeps every field; so does
+        // `xmlns:p=""` in XML 1.1.
+        for (declaration, attributes) in [
+            ("", r#"type="text/plain""#),
+            (v11, r#"type="text/plain" xmlns:p="""#),
+        ] {
+            let info = parse(&format!(
+                r#"{declaration}{}<comment>D</comment><comment xml:lang="fr">F</comment></mime-type>"#,
+                root(attributes)
+            ));
+            assert!(info.diagnostics.is_empty(), "{:?}", info.diagnostics);
+            assert_eq!(comments(&info), [(None, "D"), (Some("fr"), "F")]);
         }
     }
 
@@ -2254,7 +3443,7 @@ mod tests {
             std::fs::create_dir_all(dir.path().join(folder).join("text")).unwrap();
             std::fs::write(dir.path().join(folder).join("text/x-t.xml"), &text).unwrap();
         }
-        let info = TypeInfo::read(
+        let info = read_in(
             &MimeType::new("text/x-t").unwrap(),
             [dir.path().join("a"), dir.path().join("b")]
                 .iter()
@@ -2308,7 +3497,7 @@ mod tests {
         ] {
             let text = text.as_str();
             write(high.path(), text);
-            let alone = TypeInfo::read(&t, [high.path()].into_iter());
+            let alone = read_in(&t, [high.path()].into_iter());
             assert!(alone.found);
             assert_eq!(alone.comment.pick(&Locales::untranslated()), None, "{text}");
             assert_eq!(alone.acronym, None, "{text}");
@@ -2323,7 +3512,7 @@ mod tests {
                 [(Some(crate::Location::Offset(0)), message.as_str())],
                 "{text}"
             );
-            let both = TypeInfo::read(&t, [low.path(), high.path()].into_iter());
+            let both = read_in(&t, [low.path(), high.path()].into_iter());
             assert_eq!(
                 both.comment.pick(&Locales::untranslated()).as_deref(),
                 Some("Low"),
@@ -2412,9 +3601,11 @@ mod tests {
         .unwrap();
         std::fs::write(dir.path().join("packages/x.xml"), "").unwrap();
         let plain = MimeType::new("text/plain").unwrap();
-        let info = TypeInfo::read(&plain, [dir.path()].into_iter());
+        let info = read_in(&plain, [dir.path()].into_iter());
         assert_eq!(info.diagnostics.len(), 1);
-        assert_eq!(types_in(dir.path()), [plain]);
+        let mut diagnostics = Vec::new();
+        assert_eq!(types_in(dir.path(), &mut diagnostics), [plain]);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
 
     #[test]
@@ -2427,7 +3618,9 @@ mod tests {
         fifo(&text.join("fifo.xml"));
         std::fs::write(text.join("real.xml"), "").unwrap();
         std::os::unix::fs::symlink("real.xml", text.join("linked.xml")).unwrap();
-        let mut types = types_in(dir.path());
+        let mut diagnostics = Vec::new();
+        let mut types = types_in(dir.path(), &mut diagnostics);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
         types.sort_by(|a, b| a.as_str().cmp(b.as_str()));
         assert_eq!(
             types,
@@ -2436,6 +3629,113 @@ mod tests {
                 MimeType::new("text/real").unwrap()
             ]
         );
+    }
+
+    #[test]
+    fn an_interrupted_listing_is_listed_again() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["text/a.xml", "text/b.xml", "text/c.xml", "image/d.xml"] {
+            let path = dir.path().join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "").unwrap();
+        }
+        let all: Vec<MimeType> = ["image/d", "text/a", "text/b", "text/c"]
+            .into_iter()
+            .map(|name| MimeType::new(name).unwrap())
+            .collect();
+        // Opening, then mid-listing, of the top and of a media folder.
+        for (folder, at) in [
+            (dir.path().to_owned(), None),
+            (dir.path().to_owned(), Some(1)),
+            (dir.path().join("text"), None),
+            (dir.path().join("text"), Some(1)),
+        ] {
+            let fault = (folder, at, std::io::ErrorKind::Interrupted);
+            LISTING_FAULT.set(Some(fault.clone()));
+            let mut diagnostics = Vec::new();
+            let mut types = types_in(dir.path(), &mut diagnostics);
+            types.sort();
+            assert!(LISTING_FAULT.with_borrow(Option::is_none), "{fault:?}");
+            assert_eq!(types, all, "{fault:?}");
+            assert!(diagnostics.is_empty(), "{fault:?}: {diagnostics:?}");
+        }
+    }
+
+    /// The first entry of `dir` as listed, by name.
+    fn first_listed(dir: &Path) -> std::ffi::OsString {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .file_name()
+    }
+
+    #[test]
+    fn a_listing_error_is_reported_and_keeps_what_was_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let top = dir.path().to_owned();
+        let text = top.join("text");
+        for name in ["text/a.xml", "text/b.xml", "text/c.xml", "image/d.xml"] {
+            let path = top.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "").unwrap();
+        }
+        let named = |names: &[&str]| -> Vec<MimeType> {
+            let mut types: Vec<MimeType> = names
+                .iter()
+                .map(|name| MimeType::new(name).unwrap())
+                .collect();
+            types.sort();
+            types
+        };
+        // The first media folder listed, and the first `text` file.
+        let media = first_listed(&top);
+        let kept_media = if media == "text" {
+            named(&["text/a", "text/b", "text/c"])
+        } else {
+            named(&["image/d"])
+        };
+        let file = first_listed(&text);
+        let subtype = file.to_str().unwrap().strip_suffix(".xml").unwrap();
+        let kept_text = named(&["image/d", &format!("text/{subtype}")]);
+        let err = || std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let unopened = format!("cannot be listed: {}", err());
+        let cut = format!("cannot be listed in full: {}", err());
+        for (folder, at, message, kept) in [
+            (&top, None, &unopened, Vec::new()),
+            (&text, None, &unopened, named(&["image/d"])),
+            (&top, Some(1), &cut, kept_media),
+            (&text, Some(1), &cut, kept_text),
+        ] {
+            let fault = (folder.clone(), at, std::io::ErrorKind::PermissionDenied);
+            LISTING_FAULT.set(Some(fault.clone()));
+            let mut diagnostics = Vec::new();
+            let mut types = types_in(&top, &mut diagnostics);
+            types.sort();
+            assert!(LISTING_FAULT.with_borrow(Option::is_none), "{fault:?}");
+            assert_eq!(types, kept, "{fault:?}");
+            assert_eq!(
+                diagnostics,
+                [Diagnostic::new(folder, None, message.as_str())],
+                "{fault:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_folder_is_listed_silently() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("text")).unwrap();
+        std::fs::write(dir.path().join("text/a.xml"), "").unwrap();
+        let mut diagnostics = Vec::new();
+        assert!(types_in(&dir.path().join("missing"), &mut diagnostics).is_empty());
+        // A media folder gone once the top was listed.
+        let fault = (dir.path().join("text"), None, std::io::ErrorKind::NotFound);
+        LISTING_FAULT.set(Some(fault));
+        assert!(types_in(dir.path(), &mut diagnostics).is_empty());
+        assert!(LISTING_FAULT.with_borrow(Option::is_none));
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
 
     /// The comments `info` holds, by language, sorted.
@@ -2596,9 +3896,10 @@ mod tests {
             }
         }
         // A prefix bound further up to a namespace that cannot be read: the
-        // problem is at the field's tag.
+        // problem is at the field's tag. The root's tag then cannot be
+        // read either, so the untranslated values have their own language.
         let text = format!(
-            r#"<mime-type xmlns="{NAMESPACE}" xmlns:f="{NAMESPACE}&bogus;"><comment>en</comment><f:comment>F</f:comment><acronym>A</acronym></mime-type>"#
+            r#"<mime-type xmlns="{NAMESPACE}" xmlns:f="{NAMESPACE}&bogus;"><comment xml:lang="">en</comment><f:comment xml:lang="de">F</f:comment><acronym xml:lang="">A</acronym></mime-type>"#
         );
         check_dropped(&text, &[(None, "en")], "<f:comment", &reference("&bogus;"));
         // What the version allows is kept, and the elements of other
@@ -2849,7 +4150,7 @@ mod tests {
         // Namespaces in XML 1.0, 5, "No Prefix Undeclaring"; 1.1 allows it
         // (Namespaces in XML 1.1, 6.1).
         let message = "bad XML (an attribute cannot be read: a prefix's namespace declaration is empty in XML 1.0); the value is left out";
-        for declaration in ["", "<?xml version=\"1.0\"?>", "<?xml version=\"2.0\"?>"] {
+        for declaration in ["", "<?xml version=\"1.0\"?>", "<?xml version=\"1.2\"?>"] {
             for attribute in ["xmlns:p=\"\"", "xmlns:p=''"] {
                 check_dropped(
                     &format!(
@@ -3178,10 +4479,12 @@ mod tests {
         // field. Before, the field was kept when the root bound the prefix,
         // and left out without a word when no declaration did.
         let name = "bad XML (an element's name is not an XML name); the value is left out";
-        let tail = "<acronym>A</acronym>";
+        // A root that binds a prefix that is not a name cannot be read, so
+        // the untranslated values have their own language.
+        let tail = "<acronym xml:lang=\"\">A</acronym>";
         let bound = |prefix: &str| {
             format!(
-                "<mime-type xmlns=\"{NAMESPACE}\" xmlns:{prefix}=\"{NAMESPACE}\"><comment>en</comment>"
+                "<mime-type xmlns=\"{NAMESPACE}\" xmlns:{prefix}=\"{NAMESPACE}\"><comment xml:lang=\"\">en</comment>"
             )
         };
         for (text, mark) in [
@@ -3229,7 +4532,7 @@ mod tests {
             // Inside a field.
             (
                 format!(
-                    "<mime-type xmlns=\"{NAMESPACE}\" xmlns:1p=\"urn:q\"><comment>en</comment><comment xml:lang=\"de\">a<1p:b/>d</comment>{tail}</mime-type>"
+                    "<mime-type xmlns=\"{NAMESPACE}\" xmlns:1p=\"urn:q\"><comment xml:lang=\"\">en</comment><comment xml:lang=\"de\">a<1p:b/>d</comment>{tail}</mime-type>"
                 ),
                 "1p:b",
             ),

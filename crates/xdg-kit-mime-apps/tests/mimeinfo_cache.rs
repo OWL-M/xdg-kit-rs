@@ -173,6 +173,30 @@ fn caches_match_update_desktop_database() {
     )
     .unwrap();
     std::os::unix::fs::symlink("zlinked", applications.join("alinked")).unwrap();
+    // One file under two paths of one ID: `zsame-y` is `zsame/y`.
+    fs::create_dir_all(applications.join("zsame/y")).unwrap();
+    fs::write(
+        applications.join("zsame/y/s.desktop"),
+        "[Desktop Entry]\nType=Application\nName=S\nExec=s\nMimeType=text/same;\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink("zsame/y", applications.join("zsame-y")).unwrap();
+    // One ID, `rep-a-b-y`, under three paths in three folders, each with
+    // another entry of the type: whatever the listing order, another ID
+    // comes between two of its paths, and the tool lists it again.
+    let repeat = "[Desktop Entry]\nType=Application\nName=R\nExec=r\nMimeType=text/repeat;\n";
+    for (folder, other) in [("rep", "p"), ("rep-a", "q"), ("rep-a-b", "r")] {
+        fs::create_dir_all(applications.join(folder)).unwrap();
+        fs::write(
+            applications.join(format!("{folder}/{other}.desktop")),
+            repeat,
+        )
+        .unwrap();
+    }
+    fs::write(applications.join("rep-a-b/y.desktop"), repeat).unwrap();
+    for link in ["rep/a-b-y.desktop", "rep-a/b-y.desktop"] {
+        std::os::unix::fs::symlink("../rep-a-b/y.desktop", applications.join(link)).unwrap();
+    }
     for target in [applications.join("corpus"), applications.join("sub")] {
         fs::create_dir_all(&target).unwrap();
         for entry in fs::read_dir(&corpus).unwrap() {

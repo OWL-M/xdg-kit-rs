@@ -4,12 +4,11 @@
 
 use std::path::Path;
 
-use super::{MAX_DIAGNOSTICS, Problems};
+use super::Problems;
 use crate::model::{
-    Folder, Glob, MAX_DEPTH, MagicRule, Matchlet, NO_GLOBS, NO_MAGIC, TreeKind, TreeMatchlet,
-    TreeRule,
+    Folder, Glob, MagicRule, Matchlet, NO_GLOBS, NO_MAGIC, TreeKind, TreeMatchlet, TreeRule,
 };
-use crate::{Diagnostic, Location, MimeType};
+use crate::{Diagnostic, Limits, Location, MimeType, work};
 
 /// Which files to read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,17 +19,19 @@ pub(crate) enum Parts {
     NotInCache,
 }
 
-/// Reads a folder's text files into `folder`. Missing files are normal
-/// (a database may lack any of them); unreadable ones are reported.
+/// Reads a folder's text files into `folder`, within `limits`. Missing
+/// files are normal (a database may lack any of them); unreadable ones are
+/// reported.
 pub(crate) fn read(
     dir: &Path,
     parts: Parts,
     folder: &mut Folder,
     diagnostics: &mut Vec<Diagnostic>,
+    limits: &Limits,
 ) {
     let mut file = |name: &str| -> Option<Vec<u8>> {
         let path = dir.join(name);
-        match xdg_kit_basedir::read_regular_file(&path) {
+        match xdg_kit_basedir::read_regular_file_with(&path, limits.max_file_len) {
             Ok(bytes) => Some(bytes),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
             Err(err) => {
@@ -73,14 +74,28 @@ pub(crate) fn read(
 
     if parts == Parts::All {
         if let Some(bytes) = &globs2 {
-            parse("globs2", &dir.join("globs2"), bytes, folder, diagnostics);
+            parse(
+                "globs2",
+                &dir.join("globs2"),
+                bytes,
+                folder,
+                diagnostics,
+                limits,
+            );
         } else if let Some(bytes) = &globs {
-            parse("globs", &dir.join("globs"), bytes, folder, diagnostics);
+            parse(
+                "globs",
+                &dir.join("globs"),
+                bytes,
+                folder,
+                diagnostics,
+                limits,
+            );
         }
     }
     for (name, bytes) in &other {
         if let Some(bytes) = bytes {
-            parse(name, &dir.join(name), bytes, folder, diagnostics);
+            parse(name, &dir.join(name), bytes, folder, diagnostics, limits);
         }
     }
     if parts == Parts::All {
@@ -88,34 +103,36 @@ pub(crate) fn read(
     }
     for (name, bytes) in [("treemagic", &treemagic), ("types", &types)] {
         if let Some(bytes) = bytes {
-            parse(name, &dir.join(name), bytes, folder, diagnostics);
+            parse(name, &dir.join(name), bytes, folder, diagnostics, limits);
         }
     }
 }
 
 /// Parses the contents of the file called `name` (`globs2`, `globs`,
 /// `magic`, `aliases`, `subclasses`, `icons`, `generic-icons`,
-/// `XMLnamespaces`, `treemagic` or `types`) into `folder`; other names are
-/// ignored. Lists at most [`MAX_DIAGNOSTICS`] problems, as the cache reader
-/// does.
+/// `XMLnamespaces`, `treemagic` or `types`) into `folder`, within
+/// `limits`; other names are ignored. Lists at most
+/// [`Limits::max_diagnostics`] problems, as the cache reader does.
 pub(crate) fn parse(
     name: &str,
     path: &Path,
     bytes: &[u8],
     folder: &mut Folder,
     diagnostics: &mut Vec<Diagnostic>,
+    limits: &Limits,
 ) {
-    let problems = &mut Problems::new(path, diagnostics);
+    let problems = &mut Problems::new(path, diagnostics, limits.max_diagnostics);
+    let depth = limits.rule_depth();
     match name {
         "globs2" => parse_globs(bytes, true, folder, problems),
         "globs" => parse_globs(bytes, false, folder, problems),
-        "magic" => parse_magic(bytes, folder, problems),
+        "magic" => parse_magic(bytes, folder, problems, depth),
         "aliases" => folder.aliases = parse_pairs(bytes, ' ', problems),
         "subclasses" => folder.parents = parse_pairs(bytes, ' ', problems),
         "icons" => folder.icons = parse_icons(bytes, problems),
         "generic-icons" => folder.generic_icons = parse_icons(bytes, problems),
         "XMLnamespaces" => folder.namespaces = parse_namespaces(bytes, problems),
-        "treemagic" => parse_treemagic(bytes, folder, problems),
+        "treemagic" => parse_treemagic(bytes, folder, problems, depth),
         "types" => folder.types = Some(parse_types(bytes, problems)),
         _ => {}
     }
@@ -131,6 +148,8 @@ fn lines<'a>(
         .split(|&byte| byte == b'\n')
         .enumerate()
         .filter_map(move |(index, line)| {
+            // The line found by the split, then checked as UTF-8.
+            work::count(2 * line.len() + 1);
             let number = index + 1;
             match std::str::from_utf8(line) {
                 Ok(line) if line.is_empty() || line.starts_with('#') => None,
@@ -146,23 +165,32 @@ fn lines<'a>(
 /// Collects text file problems during parsing so they can be reported
 /// after all invalid UTF-8 lines. Keeps at most one more problem than the
 /// reporting limit so the summary line still appears.
-struct Held(Vec<(usize, String)>);
+struct Held {
+    problems: Vec<(usize, String)>,
+    /// The reporting limit (`None`: none).
+    max: Option<usize>,
+}
 
 impl Held {
-    fn new() -> Self {
-        Self(Vec::new())
+    fn new(max: Option<usize>) -> Self {
+        Self {
+            problems: Vec::new(),
+            max,
+        }
     }
 
     fn report(&mut self, line: usize, message: impl Into<String>) {
         // One past the limit brings the summary; more are never listed.
-        if self.0.len() <= MAX_DIAGNOSTICS {
-            self.0.push((line, message.into()));
+        if self.max.is_none_or(|max| self.problems.len() <= max) {
+            let message = message.into();
+            work::count(message.len());
+            self.problems.push((line, message));
         }
     }
 
     /// Lists the held problems, in the order they were found.
     fn list(self, problems: &mut Problems<'_>) {
-        for (line, message) in self.0 {
+        for (line, message) in self.problems {
             problems.report(Some(Location::Line(line)), message);
         }
     }
@@ -181,47 +209,80 @@ fn mime(text: &str, line: usize, held: &mut Held) -> Option<MimeType> {
 /// `globs2` (`weight:type:pattern[:flags[:...]]`) or the older `globs`
 /// (`type:pattern`, weight 50, the pattern running to the end of the line).
 ///
+/// `update-mime-database` writes patterns as they are, so a `globs2`
+/// pattern ends at the first `:` that `fnmatch` would not read as part of
+/// it: one in a set (`*[[:digit:]]`) or escaped belongs to the pattern,
+/// and a bracket that can never match (`[[.x`, no `.]`) takes the rest of
+/// the line, flags included, so the pattern still never matches. A bare
+/// `:` stays ambiguous; a flag other than `cs` is reported, so such a
+/// misread line shows. So does a set that a trailing `\` keeps from
+/// closing: the tool writes `[:\` with `cs` as `[:\:cs`, where the `[`
+/// stands for itself and its `:` is bare, so the line reads as `[` with
+/// the flag `\`.
+///
 /// `update-mime-database` writes every `globs2` line that has flags a second
 /// time without them, "for older parsers". That copy is dropped: honouring it
 /// would make a case-sensitive pattern such as `*.C` also match
 /// case-insensitively, which the source XML and `mime.cache` do not say.
+/// It is kept when the flagged line was read with another pattern: for a
+/// never-matching bracket the pattern keeps the flags, so
+/// [`MimeDatabase::patterns_for`](crate::MimeDatabase::patterns_for)
+/// lists `*[a:b[.x:cs` and `*[a:b[.x` where `mime.cache` gives only
+/// `*[a:b[.x`; none of them matches a name.
 ///
 /// The problems with lines' fields are listed before those with their
 /// types and patterns.
 fn parse_globs(bytes: &[u8], version_two: bool, folder: &mut Folder, problems: &mut Problems<'_>) {
-    let mut bad_fields = Held::new();
-    let mut bad_values = Held::new();
+    let mut bad_fields = Held::new(problems.max());
+    let mut bad_values = Held::new(problems.max());
     // The (weight, type, pattern) of the previous line, when it had flags.
     let mut flagged: Option<(&str, &str, &str)> = None;
     for (number, line) in lines(bytes, problems) {
         // Only the line right before counts.
         let previous = flagged.take();
         let (weight, mime_text, pattern, case_sensitive) = if version_two {
-            let mut fields = line.splitn(4, ':');
-            let (Some(weight), Some(mime), Some(pattern)) =
+            let mut fields = line.splitn(3, ':');
+            let (Some(weight), Some(mime), Some(rest)) =
                 (fields.next(), fields.next(), fields.next())
             else {
+                // The fields found scan the line.
+                work::count(line.len());
                 bad_fields.report(number, "fewer than three fields, line skipped");
                 continue;
             };
+            // The first two fields scanned for their `:`.
+            work::count(weight.len() + mime.len() + 2);
+            let end = crate::fnmatch::pattern_end(rest);
+            let pattern = &rest[..end];
             // Further fields after the flags are for future use and ignored.
-            let flags = fields
-                .next()
-                .map(|rest| rest.split(':').next().unwrap_or(""));
+            let flags = rest
+                .get(end + 1..)
+                .map(|after| after.split(':').next().unwrap_or(""));
+            // The flags scanned for their end, then for each word twice.
+            work::count(3 * flags.map_or(0, str::len));
             let key = (weight, mime, pattern);
+            // Compared with the previous line's.
+            work::count(weight.len() + mime.len() + pattern.len());
             let copy_for_old_parsers = flags.is_none() && previous == Some(key);
             flagged = flags.is_some().then_some(key);
             if copy_for_old_parsers {
                 continue;
             }
-            let flags = flags.unwrap_or("");
+            work::count(weight.len());
             let Ok(weight) = weight.parse::<u32>() else {
                 bad_fields.report(number, "weight is not a number, line skipped");
                 continue;
             };
-            let case_sensitive = flags.split(',').any(|flag| flag == "cs");
+            let words = flags.into_iter().flat_map(|flags| flags.split(','));
+            let case_sensitive = words.clone().any(|flag| flag == "cs");
+            if let Some(other) = words.clone().find(|&flag| flag != "cs") {
+                let other = crate::error::quoted(other);
+                bad_fields.report(number, format!("unknown flag \"{other}\", ignored"));
+            }
             (weight, mime, pattern, case_sensitive)
         } else {
+            // Scanned for the `:`.
+            work::count(line.len());
             let Some((mime, pattern)) = line.split_once(':') else {
                 bad_fields.report(number, "no ':', line skipped");
                 continue;
@@ -236,6 +297,7 @@ fn parse_globs(bytes: &[u8], version_two: bool, folder: &mut Folder, problems: &
         } else if pattern.is_empty() {
             bad_values.report(number, "empty pattern, line skipped");
         } else {
+            work::count(pattern.len());
             folder.globs.push(Glob {
                 weight: weight.min(100),
                 pattern: pattern.to_owned(),
@@ -256,7 +318,7 @@ fn parse_pairs(
     problems: &mut Problems<'_>,
 ) -> Vec<(MimeType, MimeType)> {
     let mut pairs = Vec::new();
-    let mut held = Held::new();
+    let mut held = Held::new(problems.max());
     for (number, line) in lines(bytes, problems) {
         let Some((first, second)) = line.split_once(separator) else {
             held.report(number, "one field only, line skipped");
@@ -276,7 +338,7 @@ fn parse_pairs(
 /// `icons` and `generic-icons`: `type:icon-name`.
 fn parse_icons(bytes: &[u8], problems: &mut Problems<'_>) -> Vec<(MimeType, String)> {
     let mut icons = Vec::new();
-    let mut held = Held::new();
+    let mut held = Held::new(problems.max());
     for (number, line) in lines(bytes, problems) {
         match line.split_once(':') {
             Some((mime_text, icon)) if !icon.is_empty() => {
@@ -295,7 +357,7 @@ fn parse_icons(bytes: &[u8], problems: &mut Problems<'_>) -> Vec<(MimeType, Stri
 /// empty (two spaces).
 fn parse_namespaces(bytes: &[u8], problems: &mut Problems<'_>) -> Vec<(String, String, MimeType)> {
     let mut namespaces = Vec::new();
-    let mut held = Held::new();
+    let mut held = Held::new(problems.max());
     for (number, line) in lines(bytes, problems) {
         let mut fields = line.splitn(3, ' ');
         match (fields.next(), fields.next(), fields.next()) {
@@ -317,7 +379,7 @@ fn parse_namespaces(bytes: &[u8], problems: &mut Problems<'_>) -> Vec<(String, S
 /// defined by the spec).
 fn parse_types(bytes: &[u8], problems: &mut Problems<'_>) -> Vec<MimeType> {
     let mut types = Vec::new();
-    let mut held = Held::new();
+    let mut held = Held::new(problems.max());
     for (number, line) in lines(bytes, problems) {
         if let Some(mime) = mime(line, number, &mut held) {
             types.push(mime);
@@ -443,6 +505,8 @@ struct Open<T> {
 struct Section<T> {
     /// Where the section header starts.
     at: usize,
+    /// The deepest nesting allowed.
+    max_depth: usize,
     /// The finished top-level tests.
     kept: Vec<T>,
     /// The last whole line of each level, from the top.
@@ -458,9 +522,10 @@ struct Section<T> {
 }
 
 impl<T: Nested> Section<T> {
-    fn new(at: usize) -> Self {
+    fn new(at: usize, max_depth: usize) -> Self {
         Self {
             at,
+            max_depth,
             kept: Vec::new(),
             open: Vec::new(),
             lost_last: false,
@@ -486,7 +551,7 @@ impl<T: Nested> Section<T> {
             return None;
         }
         self.close(depth);
-        let fits = depth == indent && indent <= MAX_DEPTH;
+        let fits = depth == indent && indent <= self.max_depth;
         let whole = item.is_some();
         if let Some(item) = item.filter(|_| fits) {
             self.open.push(Open { item, lost: false });
@@ -540,8 +605,8 @@ impl<T: Nested> Section<T> {
     }
 }
 
-/// The `magic` file.
-fn parse_magic(bytes: &[u8], folder: &mut Folder, problems: &mut Problems<'_>) {
+/// The `magic` file, tests nested at most `max_depth` deep.
+fn parse_magic(bytes: &[u8], folder: &mut Folder, problems: &mut Problems<'_>, max_depth: usize) {
     const HEADER: &[u8] = b"MIME-Magic\0\n";
     let report = |problems: &mut Problems<'_>, at: usize, message: &str| {
         problems.report(Some(Location::Offset(at)), message);
@@ -572,7 +637,7 @@ fn parse_magic(bytes: &[u8], folder: &mut Folder, problems: &mut Problems<'_>) {
                             mime,
                             matchlets: Vec::new(),
                         };
-                        rule = Some((found, Section::new(line_start)));
+                        rule = Some((found, Section::new(line_start, max_depth)));
                     }
                     Err(err) => {
                         report(problems, line_start, &format!("{err}, section skipped"));
@@ -685,8 +750,13 @@ fn parse_matchlet(cursor: &mut Cursor<'_>) -> Result<Matchlet, Skip> {
     })
 }
 
-/// The `treemagic` file.
-fn parse_treemagic(bytes: &[u8], folder: &mut Folder, problems: &mut Problems<'_>) {
+/// The `treemagic` file, tests nested at most `max_depth` deep.
+fn parse_treemagic(
+    bytes: &[u8],
+    folder: &mut Folder,
+    problems: &mut Problems<'_>,
+    max_depth: usize,
+) {
     const HEADER: &[u8] = b"MIME-TreeMagic\0\n";
     let report = |problems: &mut Problems<'_>, at: usize, message: &str| {
         problems.report(Some(Location::Offset(at)), message);
@@ -719,7 +789,7 @@ fn parse_treemagic(bytes: &[u8], folder: &mut Folder, problems: &mut Problems<'_
                             mime,
                             matchlets: Vec::new(),
                         };
-                        rule = Some((found, Section::new(line_start)));
+                        rule = Some((found, Section::new(line_start, max_depth)));
                     }
                     Err(err) => {
                         report(problems, line_start, &format!("{err}, section skipped"));
@@ -827,7 +897,13 @@ mod tests {
         std::fs::write(dir.path().join(name), bytes).unwrap();
         let mut folder = Folder::default();
         let mut diagnostics = Vec::new();
-        read(dir.path(), Parts::All, &mut folder, &mut diagnostics);
+        read(
+            dir.path(),
+            Parts::All,
+            &mut folder,
+            &mut diagnostics,
+            &Limits::default(),
+        );
         (folder, diagnostics)
     }
 
@@ -845,7 +921,13 @@ mod tests {
               0:text/x-diff:__NOGLOBS__\n\
               50:text/plain:*.txt:notcs\n",
         );
-        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        // Flags other than `cs` are reported; the lines are kept.
+        let lines: Vec<_> = diagnostics.iter().map(|d| d.location).collect();
+        assert_eq!(
+            lines,
+            [Some(Location::Line(3)), Some(Location::Line(5))],
+            "{diagnostics:?}"
+        );
         assert_eq!(folder.no_globs, [m("text/x-diff")]);
         assert_eq!(
             folder.globs,
@@ -890,6 +972,195 @@ mod tests {
             b"50:text/x-c++src:*.C:cs\nbroken line\n50:text/x-c++src:*.C\n",
         );
         assert_eq!(folder.globs.len(), 2, "a line in between ends the pairing");
+    }
+
+    #[test]
+    fn a_colon_in_a_set_belongs_to_the_pattern() {
+        // Sets as `fnmatch` reads them: classes, a leading `]`, negation,
+        // escapes. A `[` that never closes is itself, so the next `:` ends
+        // the pattern; an escaped `:` is not one that ends it. A bracket
+        // that can never match (`[.` with no `.]`) takes the rest.
+        let (folder, diagnostics) = folder_from(
+            "globs2",
+            b"50:application/x-digit:*[[:digit:]].foo\n\
+              50:text/x-b:*[[:upper:]]:cs\n\
+              50:text/x-c:a[:]b\n\
+              50:text/x-d:[]:]x:cs\n\
+              50:text/x-e:[!:]x:cs:future\n\
+              50:text/x-f:[^\\]:]x\n\
+              50:text/x-g:*[x:cs\n\
+              50:text/x-h:a\\:b\n\
+              50:text/x-i:a[[.x:cs\n\
+              50:text/x-j:x:y:cs\n\
+              50:text/x-k:[[.:\n",
+        );
+        let globs: Vec<_> = folder
+            .globs
+            .iter()
+            .map(|g| (g.pattern.as_str(), g.case_sensitive))
+            .collect();
+        assert_eq!(
+            globs,
+            [
+                ("*[[:digit:]].foo", false),
+                ("*[[:upper:]]", true),
+                ("a[:]b", false),
+                ("[]:]x", true),
+                ("[!:]x", true),
+                ("[^\\]:]x", false),
+                ("*[x", true),
+                ("a\\:b", false),
+                ("a[[.x:cs", false),
+                ("x", false),
+                ("[[.:", false),
+            ]
+        );
+        // A bare `:` stays ambiguous: `x:y:cs` reads as `x` with the flag
+        // `y`, which is reported.
+        let lines: Vec<_> = diagnostics.iter().map(|d| d.location).collect();
+        assert_eq!(lines, [Some(Location::Line(10))], "{diagnostics:?}");
+    }
+
+    #[test]
+    fn a_set_an_escaped_colon_keeps_open_leaves_its_colon_bare() {
+        // `[:\` and `x[:a\` with `cs`, as `update-mime-database` writes
+        // them, each with its flagless copy. The `[` is itself, so the
+        // pattern ends at the `:` after it; the flag `\` is reported.
+        let (folder, diagnostics) = folder_from(
+            "globs2",
+            b"50:text/x-a:[:\\:cs\n50:text/x-a:[:\\\n\
+              50:text/x-b:x[:a\\:cs\n50:text/x-b:x[:a\\\n",
+        );
+        let globs: Vec<_> = folder
+            .globs
+            .iter()
+            .map(|g| (g.pattern.as_str(), g.case_sensitive))
+            .collect();
+        assert_eq!(
+            globs,
+            [
+                ("[", false),
+                ("[:\\", false),
+                ("x[", false),
+                ("x[:a\\", false)
+            ]
+        );
+        let found: Vec<_> = diagnostics
+            .iter()
+            .map(|d| (d.location, d.message.as_str()))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                (Some(Location::Line(1)), "unknown flag \"\\\\\", ignored"),
+                (Some(Location::Line(3)), "unknown flag \"a\\\\\", ignored"),
+            ]
+        );
+    }
+
+    #[test]
+    fn globs2_lines_are_split_in_linear_time() {
+        // Long patterns of brackets: unclosed (the `:` after them ends the
+        // pattern), never matching (they take the flags), sets holding a
+        // `:`, a long class name; and many short lines. Each with the
+        // first pattern the file should give, its case flag, and its
+        // steps per byte rounded up, the bound being twice that.
+        //
+        // A long pattern's byte costs eight: two to find and check the
+        // line, two to decode and copy it in the split and two to mark
+        // it and look at it for a `.]`, one to compare it with the
+        // previous line's and one to copy it. On top: `[` × n, read
+        // (one) and a pass and a stop (two): eleven; `[[.` × n, none
+        // (the bracket jumps to the end): eight; `*[[:digit:]]`, 16 a
+        // unit of 12 bytes (`*` and `[` read, a step for the member
+        // and for `]`, `digit:` read and copied): 9.33; `[` × n then
+        // `[:`, `a` × n and `:]]`, a member step per `[` and two per
+        // `a` read and copied: 9.5. Short lines of 20 bytes, 132 each
+        // (the line 39, its first fields 12, the split 35, the flags 6,
+        // the comparison 14, the weight 2, the type 20, the copy 4):
+        // 6.6.
+        type Shape = fn(usize) -> (String, String, bool);
+        let shapes: [(Shape, usize); 5] = [
+            (
+                |n| {
+                    let pattern = "[".repeat(n);
+                    (format!("50:text/x-a:{pattern}:cs\n"), pattern, true)
+                },
+                11,
+            ),
+            (
+                |n| {
+                    let pattern = format!("{}:cs", "[[.".repeat(n));
+                    (format!("50:text/x-a:{pattern}\n"), pattern, false)
+                },
+                8,
+            ),
+            (
+                |n| {
+                    let pattern = "*[[:digit:]]".repeat(n);
+                    (format!("50:text/x-a:{pattern}\n"), pattern, false)
+                },
+                10,
+            ),
+            (
+                |n| {
+                    let pattern = format!("{}[:{}:]]", "[".repeat(n), "a".repeat(n));
+                    (format!("50:text/x-a:{pattern}:cs\n"), pattern, true)
+                },
+                10,
+            ),
+            (
+                |n| ("50:text/x-a:*[:]:cs\n".repeat(n), "*[:]".to_owned(), true),
+                7,
+            ),
+        ];
+        for (shape, per) in shapes {
+            work::assert_linear(
+                5000,
+                |n| {
+                    let (text, pattern, case_sensitive) = shape(n);
+                    let mut folder = Folder::default();
+                    let mut diagnostics = Vec::new();
+                    let ((), steps) = work::steps(|| {
+                        parse(
+                            "globs2",
+                            Path::new("globs2"),
+                            text.as_bytes(),
+                            &mut folder,
+                            &mut diagnostics,
+                            &Limits::default(),
+                        );
+                    });
+                    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+                    let first = &folder.globs[0];
+                    assert!(
+                        first.pattern == pattern && first.case_sensitive == case_sensitive,
+                        "{} bytes, case-sensitive {}",
+                        first.pattern.len(),
+                        first.case_sensitive
+                    );
+                    (steps, text.len())
+                },
+                |_, bytes| 2 * (100 + per * bytes),
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_flag_is_quoted_and_cut() {
+        let long = "f".repeat(40);
+        let (_, diagnostics) = folder_from(
+            "globs2",
+            format!("50:text/x-a:*.a:{long}\n50:text/x-b:*.b:cs,\"\u{202e}x\t\n").as_bytes(),
+        );
+        let messages: Vec<_> = diagnostics.iter().map(|d| d.message.as_str()).collect();
+        assert_eq!(
+            messages,
+            [
+                format!("unknown flag \"{}…\", ignored", "f".repeat(32)),
+                "unknown flag \"\"\\u{202e}x\\t\", ignored".to_owned(),
+            ]
+        );
     }
 
     #[test]
@@ -997,7 +1268,13 @@ mod tests {
         write("types", "text/plain\nimage/png\n");
         let mut folder = Folder::default();
         let mut diagnostics = Vec::new();
-        read(dir.path(), Parts::All, &mut folder, &mut diagnostics);
+        read(
+            dir.path(),
+            Parts::All,
+            &mut folder,
+            &mut diagnostics,
+            &Limits::default(),
+        );
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
         assert_eq!(folder.aliases, [(m("audio/x-midi"), m("audio/midi"))]);
         assert_eq!(folder.parents, [(m("image/svg+xml"), m("application/xml"))]);
@@ -1120,7 +1397,13 @@ mod tests {
         std::fs::write(dir.path().join("globs2"), "50:text/plain:*.txt\n").unwrap();
         std::fs::write(dir.path().join("types"), "text/plain\n").unwrap();
         let mut folder = Folder::default();
-        read(dir.path(), Parts::NotInCache, &mut folder, &mut Vec::new());
+        read(
+            dir.path(),
+            Parts::NotInCache,
+            &mut folder,
+            &mut Vec::new(),
+            &Limits::default(),
+        );
         assert!(folder.globs.is_empty());
         assert!(folder.types.is_some());
     }

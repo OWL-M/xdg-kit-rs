@@ -7,10 +7,6 @@ pub(crate) const NO_GLOBS: &str = "__NOGLOBS__";
 /// The deletion marker for magic (`magic-deleteall`), written as a value.
 pub(crate) const NO_MAGIC: &[u8] = b"__NOMAGIC__";
 
-/// Deepest nesting accepted in magic and tree magic rules. Real databases
-/// nest a few levels; this only bounds what a damaged file can ask for.
-pub(crate) const MAX_DEPTH: usize = 64;
-
 /// A file name pattern.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct Glob {

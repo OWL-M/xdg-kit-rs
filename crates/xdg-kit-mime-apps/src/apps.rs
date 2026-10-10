@@ -14,7 +14,7 @@ use xdg_kit_mime::{MimeDatabase, MimeType};
 
 use crate::error::quoted;
 use crate::list::{Group, MIMEAPPS_LIST, MimeAppsList};
-use crate::{Diagnostic, MediaType, TypePattern, work};
+use crate::{Diagnostic, Limits, MediaType, TypePattern, work};
 
 /// One step's associations, in order and as a set.
 type Associations<'a> = (Vec<&'a str>, HashSet<&'a str>);
@@ -90,6 +90,8 @@ pub struct MimeApps {
     /// cannot name a file); kept across refreshes.
     setup: Vec<Diagnostic>,
     diagnostics: Vec<Diagnostic>,
+    /// The limits its files are read within.
+    limits: Limits,
 }
 
 impl MimeApps {
@@ -109,6 +111,20 @@ impl MimeApps {
         desktops: &Desktops,
         apps: Arc<AppIndex>,
         mime: Arc<MimeDatabase>,
+    ) -> Self {
+        Self::load_with(base_dirs, desktops, apps, mime, &Limits::default())
+    }
+
+    /// Loads associations as [`MimeApps::load`] does, using `limits`.
+    /// [`MimeApps::refresh`] and [`open_plan`](crate::open_plan) use the same
+    /// limits; `apps` and `mime` keep their own.
+    #[must_use]
+    pub fn load_with(
+        base_dirs: &BaseDirs,
+        desktops: &Desktops,
+        apps: Arc<AppIndex>,
+        mime: Arc<MimeDatabase>,
+        limits: &Limits,
     ) -> Self {
         let mut setup = Vec::new();
         let names: Vec<String> = desktops
@@ -197,7 +213,7 @@ impl MimeApps {
                 Some(place)
             })
             .collect();
-        Self::build(kept, apps, mime, None, setup)
+        Self::build(kept, apps, mime, None, setup, *limits)
     }
 
     fn build(
@@ -206,6 +222,7 @@ impl MimeApps {
         mime: Arc<MimeDatabase>,
         try_exec: Option<OsString>,
         setup: Vec<Diagnostic>,
+        limits: Limits,
     ) -> Self {
         let dirs = apps.dirs();
         // Each folder's index: the first, should one be listed twice.
@@ -258,7 +275,7 @@ impl MimeApps {
             let associations = !place.desktop_specific;
             let stamp = FileStamp::of(&place.path);
             let list = if place.read {
-                match MimeAppsList::open(&place.path) {
+                match MimeAppsList::open_with(&place.path, &limits) {
                     Ok(list) => list,
                     Err(err) => {
                         // The path copied.
@@ -317,7 +334,14 @@ impl MimeApps {
             try_exec,
             setup,
             diagnostics,
+            limits,
         }
+    }
+
+    /// The limits its files are read within.
+    #[must_use]
+    pub fn limits(&self) -> &Limits {
+        &self.limits
     }
 
     /// Enables the `TryExec` check, as in `GLib`. To count as installed, an
@@ -452,7 +476,8 @@ impl MimeApps {
     /// disappeared (by its [`FileStamp`]), or if `apps` or `mime` is a
     /// different snapshot from the one used to build this one. Returns
     /// `None` if nothing changed. The caller must refresh `apps` and `mime`
-    /// separately.
+    /// separately. The new snapshot keeps to the same
+    /// [`MimeApps::limits`].
     ///
     /// Checks the same files as [`MimeApps::load`]. Changes to the base
     /// directories or desktop names need a new `load`. This does not detect
@@ -501,6 +526,7 @@ impl MimeApps {
             Arc::clone(mime),
             self.try_exec.clone(),
             self.setup.clone(),
+            self.limits,
         ))
     }
 

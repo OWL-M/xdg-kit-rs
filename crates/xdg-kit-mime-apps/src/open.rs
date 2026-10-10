@@ -57,7 +57,8 @@ impl std::error::Error for OpenError {
 /// anything: [`LaunchPlan::spawn`] does that.
 ///
 /// - A file's type comes from the MIME database (by name and contents); a
-///   desktop entry of `Type=Link` is followed to its `URL`.
+///   desktop entry of `Type=Link` is followed to its `URL`, unless it is
+///   larger than `apps`' [`Limits::max_file_len`](crate::Limits::max_file_len).
 /// - A `file:` URI is a file; any other URI has the type
 ///   `x-scheme-handler/<scheme>`.
 ///
@@ -118,7 +119,7 @@ fn file(
         .canonical(&MimeType::new("application/x-desktop").expect("a valid type"));
     if follow_links
         && mime == desktop_entry
-        && let Ok(entry) = DesktopEntry::read(path)
+        && let Ok(entry) = DesktopEntry::read_with_limits(path, &apps.limits().for_entries())
         && entry.entry_type() == Some(EntryType::Link)
     {
         let url = entry

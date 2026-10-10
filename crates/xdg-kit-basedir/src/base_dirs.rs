@@ -170,14 +170,15 @@ impl BaseDirs {
 
     /// The most important existing `rel` under the data directories:
     /// `$XDG_DATA_HOME`, then each of `$XDG_DATA_DIRS`. A folder is searched
-    /// once, even when it is listed again.
+    /// once, even when it is listed again, and the search stops at the
+    /// first file found.
     ///
     /// # Errors
     ///
     /// [`Error::InvalidRelativePath`] when `rel` is absolute, contains `..`,
     /// or names nothing (empty, or just `.`).
     pub fn find_data(&self, rel: impl AsRef<Path>) -> Result<Option<PathBuf>, Error> {
-        Ok(self.data_files(rel)?.into_iter().next())
+        Ok(existing(&self.data_home, &self.data_dirs, rel.as_ref())?.next())
     }
 
     /// Every existing `rel` under the data directories, most important first.
@@ -187,19 +188,20 @@ impl BaseDirs {
     /// [`Error::InvalidRelativePath`] when `rel` is absolute, contains `..`,
     /// or names nothing (empty, or just `.`).
     pub fn data_files(&self, rel: impl AsRef<Path>) -> Result<Vec<PathBuf>, Error> {
-        existing(&self.data_home, &self.data_dirs, rel.as_ref())
+        Ok(existing(&self.data_home, &self.data_dirs, rel.as_ref())?.collect())
     }
 
     /// The most important existing `rel` under the config directories:
     /// `$XDG_CONFIG_HOME`, then each of `$XDG_CONFIG_DIRS`. A folder is
-    /// searched once, even when it is listed again.
+    /// searched once, even when it is listed again, and the search stops
+    /// at the first file found.
     ///
     /// # Errors
     ///
     /// [`Error::InvalidRelativePath`] when `rel` is absolute, contains `..`,
     /// or names nothing (empty, or just `.`).
     pub fn find_config(&self, rel: impl AsRef<Path>) -> Result<Option<PathBuf>, Error> {
-        Ok(self.config_files(rel)?.into_iter().next())
+        Ok(existing(&self.config_home, &self.config_dirs, rel.as_ref())?.next())
     }
 
     /// Every existing `rel` under the config directories, most important
@@ -210,7 +212,7 @@ impl BaseDirs {
     /// [`Error::InvalidRelativePath`] when `rel` is absolute, contains `..`,
     /// or names nothing (empty, or just `.`).
     pub fn config_files(&self, rel: impl AsRef<Path>) -> Result<Vec<PathBuf>, Error> {
-        existing(&self.config_home, &self.config_dirs, rel.as_ref())
+        Ok(existing(&self.config_home, &self.config_dirs, rel.as_ref())?.collect())
     }
 
     /// The path to write `rel` under `$XDG_DATA_HOME`, creating missing
@@ -345,16 +347,29 @@ fn list(
     dirs
 }
 
-fn existing(home: &Path, dirs: &[PathBuf], rel: &Path) -> Result<Vec<PathBuf>, Error> {
+/// Yields existing paths for `rel` under `home`, then `dirs`, in order of
+/// importance. Checks one path at a time.
+fn existing<'a>(
+    home: &'a Path,
+    dirs: &'a [PathBuf],
+    rel: &'a Path,
+) -> Result<impl Iterator<Item = PathBuf> + 'a, Error> {
     check_relative(rel)?;
     // The list already has no duplicates. Search home first and skip any
     // matching list entry.
     Ok(std::iter::once(home)
-        .chain(dirs.iter().map(PathBuf::as_path).filter(|dir| *dir != home))
-        .map(|base| base.join(rel))
+        .chain(
+            dirs.iter()
+                .map(PathBuf::as_path)
+                .filter(move |dir| *dir != home),
+        )
+        .map(move |base| {
+            // The folder, compared with home, then joined with `rel`.
+            work::count(1 + 2 * base.as_os_str().len() + rel.as_os_str().len());
+            base.join(rel)
+        })
         // A path that cannot be checked is skipped, as the spec says.
-        .filter(|path| matches!(path.try_exists(), Ok(true)))
-        .collect())
+        .filter(|path| matches!(path.try_exists(), Ok(true))))
 }
 
 fn place(base: &Path, rel: &Path) -> Result<PathBuf, Error> {
@@ -710,6 +725,43 @@ mod tests {
             dirs.find_config("/etc/passwd"),
             Err(Error::InvalidRelativePath(_))
         ));
+    }
+
+    #[test]
+    fn the_first_existing_file_ends_the_search() {
+        // A file in each home: however many folders follow, finding it
+        // looks at none of them. Listing every file still looks at each.
+        let root = tempfile::tempdir().unwrap();
+        let data_home = root.path().join("data");
+        let config_home = root.path().join("config");
+        for home in [&data_home, &config_home] {
+            fs::create_dir_all(home.join("mime")).unwrap();
+            fs::write(home.join("mime/types"), b"").unwrap();
+        }
+        let steps = |n: usize| {
+            let list = (0..n)
+                .map(|at| format!("/nonexistent/d{at}"))
+                .collect::<Vec<_>>()
+                .join(":");
+            let dirs = dirs(&[
+                ("HOME", b"/home/u"),
+                ("XDG_DATA_HOME", data_home.as_os_str().as_bytes()),
+                ("XDG_CONFIG_HOME", config_home.as_os_str().as_bytes()),
+                ("XDG_DATA_DIRS", list.as_bytes()),
+                ("XDG_CONFIG_DIRS", list.as_bytes()),
+            ])
+            .unwrap();
+            let (data, finding_data) = work::steps(|| dirs.find_data("mime/types").unwrap());
+            assert_eq!(data, Some(data_home.join("mime/types")));
+            let (config, finding_config) = work::steps(|| dirs.find_config("mime/types").unwrap());
+            assert_eq!(config, Some(config_home.join("mime/types")));
+            let (all, listing) = work::steps(|| dirs.data_files("mime/types").unwrap());
+            assert_eq!(all, [data_home.join("mime/types")]);
+            (finding_data, finding_config, listing)
+        };
+        let (few, many) = (steps(1), steps(1000));
+        assert_eq!((few.0, few.1), (many.0, many.1));
+        assert!(many.2 > few.2 + 1000, "{few:?} {many:?}");
     }
 
     #[test]

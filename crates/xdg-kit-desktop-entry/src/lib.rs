@@ -31,6 +31,7 @@ mod index;
 mod key_file;
 mod keys;
 mod launch;
+mod limits;
 mod registry;
 mod validate;
 
@@ -44,6 +45,7 @@ pub use launch::{
     DBusCall, DBusMethod, Launch, LaunchError, LaunchOptions, LaunchPlan, PlannedCommand, Target,
     prepare_launch,
 };
+pub use limits::Limits;
 pub use validate::{Issue, Level, validate};
 pub use xdg_kit_locale::Locales;
 

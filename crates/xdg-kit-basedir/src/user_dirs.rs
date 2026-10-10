@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use crate::paths::normalize;
 use crate::work;
-use crate::{BaseDirs, Diagnostic};
+use crate::{BaseDirs, Diagnostic, Limits};
 
 /// A user folder, by its name in `user-dirs.dirs` (`XDG_<NAME>_DIR`).
 ///
@@ -108,8 +108,15 @@ impl UserDirs {
     /// but cannot be read.
     #[must_use]
     pub fn load(base_dirs: &BaseDirs) -> Self {
+        Self::load_with(base_dirs, &Limits::default())
+    }
+
+    /// [`UserDirs::load`] within `limits`: a file larger than
+    /// [`Limits::max_file_len`] is unreadable.
+    #[must_use]
+    pub fn load_with(base_dirs: &BaseDirs, limits: &Limits) -> Self {
         let path = base_dirs.config_home().join("user-dirs.dirs");
-        match crate::read_regular_file(&path) {
+        match crate::read_regular_file_with(&path, limits.max_file_len) {
             Ok(contents) => Self::from_bytes(base_dirs.home(), &contents),
             Err(err) => {
                 let mut dirs = Self::from_bytes(base_dirs.home(), b"");
@@ -522,6 +529,33 @@ mod tests {
         let unreadable = UserDirs::load(&base);
         assert_eq!(unreadable.iter().count(), 0);
         assert_eq!(unreadable.diagnostics().len(), 1);
+    }
+
+    #[test]
+    fn loading_keeps_to_the_size_limit_given() {
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().to_owned();
+        let vars = move |name: &str| match name {
+            "HOME" => Some(HOME.into()),
+            "XDG_CONFIG_HOME" => Some(config.clone().into_os_string()),
+            _ => None,
+        };
+        let base = BaseDirs::from_vars(vars).unwrap();
+        let text = "XDG_MUSIC_DIR=\"$HOME/Music\"\n";
+        fs::write(root.path().join("user-dirs.dirs"), text).unwrap();
+        let music = Some(Path::new("/home/u/Music"));
+        let mut limits = Limits::default();
+        assert_eq!(
+            UserDirs::load_with(&base, &limits).get(&UserDirKind::Music),
+            music
+        );
+        limits.max_file_len = Some(text.len() as u64 - 1);
+        let refused = UserDirs::load_with(&base, &limits);
+        assert_eq!(refused.iter().count(), 0);
+        assert_eq!(refused.diagnostics().len(), 1);
+        assert!(refused.diagnostics()[0].message.contains("cannot be read"));
+        let unlimited = UserDirs::load_with(&base, &Limits::unlimited());
+        assert_eq!(unlimited.get(&UserDirKind::Music), music);
     }
 
     /// The bound for parsing `text`: twice the analysed cost of its lines,

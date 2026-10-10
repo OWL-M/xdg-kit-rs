@@ -8,8 +8,8 @@ use std::path::Path;
 
 use xdg_kit_locale::Locales;
 
-use crate::KeyFile;
 use crate::key_file::work;
+use crate::{KeyFile, KeyNames, Limits};
 
 /// The main group of every desktop entry.
 pub const DESKTOP_ENTRY: &str = "Desktop Entry";
@@ -211,7 +211,18 @@ impl DesktopEntry {
     /// than [`xdg_kit_basedir::MAX_FILE_LEN`]. Problems in its text are
     /// diagnostics of the key file.
     pub fn read(path: impl AsRef<Path>) -> io::Result<Self> {
-        KeyFile::read(path).map(Self::from_key_file)
+        Self::read_with_limits(path, &Limits::default())
+    }
+
+    /// Reads the entry at `path` using `limits`.
+    ///
+    /// # Errors
+    ///
+    /// When the file cannot be read, is not a regular file or exceeds
+    /// [`Limits::max_file_len`]. Problems in its text appear in the key file's
+    /// diagnostics.
+    pub fn read_with_limits(path: impl AsRef<Path>, limits: &Limits) -> io::Result<Self> {
+        KeyFile::read_with_limits(path, KeyNames::DesktopEntry, limits).map(Self::from_key_file)
     }
 
     /// Parses `bytes` as an entry.

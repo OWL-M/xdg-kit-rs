@@ -32,6 +32,7 @@ pub fn mime_cache(bytes: &[u8]) {
         bytes,
         &mut folder,
         &mut diagnostics,
+        &crate::Limits::default(),
     );
     use_folder(&folder, &diagnostics, bytes);
 }
@@ -58,7 +59,14 @@ pub fn text_file(name: &str, bytes: &[u8]) {
 fn parse(name: &str, file: &[u8], data: &[u8]) {
     let mut folder = Folder::default();
     let mut diagnostics = Vec::new();
-    text::parse(name, Path::new(name), file, &mut folder, &mut diagnostics);
+    text::parse(
+        name,
+        Path::new(name),
+        file,
+        &mut folder,
+        &mut diagnostics,
+        &crate::Limits::default(),
+    );
     use_folder(&folder, &diagnostics, data);
 }
 
@@ -73,9 +81,13 @@ pub fn xml_root(bytes: &[u8]) {
     let _ = crate::xml::root_element(bytes);
 }
 
-/// Matches `name` against `pattern`.
+/// Matches `name` against `pattern` case-sensitively, then case-insensitively
+/// after lowercasing the name as lookups do.
 pub fn fnmatch(pattern: &str, name: &[u8]) {
+    use crate::fnmatch::{Name, Pattern};
     let _ = crate::fnmatch::matches(pattern, name);
+    let lower = crate::database::lowercase(name);
+    let _ = Pattern::new(pattern, true).matches(&Name::new(&lower));
 }
 
 /// Separates the parts of a [`database`] input.

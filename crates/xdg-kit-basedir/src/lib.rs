@@ -31,7 +31,7 @@ mod work;
 
 pub use base_dirs::BaseDirs;
 pub use error::{Diagnostic, DiagnosticSource, Error};
-pub use read::{MAX_FILE_LEN, read_regular_file};
+pub use read::{Limits, MAX_FILE_LEN, read_regular_file, read_regular_file_with};
 pub use runtime::RuntimeDirProblem;
 pub use stamp::FileStamp;
 pub use user_dirs::{UserDirKind, UserDirs};
@@ -41,5 +41,6 @@ const _: fn() = || {
     fn shareable<T: Send + Sync>() {}
     shareable::<BaseDirs>();
     shareable::<FileStamp>();
+    shareable::<Limits>();
     shareable::<UserDirs>();
 };
