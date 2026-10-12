@@ -203,7 +203,7 @@ pub struct DesktopEntry {
 }
 
 impl DesktopEntry {
-    /// Reads the entry at `path`.
+    /// Reads the entry at `path`, made absolute as [`KeyFile::read`] does.
     ///
     /// # Errors
     ///
@@ -214,7 +214,8 @@ impl DesktopEntry {
         Self::read_with_limits(path, &Limits::default())
     }
 
-    /// Reads the entry at `path` using `limits`.
+    /// Reads the entry at `path` using `limits`. A relative `path` is made
+    /// absolute as [`KeyFile::read`] does.
     ///
     /// # Errors
     ///
@@ -254,7 +255,7 @@ impl DesktopEntry {
         self.file
     }
 
-    /// The file this was read from, if any.
+    /// The file this was read from, if any, made absolute when read.
     #[must_use]
     pub fn path(&self) -> Option<&Path> {
         self.file.path()

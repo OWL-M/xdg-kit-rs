@@ -24,6 +24,71 @@
 //! work roughly doubles, while quadratic work roughly quadruples. Each
 //! count must also stay within a bound based on items and bytes, set at
 //! about twice the analysed cost.
+//!
+//! Tests also track memory where it can grow faster than the input, as in
+//! `xml`'s entity loop analysis. Each buffer records its size for as long
+//! as it is held ([`hold`]); tests read the peak through the test-only
+//! `peak`. This measures only buffers that record their size.
+
+#[cfg(test)]
+thread_local! {
+    #[allow(
+        clippy::missing_const_for_thread_local,
+        reason = "already const; clippy flags it on targets without native thread locals (Android, OpenBSD, illumos)"
+    )]
+    static HELD: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Bytes noted as held until it is dropped ([`hold`]); nothing outside
+/// tests.
+#[must_use]
+pub(crate) struct Held(#[cfg(test)] usize);
+
+/// Notes, in tests, `bytes` held until the result is dropped.
+#[inline]
+pub(crate) fn hold(bytes: impl FnOnce() -> usize) -> Held {
+    #[cfg(test)]
+    {
+        let bytes = bytes();
+        HELD.with(|held| {
+            let (now, most) = held.get();
+            held.set((now + bytes, most.max(now + bytes)));
+        });
+        Held(bytes)
+    }
+    #[cfg(not(test))]
+    {
+        let _ = bytes;
+        Held()
+    }
+}
+
+/// The bytes of a buffer of `capacity` items of `T`, for [`hold`].
+pub(crate) const fn size<T>(capacity: usize) -> usize {
+    capacity * std::mem::size_of::<T>()
+}
+
+#[cfg(test)]
+impl Drop for Held {
+    fn drop(&mut self) {
+        HELD.with(|held| {
+            let (now, most) = held.get();
+            held.set((now - self.0, most));
+        });
+    }
+}
+
+/// Returns `f`'s result and the most bytes noted as held at once while it
+/// ran ([`hold`]), above what was held before.
+#[cfg(test)]
+pub(crate) fn peak<T>(f: impl FnOnce() -> T) -> (T, usize) {
+    let (before, most) = HELD.with(std::cell::Cell::get);
+    HELD.with(|held| held.set((before, before)));
+    let value = f();
+    let (now, top) = HELD.with(std::cell::Cell::get);
+    HELD.with(|held| held.set((now, most.max(top))));
+    (value, top - before)
+}
 
 #[cfg(test)]
 thread_local! {

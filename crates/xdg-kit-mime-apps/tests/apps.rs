@@ -560,11 +560,45 @@ fn only_applications_are_associated() {
 }
 
 #[test]
+fn a_default_without_exec_is_chosen_and_cannot_be_launched() {
+    // As in GLib: an application with neither `Exec` nor
+    // `DBusActivatable=true` is installed, and fails at launch.
+    let fixture = Fixture::new();
+    let dir = "share1/applications";
+    fixture.write(
+        &format!("{dir}/xkt-a.desktop"),
+        "[Desktop Entry]\nType=Application\nName=A\nMimeType=text/x-xkt-plain;\n",
+    );
+    fixture.app(dir, "xkt-b.desktop", "text/x-xkt-plain;", "");
+    fixture.write(
+        "config/mimeapps.list",
+        "[Default Applications]\ntext/x-xkt-plain=xkt-a.desktop;xkt-b.desktop;\n",
+    );
+    fixture.write("files/notes.xkt-plain", "hello\n");
+    let apps = fixture.mime_apps();
+    assert_eq!(
+        apps.default_for(&m("text/x-xkt-plain")).unwrap().id(),
+        "xkt-a.desktop"
+    );
+    assert!(matches!(
+        open_plan(
+            &Target::Path(fixture.path("files/notes.xkt-plain")),
+            &apps,
+            &LaunchOptions::default()
+        ),
+        Err(OpenError::Launch(
+            xdg_kit_desktop_entry::LaunchError::NoExec
+        ))
+    ));
+}
+
+#[test]
 fn a_file_of_unknown_type_does_not_hold_its_id() {
     // The index ignores the higher file, so the lower one is the ID's file,
     // with its `MimeType=` and the lower level's added association. GLib
     // counts every file name in a folder, so the higher file would hide
-    // both there; ignoring it is deliberate (decision 21).
+    // both there; ignoring it follows the Desktop Entry spec, which says to
+    // ignore entries of an unknown type.
     let fixture = Fixture::new();
     fixture.write(
         "share1/applications/xkt-foo.desktop",
@@ -667,7 +701,7 @@ fn a_link_is_followed_when_desktop_entries_are_an_alias() {
 #[test]
 fn a_url_scheme_aliased_to_data_has_only_its_own_handlers() {
     // A database may make a scheme's type an alias of a data type; the URL
-    // still gets no data application (decision 8).
+    // still gets no data application: a URL is no data.
     let fixture = Fixture::new();
     fixture.add_types(
         "aliased",
@@ -851,6 +885,144 @@ fn opening_files_and_uris() {
         Err(OpenError::Type(..))
     ));
     fs::remove_file(&notes).unwrap();
+}
+
+#[test]
+fn a_raw_nul_in_a_uri_is_refused_before_anything_else() {
+    let fixture = Fixture::new();
+    fixture.app(
+        "share1/applications",
+        "xkt-text.desktop",
+        "text/x-xkt-plain;",
+        "",
+    );
+    fixture.write(
+        "share1/applications/xkt-web.desktop",
+        "[Desktop Entry]\nType=Application\nName=Web\nExec=true %u\nMimeType=x-scheme-handler/xkt-web;\n",
+    );
+    // Takes no targets, so the launch would not look at the URI.
+    fixture.write(
+        "share1/applications/xkt-bare.desktop",
+        "[Desktop Entry]\nType=Application\nName=Bare\nExec=true\nMimeType=x-scheme-handler/xkt-bare;\n",
+    );
+    fixture.write("files/notes.xkt-plain", "hello\n");
+    fixture.write(
+        "files/site.desktop",
+        "[Desktop Entry]\nType=Link\nName=Site\nURL=xkt-web://example.org/\n",
+    );
+    let apps = fixture.mime_apps();
+    let options = LaunchOptions::default();
+    let link = file_uri(&fixture.path("files/site.desktop"));
+    let notes = file_uri(&fixture.path("files/notes.xkt-plain"));
+    let files = file_uri(&fixture.path("files"));
+    for uri in [
+        // The link is not followed, nor the suffix dropped.
+        format!("{link}?\0"),
+        format!("{link}#\0"),
+        format!("{notes}?\0"),
+        format!("{notes}#a\0b"),
+        // In the path, not only escaped as `%00`.
+        format!("{files}/no\0tes.xkt-plain"),
+        "xkt-web://example.org/\0".to_owned(),
+        "xkt-bare:\0".to_owned(),
+        "xkt-none:\0".to_owned(),
+    ] {
+        let result = open_plan(&Target::Uri(uri.clone()), &apps, &options);
+        assert!(
+            matches!(&result, Err(OpenError::BadUri(bad)) if *bad == uri),
+            "{uri:?}: {result:?}"
+        );
+    }
+    // Without the NUL, the same URIs open.
+    for uri in [link, notes, "xkt-bare:x".to_owned()] {
+        assert!(
+            open_plan(&Target::Uri(uri.clone()), &apps, &options).is_ok(),
+            "{uri:?}"
+        );
+    }
+}
+
+#[test]
+fn a_raw_nul_in_a_links_url_is_refused() {
+    let fixture = Fixture::new();
+    // Takes no targets, so the launch would not look at the URI.
+    fixture.write(
+        "share1/applications/xkt-bare.desktop",
+        "[Desktop Entry]\nType=Application\nName=Bare\nExec=true\nMimeType=x-scheme-handler/xkt-bare;\n",
+    );
+    // A raw NUL byte in the value, kept by the key file.
+    fixture.write(
+        "files/site.desktop",
+        "[Desktop Entry]\nType=Link\nName=Site\nURL=xkt-bare:a\0b\n",
+    );
+    let apps = fixture.mime_apps();
+    let options = LaunchOptions::default();
+    let path = fixture.path("files/site.desktop");
+    for target in [Target::Path(path.clone()), Target::Uri(file_uri(&path))] {
+        let result = open_plan(&target, &apps, &options);
+        assert!(
+            matches!(&result, Err(OpenError::BadUri(bad)) if bad == "xkt-bare:a\0b"),
+            "{target:?}: {result:?}"
+        );
+    }
+    // Without the NUL, the link opens.
+    fixture.write(
+        "files/site.desktop",
+        "[Desktop Entry]\nType=Link\nName=Site\nURL=xkt-bare:ab\n",
+    );
+    assert!(open_plan(&Target::Path(path), &apps, &options).is_ok());
+}
+
+#[test]
+fn a_link_in_an_unsupported_encoding_is_not_followed() {
+    let fixture = Fixture::new();
+    fixture.write(
+        "share1/applications/xkt-web.desktop",
+        "[Desktop Entry]\nType=Application\nName=Web\nExec=true %u\nMimeType=x-scheme-handler/https;\n",
+    );
+    fixture.write(
+        "files/site.desktop",
+        "[Desktop Entry]\nType=Link\nName=Site\nEncoding=Legacy-Mixed\nURL=https://example.org/\n",
+    );
+    let apps = fixture.mime_apps();
+    let path = fixture.path("files/site.desktop");
+    let err = open_plan(
+        &Target::Path(path.clone()),
+        &apps,
+        &LaunchOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&err, OpenError::UnsupportedEncoding(link) if *link == path),
+        "{err:?}"
+    );
+    assert_eq!(
+        err.to_string(),
+        format!("{}: a link in an unsupported encoding", path.display())
+    );
+    // Another entry in that encoding is a file of its type.
+    fixture.write(
+        "files/app.desktop",
+        "[Desktop Entry]\nType=Application\nName=App\nEncoding=Legacy-Mixed\nExec=true\n",
+    );
+    assert!(matches!(
+        open_plan(
+            &Target::Path(fixture.path("files/app.desktop")),
+            &apps,
+            &LaunchOptions::default()
+        ),
+        Err(OpenError::NoApplication(mime)) if mime.as_str() == "application/x-desktop"
+    ));
+    // In a supported encoding the link is followed.
+    fixture.write(
+        "files/site.desktop",
+        "[Desktop Entry]\nType=Link\nName=Site\nEncoding=UTF-8\nURL=https://example.org/\n",
+    );
+    let plan = open_plan(&Target::Path(path), &apps, &LaunchOptions::default()).unwrap();
+    let Launch::Commands(commands) = plan.launch else {
+        panic!("{plan:?}")
+    };
+    assert_eq!(commands[0].args, ["https://example.org/"]);
 }
 
 #[test]

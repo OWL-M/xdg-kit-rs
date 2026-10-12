@@ -34,6 +34,18 @@ use crate::{Limits, TypePattern};
 /// so it repeats an ID when another ID of the same type falls between
 /// its paths in folder listing order.
 ///
+/// Each ID is written escaped, as `GLib`'s key-file string lists expect,
+/// so that `GLib` reads the same ID back: `\` as `\\`, line feed as `\n`,
+/// tab as `\t`, carriage return as `\r`, `;` as `\;`, a leading space as
+/// `\s`. IDs are ordered as named, not as escaped. The tool writes the
+/// bytes as they are; in `GLib` a line feed then breaks the file, and a
+/// backslash or `;` changes the IDs or loses the type's list. An ID
+/// `GLib` cannot read back is left out, silently, wherever it would fall
+/// in the line: one that is not UTF-8 (`GLib` would lose the type's whole
+/// list), and one starting with a form feed (`GLib` skips white space
+/// before a value and has no escape for a form feed). The walk still
+/// lists and reads its file. A type left with no ID gets no line.
+///
 /// Links back to any ancestor folder are skipped, as in `AppIndex`.
 /// The tool and `GLib` follow these loops until the path is too long:
 /// one link produces dozens of IDs, and work grows exponentially with
@@ -54,7 +66,11 @@ use crate::{Limits, TypePattern};
 ///
 /// The walk lists at most [`Limits::max_listed`] entries, counted along
 /// every path, so links cannot multiply its work without bound; past that
-/// it fails with [`io::ErrorKind::Other`], naming the limit.
+/// it fails with [`io::ErrorKind::Other`], naming the limit. It stops
+/// reading a folder at the first entry past the limit, so a wide folder
+/// is not read whole: an error its listing would give after that entry is
+/// not met, and the walk fails with the limit's error instead (either way
+/// there is no cache).
 ///
 /// No partial listing is returned. This deliberately differs from
 /// `update-desktop-database`, which silently keeps what it listed before
@@ -100,19 +116,39 @@ pub fn mimeinfo_cache(folder: &Path) -> io::Result<Vec<u8>> {
 ///
 /// As [`mimeinfo_cache`].
 pub fn mimeinfo_cache_with(folder: &Path, limits: &Limits) -> io::Result<Vec<u8>> {
-    let mut types: BTreeMap<String, BTreeSet<Vec<u8>>> = BTreeMap::new();
+    let mut types: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     collect(folder, &mut types, limits)?;
     let mut out = b"[MIME Cache]\n".to_vec();
     for (mime, ids) in types {
         out.extend_from_slice(mime.as_bytes());
         out.push(b'=');
         for id in ids {
-            out.extend_from_slice(&id);
+            escape(&id, &mut out);
             out.push(b';');
         }
         out.push(b'\n');
     }
     Ok(out)
+}
+
+/// Writes `id` to `out` as an item of a `GLib` key-file string list: `\`,
+/// line feed, tab, carriage return and `;` escaped, a leading space as
+/// `\s`, as `xdg-kit-desktop-entry` escapes list items. Unescaped by
+/// `g_key_file_get_string_list`, it is `id` again.
+///
+/// Written here: that crate's escaper is not public API.
+fn escape(id: &str, out: &mut Vec<u8>) {
+    for (at, byte) in id.bytes().enumerate() {
+        match byte {
+            b'\\' => out.extend_from_slice(b"\\\\"),
+            b'\n' => out.extend_from_slice(b"\\n"),
+            b'\t' => out.extend_from_slice(b"\\t"),
+            b'\r' => out.extend_from_slice(b"\\r"),
+            b';' => out.extend_from_slice(b"\\;"),
+            b' ' if at == 0 => out.extend_from_slice(b"\\s"),
+            _ => out.push(byte),
+        }
+    }
 }
 
 /// Writes [`mimeinfo_cache`] of `folder` to `folder/mimeinfo.cache`
@@ -213,7 +249,7 @@ struct Level {
 /// inode because a name may point elsewhere between lookup and opening. If
 /// lookup already identifies an ancestor, skips the name without opening it.
 /// Later changes to that name go unseen, as with names the walk has passed.
-/// Exceeding [`Limits::max_listed`] entries fails the walk ([`counted`]).
+/// Exceeding [`Limits::max_listed`] entries fails the walk ([`names`]).
 ///
 /// Skips names that cannot be looked up, sub-folders that cannot be opened or
 /// reopened, and desktop entries that cannot be opened, checked or read, when
@@ -232,7 +268,7 @@ struct Level {
 /// invariant fails the walk ([`invariant`]).
 fn collect(
     folder: &Path,
-    types: &mut BTreeMap<String, BTreeSet<Vec<u8>>>,
+    types: &mut BTreeMap<String, BTreeSet<String>>,
     limits: &Limits,
 ) -> io::Result<()> {
     let first = open_folder(rustix::fs::CWD, folder)?;
@@ -243,8 +279,8 @@ fn collect(
     // only skip a name that was a folder on the path.
     let stat = fstat(first.as_fd())?;
     let mut ancestors = HashSet::from([(stat.st_dev, stat.st_ino)]);
-    let left = names(first.as_fd())?;
-    let mut listed = counted(0, &left, limits.max_listed)?;
+    let left = names(first.as_fd(), 0, limits.max_listed)?;
+    let mut listed = left.len();
     let mut id = Vec::new();
     let mut stack = vec![Level {
         name: OsString::new(),
@@ -310,8 +346,8 @@ fn collect(
                     if !ancestors.insert((stat.st_dev, stat.st_ino)) {
                         continue;
                     }
-                    let left = names(handle.as_fd())?;
-                    listed = counted(listed, &left, limits.max_listed)?;
+                    let left = names(handle.as_fd(), listed, limits.max_listed)?;
+                    listed += left.len();
                     window.push(depth + 1);
                     stack.push(Level {
                         name,
@@ -332,22 +368,12 @@ fn collect(
     Ok(())
 }
 
-/// `listed`, the entries the walk listed before, with `names` added.
-///
-/// # Errors
-///
-/// Past `max` ([`Limits::max_listed`]): the walk fails, so no cache is
-/// made.
-fn counted(listed: usize, names: &[OsString], max: Option<usize>) -> io::Result<usize> {
-    let listed = listed + names.len();
-    if let Some(max) = max
-        && listed > max
-    {
-        return Err(io::Error::other(format!(
-            "mimeinfo.cache walk: more than {max} entries to list; no cache made"
-        )));
-    }
-    Ok(listed)
+/// The error of a walk past `max` ([`Limits::max_listed`]) entries listed:
+/// it fails, so no cache is made.
+fn too_many(max: usize) -> io::Error {
+    io::Error::other(format!(
+        "mimeinfo.cache walk: more than {max} entries to list; no cache made"
+    ))
 }
 
 /// The status of `name` in `dir`, links followed, looked at again when
@@ -467,7 +493,15 @@ const LOOKUPS_ONLY: Option<OFlags> = None;
 /// errors are returned instead of a partial listing. A handle opened for
 /// lookups only ([`reopen_folder`]) cannot be listed. If the folder is deleted
 /// during listing, rustix ends the listing on `ENOENT`.
-fn names(folder: BorrowedFd<'_>) -> io::Result<Vec<OsString>> {
+///
+/// # Errors
+///
+/// Also when the names, added to the `listed` entries the walk listed
+/// before, pass `max` ([`Limits::max_listed`]): the listing stops at the
+/// first name past it ([`too_many`]), so a wide folder is not read whole.
+/// An error the listing would give after that name is not met: the cap's
+/// error is returned instead (either way the walk fails).
+fn names(folder: BorrowedFd<'_>, listed: usize, max: Option<usize>) -> io::Result<Vec<OsString>> {
     #[cfg(test)]
     if tests::UNLISTABLE.with_borrow(|unlistable| {
         unlistable.as_ref().is_some_and(|unlistable| {
@@ -479,19 +513,31 @@ fn names(folder: BorrowedFd<'_>) -> io::Result<Vec<OsString>> {
     let mut listing = Dir::new(folder.try_clone_to_owned()?)?;
     // On interruption, rewind and restart, discarding the partial listing.
     // Retry as often as needed, as `retry_on_intr` does.
+    // The most names this listing may hold; `None`: no limit.
+    let most = max.map(|max| max.saturating_sub(listed));
     let mut names = loop {
-        match listed(&mut listing, folder) {
+        match read_names(&mut listing, folder, most) {
             Err(Errno::INTR) => listing.rewind(),
             names => break names?,
         }
     };
+    if let Some(max) = max
+        && listed + names.len() > max
+    {
+        return Err(too_many(max));
+    }
+    // Sorted only once within the cap.
     names.sort_unstable_by(|a, b| b.cmp(a));
     Ok(names)
 }
 
 /// Reads the remaining names from `listing` (of `folder`), excluding `.` and
-/// `..`.
-fn listed(listing: &mut Dir, folder: BorrowedFd<'_>) -> rustix::io::Result<Vec<OsString>> {
+/// `..`. Stops once it holds one more than `most`.
+fn read_names(
+    listing: &mut Dir,
+    folder: BorrowedFd<'_>,
+    most: Option<usize>,
+) -> rustix::io::Result<Vec<OsString>> {
     #[cfg(not(test))]
     let _ = folder;
     let mut names = Vec::new();
@@ -500,6 +546,11 @@ fn listed(listing: &mut Dir, folder: BorrowedFd<'_>) -> rustix::io::Result<Vec<O
         let name = entry.file_name().to_bytes();
         if name != b"." && name != b".." {
             names.push(OsStr::from_bytes(name).to_owned());
+            #[cfg(test)]
+            tests::NAMES_READ.with(|read| read.set(read.get() + 1));
+            if most.is_some_and(|most| names.len() > most) {
+                break;
+            }
         }
         // Interrupted once a name is kept, so that the listing is partial.
         #[cfg(test)]
@@ -686,8 +737,7 @@ fn skipping<T>(done: io::Result<T>) -> io::Result<Option<T>> {
 /// The folder handles the walk keeps open, besides the first folder's, and
 /// which of them to close when another one is needed: binary
 /// checkpointing, as the tree-magic walk of `xdg-kit-mime` keeps its
-/// handles (`Window` in its `tree.rs`, with the proof of its bound in the
-/// design notes, decision 32).
+/// handles (`Window` in its `tree.rs`).
 ///
 /// Folders are told by their depth in the walk's stack, the first folder at
 /// 0. A depth's rank is the number of times 2 divides it; the handle at
@@ -701,15 +751,20 @@ fn skipping<T>(done: io::Result<T>) -> io::Result<Option<T>> {
 ///
 /// At most `most` handles are open, one being opened among them. `most`
 /// starts at [`MOST_OPEN`] and grows by one when the walk first gets
-/// `2^(most - 2)` folders deep, so that no depth's rank reaches
-/// `most - 2`, the rank tree magic caps: no rank is ever capped. By that
-/// proof, in its case with no rank capped, the walk opens folders again at
-/// most `G(N)` times for each name looked at or folder listed after the
-/// first, `N` the deepest depth reached and `G(N)` as defined there (at
-/// most 6 for `N` below 10,000). Once the walk has been `N` folders deep
-/// (`N` ≥ 1), `most` is exactly `max(16, ⌊log2 N⌋ + 3)`: at most that many
-/// handles are open, besides the first folder's and one more for a moment
-/// (a listing's, or an entry's being read).
+/// `2^(most - 2)` folders deep, so that no depth's rank reaches `most - 2`,
+/// the rank tree magic caps: no rank is ever capped
+/// (`the_window_grows_before_a_rank_would_be_capped` checks this, and the
+/// formula below, to 2^15 folders deep). Once the walk has been `N` folders
+/// deep (`N` ≥ 1), `most` is exactly `max(16, ⌊log2 N⌋ + 3)`: at most that
+/// many handles are open, besides the first folder's and one more for a
+/// moment (a listing's, or an entry's being read).
+///
+/// The walk opens folders again at most 6 times for each name looked at
+/// or folder listed after the first, as far as the tests check: here
+/// `going_back_up_a_deep_tree_keeps_few_handles`, 300 folders deep; for
+/// tree magic's handles, its tests (named at `MAX_REOPENS` in its
+/// `tree.rs`), to the 4,999 folders deep its default lookups allow. The
+/// default [`Limits::max_listed`] lets this walk go deeper than either.
 struct Window {
     /// The depths of the folders whose handles are open, shallowest first.
     open: Vec<usize>,
@@ -823,7 +878,8 @@ impl Window {
 /// `types`. It is skipped when it cannot be opened, checked or read for an
 /// error saying its name cannot be used as written ([`skipped`]), when it
 /// is not a regular file (any more) or is larger than `max_len`
-/// ([`read_regular_file`]), and when it is deleted
+/// ([`read_regular_file`]), when its ID is one `GLib` cannot read back
+/// (not UTF-8, or starting with a form feed), and when it is deleted
 /// ([`DesktopEntry::hidden`]) or not in UTF-8
 /// ([`DesktopEntry::supports_encoding`]).
 ///
@@ -835,12 +891,20 @@ fn add(
     folder: BorrowedFd<'_>,
     name: &OsStr,
     id: &[u8],
-    types: &mut BTreeMap<String, BTreeSet<Vec<u8>>>,
+    types: &mut BTreeMap<String, BTreeSet<String>>,
     max_len: Option<u64>,
 ) -> io::Result<()> {
     let Some(bytes) = skipping(read_regular_file(folder, name, max_len))?.flatten() else {
         return Ok(());
     };
+    // IDs `GLib` cannot read back are left out: not UTF-8, or starting
+    // with a form feed (skipped before a value, with no escape).
+    let Ok(id) = std::str::from_utf8(id) else {
+        return Ok(());
+    };
+    if id.starts_with('\x0c') {
+        return Ok(());
+    }
     let entry = DesktopEntry::parse(&bytes);
     // As `update-desktop-database`: not deleted and in UTF-8. Unlike
     // `AppIndex`, entries of no or unknown `Type` are listed.
@@ -854,7 +918,7 @@ fn add(
             types
                 .entry(item.to_owned())
                 .or_default()
-                .insert(id.to_vec());
+                .insert(id.to_owned());
         }
     }
     Ok(())
@@ -1155,6 +1219,8 @@ mod tests {
         /// thread once a name was kept, and the error it gives.
         pub(super) static INTERRUPTED_LISTING: RefCell<Option<(rustix::fs::Stat, Errno)>> =
             const { RefCell::new(None) };
+        /// The names [`names`] read on this thread, `.` and `..` left out.
+        pub(super) static NAMES_READ: Cell<usize> = const { Cell::new(0) };
         /// The calls interrupted by a fault on this thread ([`once`]).
         static INTERRUPTED: Cell<usize> = const { Cell::new(0) };
     }
@@ -1380,8 +1446,8 @@ mod tests {
         assert_eq!(cache, format!("[MIME Cache]\ntext/plain={ids}\n"));
         assert_eq!(MOST_OPEN_SEEN.with(Cell::get), MOST_OPEN, "handles kept");
         // Each name looked at and each folder listed is a step: within the
-        // proven bound (decision 32), at most 6 reopens for each step after
-        // the first.
+        // bound of `Window`, at most 6 reopens for each step after the
+        // first.
         let steps = 2 * depth + (depth + 1);
         let reopens = REOPENS.with(Cell::get);
         assert!(
@@ -1451,7 +1517,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("e.desktop"), ENTRY).unwrap();
         let listed = open_folder(rustix::fs::CWD, dir.path()).unwrap();
-        assert_eq!(names(listed.as_fd()).unwrap(), ["e.desktop"]);
+        assert_eq!(names(listed.as_fd(), 0, None).unwrap(), ["e.desktop"]);
         let Some(lookups_only) = LOOKUPS_ONLY else {
             return;
         };
@@ -1463,7 +1529,7 @@ mod tests {
         )
         .unwrap();
         // Not an empty listing, which would hide the misuse.
-        let listing = names(handle.as_fd());
+        let listing = names(handle.as_fd(), 0, None);
         assert!(listing.is_err(), "{listing:?}");
     }
 
@@ -1506,7 +1572,7 @@ mod tests {
                 Err(Some(Errno::IO.raw_os_error())),
                 "{unlistable}"
             );
-            // The old cache is left as it is, and no file is left behind.
+            // The cache already there is kept, and no file is left behind.
             assert_eq!(fs::read(&cache).unwrap(), before, "{unlistable}");
             assert_eq!(files(), files_before, "{unlistable}");
         }
@@ -1550,7 +1616,7 @@ mod tests {
                     error,
                     "{errno:?}"
                 );
-                // The old cache is left as it is, and no file is left behind.
+                // The cache already there is kept, and no file is left behind.
                 assert_eq!(fs::read(&cache).unwrap(), before, "{errno:?}");
                 assert_eq!(listed(dir.path()), files_before, "{errno:?}");
             }
@@ -2007,6 +2073,198 @@ mod tests {
     }
 
     #[test]
+    fn ids_not_in_utf8_are_left_out() {
+        // `GLib` cannot read them, and loses the type's whole list. A type
+        // left with no ID gets no line.
+        let dir = tempfile::tempdir().unwrap();
+        let raw = |relative: &[u8]| dir.path().join(OsStr::from_bytes(relative));
+        fs::write(raw(b"bad\x80.desktop"), ENTRY).unwrap();
+        fs::write(dir.path().join("bad\u{fffd}.desktop"), ENTRY).unwrap();
+        fs::create_dir(raw(b"d\xff")).unwrap();
+        fs::write(raw(b"d\xff/a.desktop"), ENTRY).unwrap();
+        fs::write(
+            raw(b"only\xfe.desktop"),
+            ENTRY.replace("text/plain", "text/only"),
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(mimeinfo_cache(dir.path()).unwrap()).unwrap(),
+            "[MIME Cache]\ntext/plain=bad\u{fffd}.desktop;\n"
+        );
+    }
+
+    #[test]
+    fn ids_starting_with_a_form_feed_are_left_out() {
+        // `GLib` drops white space before a value and cannot escape a form
+        // feed: left out wherever they would fall in the line.
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["\x0cff", "z\x0c", "\x0c"] {
+            fs::write(dir.path().join(format!("{name}.desktop")), ENTRY).unwrap();
+        }
+        fs::create_dir(dir.path().join("\x0cd")).unwrap();
+        fs::write(dir.path().join("\x0cd/a.desktop"), ENTRY).unwrap();
+        fs::create_dir(dir.path().join("e")).unwrap();
+        fs::write(dir.path().join("e/\x0cb.desktop"), ENTRY).unwrap();
+        fs::write(dir.path().join("~.desktop"), ENTRY).unwrap();
+        let cache = mimeinfo_cache(dir.path()).unwrap();
+        assert_eq!(
+            String::from_utf8(cache.clone()).unwrap(),
+            "[MIME Cache]\ntext/plain=e-\x0cb.desktop;z\x0c.desktop;~.desktop;\n"
+        );
+        assert_eq!(
+            glib_string_list(&cache, "text/plain"),
+            Some(vec![
+                "e-\x0cb.desktop".to_owned(),
+                "z\x0c.desktop".to_owned(),
+                "~.desktop".to_owned()
+            ])
+        );
+    }
+
+    /// The items `GLib` reads from `key` in `[MIME Cache]` of `cache`, as
+    /// `g_key_file_load_from_data` and `g_key_file_get_string_list` do
+    /// (glib/gkeyfile.c, 2.88.3); `None` where `GLib` gives an error. A
+    /// little stricter: a key with `[` or `]` (a locale) refuses the file.
+    fn glib_string_list(cache: &[u8], key: &str) -> Option<Vec<String>> {
+        // `g_ascii_isspace`: no vertical tab.
+        let space = |byte: &u8| matches!(byte, b' ' | b'\t' | b'\n' | b'\x0c' | b'\r');
+        let mut group: Option<&[u8]> = None;
+        let mut value = None;
+        for line in cache.split_inclusive(|&byte| byte == b'\n') {
+            // A carriage return goes only before a line feed.
+            let line = line
+                .strip_suffix(b"\r\n")
+                .or_else(|| line.strip_suffix(b"\n"))
+                .unwrap_or(line);
+            let start = line.iter().position(|byte| !space(byte));
+            let Some(line) = start.map(|start| &line[start..]) else {
+                continue;
+            };
+            if line[0] == b'#' {
+                continue;
+            }
+            let end = line.iter().position(|&byte| byte == b']');
+            if line[0] == b'['
+                && let Some(end) = end
+                && line[end + 1..]
+                    .iter()
+                    .all(|&byte| matches!(byte, b' ' | b'\t'))
+            {
+                let name = &line[1..end];
+                if name.is_empty()
+                    || name
+                        .iter()
+                        .any(|&byte| byte == b'[' || byte < 0x20 || byte == 0x7f)
+                {
+                    return None;
+                }
+                group = Some(name);
+                continue;
+            }
+            // Not an entry, group or comment, or before the first group: the
+            // whole file is refused.
+            let equals = line
+                .iter()
+                .position(|&byte| byte == b'=')
+                .filter(|&at| at > 0)?;
+            let name = &line[..equals];
+            let name = &name[..=name.iter().rposition(|byte| !space(byte))?];
+            if name.iter().any(|&byte| byte == b'[' || byte == b']') {
+                return None;
+            }
+            let rest = &line[equals + 1..];
+            let rest = &rest[rest
+                .iter()
+                .position(|byte| !space(byte))
+                .unwrap_or(rest.len())..];
+            if group? == b"MIME Cache" && name == key.as_bytes() {
+                value = Some(rest);
+            }
+        }
+        let value = std::str::from_utf8(value?).ok()?;
+        let (mut items, mut item) = (Vec::new(), String::new());
+        let mut chars = value.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' => item.push(match chars.next()? {
+                    's' => ' ',
+                    'n' => '\n',
+                    't' => '\t',
+                    'r' => '\r',
+                    '\\' => '\\',
+                    ';' => ';',
+                    _ => return None,
+                }),
+                ';' => items.push(std::mem::take(&mut item)),
+                _ => item.push(c),
+            }
+        }
+        if !item.is_empty() {
+            items.push(item);
+        }
+        Some(items)
+    }
+
+    #[test]
+    fn glib_reads_every_id_back() {
+        let names = [
+            "bad\nname",
+            "a;b",
+            "x\\y",
+            "s\\sx",
+            "n\\nn",
+            "p\\;q",
+            "w\\\\w",
+            " lead",
+            "\tlead",
+            "tab\tx",
+            "cr\rx",
+            "a=b",
+            "[x]",
+            "#c",
+        ];
+        let all = tempfile::tempdir().unwrap();
+        let mut every = vec!["d\\-z.desktop".to_owned()];
+        for name in names {
+            let dir = tempfile::tempdir().unwrap();
+            let id = format!("{name}.desktop");
+            fs::write(dir.path().join(&id), ENTRY).unwrap();
+            fs::write(all.path().join(&id), ENTRY).unwrap();
+            let cache = mimeinfo_cache(dir.path()).unwrap();
+            assert_eq!(
+                glib_string_list(&cache, "text/plain"),
+                Some(vec![id.clone()]),
+                "{id:?} in {:?}",
+                String::from_utf8_lossy(&cache)
+            );
+            every.push(id);
+        }
+        // A folder's name, ending in an escape character.
+        fs::create_dir(all.path().join("d\\")).unwrap();
+        fs::write(all.path().join("d\\/z.desktop"), ENTRY).unwrap();
+        every.sort();
+        let cache = mimeinfo_cache(all.path()).unwrap();
+        assert_eq!(
+            glib_string_list(&cache, "text/plain"),
+            Some(every),
+            "{:?}",
+            String::from_utf8_lossy(&cache)
+        );
+    }
+
+    #[test]
+    fn ids_are_written_escaped_as_glib_lists_expect() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [" a;b\\c\n", "\td\r e"] {
+            fs::write(dir.path().join(format!("{name}.desktop")), ENTRY).unwrap();
+        }
+        assert_eq!(
+            String::from_utf8(mimeinfo_cache(dir.path()).unwrap()).unwrap(),
+            "[MIME Cache]\ntext/plain=\\td\\r e.desktop;\\sa\\;b\\\\c\\n.desktop;\n"
+        );
+    }
+
+    #[test]
     fn a_folder_linked_under_two_names_is_listed_under_each() {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir(dir.path().join("b")).unwrap();
@@ -2031,6 +2289,42 @@ mod tests {
             String::from_utf8(mimeinfo_cache(dir.path()).unwrap()).unwrap(),
             "[MIME Cache]\ntext/plain=x-y-foo.desktop;\n"
         );
+    }
+
+    #[test]
+    fn a_wide_folder_is_read_only_until_the_cap_is_passed() {
+        // A folder of 1,000 names, as the first folder and under it.
+        let dir = tempfile::tempdir().unwrap();
+        let wide = dir.path().join("wide");
+        for at in 0..1000 {
+            fs::create_dir_all(wide.join(format!("w/{at}"))).unwrap();
+        }
+        for (folder, names) in [(wide.join("w"), 1000), (wide, 1001)] {
+            for max in [0, 1, 10, 500, 999] {
+                let limits = Limits {
+                    max_listed: Some(max),
+                    ..Limits::default()
+                };
+                NAMES_READ.set(0);
+                let err = mimeinfo_cache_with(&folder, &limits).unwrap_err();
+                assert_eq!(
+                    err.to_string(),
+                    format!("mimeinfo.cache walk: more than {max} entries to list; no cache made"),
+                    "{max}"
+                );
+                // Names read stop at the first past the cap.
+                assert_eq!(NAMES_READ.get(), max + 1, "{folder:?} {max}");
+            }
+            // Within the cap, all is listed.
+            let limits = Limits {
+                max_listed: Some(names),
+                ..Limits::default()
+            };
+            NAMES_READ.set(0);
+            let made = mimeinfo_cache_with(&folder, &limits).unwrap();
+            assert_eq!(made, b"[MIME Cache]\n");
+            assert_eq!(NAMES_READ.get(), names, "{folder:?}");
+        }
     }
 
     #[test]
@@ -2206,7 +2500,7 @@ mod tests {
             let path = dir.path().join(folder);
             fail(&INTERRUPTED_LISTING, Some((&path, Errno::INTR)));
             let handle = open_folder(rustix::fs::CWD, &path).unwrap();
-            let mut names = names(handle.as_fd()).map_err(|err| err.raw_os_error());
+            let mut names = names(handle.as_fd(), 0, None).map_err(|err| err.raw_os_error());
             if let Ok(names) = &mut names {
                 names.reverse();
             }
@@ -2320,7 +2614,7 @@ mod tests {
                 error,
                 "{name}: {errno:?}"
             );
-            // The old cache is left as it is, and no file is left behind.
+            // The cache already there is kept, and no file is left behind.
             assert_eq!(fs::read(&cache).unwrap(), before, "{name}: {errno:?}");
             assert_eq!(listed(dir), files_before, "{name}: {errno:?}");
         }

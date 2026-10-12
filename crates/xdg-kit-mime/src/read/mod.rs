@@ -300,7 +300,7 @@ mod tests {
         assert_eq!(named(&dbs, "aς"), [None, None]);
     }
 
-    /// The class rows need the matcher's fold (151). `update-mime-database`
+    /// The class rows need the matcher's fold. `update-mime-database`
     /// writes `*[A-C].x` as `*[a-c].x`, so the range rows check only that
     /// both readers agree; `fnmatch`'s unit tests cover folded ranges.
     #[test]

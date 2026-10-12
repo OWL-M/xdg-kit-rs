@@ -4,10 +4,10 @@
 //! For each scenario and type both must give the same default application
 //! and, when there is one, the same applications ("Registered") and the
 //! same applications for the type itself ("Recommended"). Intentional
-//! differences follow either the specs or a project decision where `GLib`
-//! does not. `gio-differences.txt` lists each scenario and type with our
-//! expected answer and a reason. Every listed case must still differ, and
-//! our answer must match the listed one.
+//! differences follow the specs, or a deliberate choice of this crate,
+//! where `GLib` does not. `gio-differences.txt` lists each scenario and
+//! type with our expected answer and a reason. Every listed case must still
+//! differ, and our answer must match the listed one.
 //!
 //! `GLib` takes a folder's associations from its `mimeinfo.cache` only, so
 //! `update-desktop-database` writes one into every `applications` folder

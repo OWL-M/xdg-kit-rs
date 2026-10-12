@@ -352,13 +352,20 @@ impl MimeDatabase {
     /// (namespace, local name) pair, else the namespace with any element,
     /// else the local name with any namespace.
     fn xml_root_type(&self, data: &[u8]) -> Option<MimeType> {
-        let (namespace, local) = crate::xml::root_element(data)?;
+        let mut key = crate::xml::root_element_within(data, self.limits())?;
         let namespaces = &self.merged.namespaces;
-        namespaces
-            .get(&(namespace.clone(), local.clone()))
-            .or_else(|| namespaces.get(&(namespace, String::new())))
-            .or_else(|| namespaces.get(&(String::new(), local)))
-            .map(|mime| self.canonical(mime))
+        // The key changed in place, not copied: the namespace may be as
+        // large as memory allows.
+        let mut found = namespaces.get(&key);
+        if found.is_none() {
+            let local = std::mem::take(&mut key.1);
+            found = namespaces.get(&key);
+            if found.is_none() {
+                key = (String::new(), local);
+                found = namespaces.get(&key);
+            }
+        }
+        found.map(|mime| self.canonical(mime))
     }
 
     /// Resolves a built-in type such as `text/plain` or `inode/directory`

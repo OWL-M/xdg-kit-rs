@@ -197,6 +197,14 @@ fn caches_match_update_desktop_database() {
     for link in ["rep/a-b-y.desktop", "rep-a/b-y.desktop"] {
         std::os::unix::fs::symlink("../rep-a-b/y.desktop", applications.join(link)).unwrap();
     }
+    // IDs `GLib` reads only escaped; all in UTF-8, distinct in any case.
+    for name in [" lead", "a;b", "tab\tx", "x\\y"] {
+        fs::write(
+            applications.join(format!("{name}.desktop")),
+            "[Desktop Entry]\nType=Application\nName=E\nExec=e\nMimeType=text/escaped-id;\n",
+        )
+        .unwrap();
+    }
     for target in [applications.join("corpus"), applications.join("sub")] {
         fs::create_dir_all(&target).unwrap();
         for entry in fs::read_dir(&corpus).unwrap() {

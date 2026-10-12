@@ -169,13 +169,17 @@ impl MimeAppsList {
         Self::open_with(base_dirs.config_home().join(MIMEAPPS_LIST), limits)
     }
 
-    /// The file at `path`; a missing file is an empty list, created by
-    /// [`MimeAppsList::write`]. A file not named `mimeapps.list` counts as
-    /// desktop-specific.
+    /// Reads the file at `path`. A missing file gives an empty list;
+    /// [`MimeAppsList::write`] creates the file. A file not named
+    /// `mimeapps.list` counts as desktop-specific. Converts a relative path
+    /// to an absolute path now, without following links, so later changes to
+    /// the working directory do not change its location.
     ///
     /// # Errors
     ///
-    /// When the file exists but cannot be read.
+    /// If `path` cannot be made absolute because it is empty or the current
+    /// directory is gone. The list needs a fixed location for writing it back.
+    /// Also fails if the file exists but cannot be read.
     pub fn open(path: impl Into<PathBuf>) -> io::Result<Self> {
         Self::open_with(path, &Limits::default())
     }
@@ -184,6 +188,7 @@ impl MimeAppsList {
     ///
     /// # Errors
     ///
+    /// When `path` cannot be made absolute, as for [`MimeAppsList::open`].
     /// When the file exists but cannot be read, or is larger than
     /// [`Limits::max_file_len`].
     pub fn open_with(path: impl Into<PathBuf>, limits: &Limits) -> io::Result<Self> {
@@ -1239,6 +1244,16 @@ mod tests {
             Err(EditError::DesktopId("kde/a.desktop".into())),
             "adding one stays refused"
         );
+    }
+
+    #[test]
+    fn a_path_that_cannot_be_made_absolute_is_refused() {
+        // Unlike `KeyFile::read`, which keeps such a path as given: the list
+        // is written back, so it needs a fixed place.
+        let err = MimeAppsList::open("").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        let err = MimeAppsList::open_with("", &Limits::default()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]

@@ -38,11 +38,11 @@ pub struct TreeOptions {
     pub max_lookups: Option<usize>,
     /// The maximum folder reopens while backtracking along one rule path, after
     /// their handles have been closed. Exceeding it makes the rule path fail to
-    /// match. Defaults to 6 per default lookup, a bound proven sufficient
-    /// within the default lookup limit. Under those limits, the search finds
-    /// the same paths as one that keeps every folder open. Raising the lookup
-    /// limit may exhaust reopens first and miss matches; `None` removes that
-    /// restriction.
+    /// match. Defaults to 6 per default lookup: the crate's tests check that
+    /// searches within the default lookup limit (at most 4,999 folders deep)
+    /// need no more, and so find the same paths as one that keeps every
+    /// folder open. Raising the lookup limit may exhaust reopens first and
+    /// miss matches; `None` removes that restriction.
     pub max_reopens: Option<usize>,
 }
 
@@ -72,10 +72,17 @@ impl TreeOptions {
 const MAX_LOOKUPS: usize = 10_000;
 
 /// The default of [`TreeOptions::max_reopens`]. With its handles kept as
-/// [`Window`] says, a search opens folders again at most 6 times for each
-/// lookup after the first, while it is at most 4,999 folders deep (the
-/// default lookups allow no deeper, as each folder entered takes two): the
-/// proof is decision 32 of the design notes.
+/// [`Window`] says, a search within the default lookups (at most 4,999
+/// folders deep, as each folder entered takes two) opens folders again at
+/// most 6 times for each lookup after the first. Tests of this bound:
+/// `the_reopen_cap_is_the_bound_for_the_default_lookups` (its formula gives
+/// 6 at that depth), `small_volumes_stay_within_the_bound_with_few_handles`
+/// (every volume of up to 9 folders, with 2 to 6 handles),
+/// `the_simulation_reopens_as_the_walk_does` (the simulation those use,
+/// against real walks), and, for real walks of up to 1,700 levels,
+/// `going_back_past_dead_ends_stays_within_the_bound`,
+/// `going_back_past_deep_dead_ends_finds_what_unlimited_handles_find` and
+/// `climbing_back_level_by_level_finds_what_unlimited_handles_find`.
 const MAX_REOPENS: usize = 6 * MAX_LOOKUPS;
 
 /// The most folder handles one rule path's search holds open at a time,
@@ -240,11 +247,12 @@ fn find_entries(
 /// The search holds at most [`MAX_OPEN_FOLDERS`] handles regardless of
 /// depth. While backtracking, it reopens closed folders from their
 /// ancestors ([`Window`]). Reopening does not count as a lookup and has
-/// its own limit, [`TreeOptions::max_reopens`]. The handle retention
-/// strategy is proven to stay within the default reopens for the default
-/// lookups, so it then finds every path that a search with unlimited
-/// handles would find within the same lookups. If reopening finds a
-/// different folder (see [`Walk::from`]), the rule path does not match.
+/// its own limit, [`TreeOptions::max_reopens`]. Within the default
+/// lookups, the handles kept stay within the default reopens as far as
+/// the tests named at [`MAX_REOPENS`] check, so the search then finds
+/// every path that a search with unlimited handles would find within
+/// the same lookups. If reopening finds a different folder (see
+/// [`Walk::from`]), the rule path does not match.
 /// This works with or without mount IDs.
 fn any_path(
     root: BorrowedFd<'_>,
@@ -1756,8 +1764,8 @@ mod tests {
     #[test]
     fn going_back_past_dead_ends_stays_within_the_bound() {
         // 150 levels with a dead end 20 folders deep before each. (Closing
-        // the handle leaving the smallest gap took 403 reopens here, and
-        // closing the shallowest 9,045.)
+        // the handle leaving the smallest gap would take 403 reopens here,
+        // and closing the shallowest 9,045.)
         let _many = many_handles();
         let found = against_unlimited(150, |root, levels| dead_ends(root, levels, 20));
         assert!(found.is_none_or(|(found, _, _)| found));
@@ -1993,9 +2001,9 @@ mod tests {
     /// the folders opened again, and the most handles open at once.
     type Simulated = (Vec<usize>, usize, usize, usize);
 
-    /// Whether the handle at `at` was far enough from `depth` to be closed
-    /// (proof, step 4): `depth` is at least twice what it covers after it,
-    /// once at the top rank. Apart from [`Window::near`], which it checks.
+    /// Whether the handle at `at` was far enough from `depth` to be closed:
+    /// `depth` is at least twice what it covers after it, once at the top
+    /// rank. Apart from [`Window::near`], which it checks.
     fn far(window: &Window, at: usize, depth: usize) -> bool {
         let rank = window.rank(at);
         let past = if rank < window.top_rank() { 2 } else { 1 };
@@ -2005,9 +2013,8 @@ mod tests {
     /// The walk of [`Walk::from`] over `volume`, for a rule path one
     /// component longer than the volume is deep, with handles kept as
     /// [`Window`] says for `most`, but no files: each step is one lookup,
-    /// each folder entered one more. Checks the proof's steps 2 (where
-    /// going back starts and what it costs) and 4 (a handle closed is far
-    /// from the walk) as it goes.
+    /// each folder entered one more. Checks where going back starts and what
+    /// it costs, and that a handle closed is far from the walk, as it goes.
     fn simulate(volume: &Made, most: usize, lookups: usize) -> Simulated {
         struct Level<'v> {
             folder: &'v Made,
@@ -2047,7 +2054,7 @@ mod tests {
                     (1..=depth).filter(|&at| window.covers(at, depth)).collect();
                 let closed = covering.iter().position(|&at| !stack[at].open).unwrap();
                 let start = closed.checked_sub(1).map_or(0, |before| covering[before]);
-                assert_eq!(window.start(depth), start, "proof, step 2");
+                assert_eq!(window.start(depth), start, "where going back starts");
                 let (shallowest, rank) = (covering[closed], window.rank(covering[closed]));
                 let cost = if rank < window.top_rank() {
                     (2 << rank) - 1
@@ -2065,7 +2072,7 @@ mod tests {
                         let closed = window
                             .close_one(depth, at - 1, |at| live(&stack[at]))
                             .unwrap();
-                        assert!(far(&window, closed, depth), "proof, step 4");
+                        assert!(far(&window, closed, depth), "closed far from the walk");
                         stack[closed].open = false;
                     }
                     reopens += 1;
@@ -2078,13 +2085,13 @@ mod tests {
                         passing = true;
                     }
                 }
-                assert!(reopens - before <= cost, "proof, step 2");
+                assert!(reopens - before <= cost, "what going back costs");
             }
             while !last && window.open.len() >= window.most {
                 let closed = window
                     .close_one(depth, depth, |at| live(&stack[at]))
                     .unwrap();
-                assert!(far(&window, closed, depth), "proof, step 4");
+                assert!(far(&window, closed, depth), "closed far from the walk");
                 stack[closed].open = false;
             }
             let (false, Some(folder)) = (last, entry) else {
@@ -2105,10 +2112,10 @@ mod tests {
         (steps, used, reopens, peak)
     }
 
-    /// The most crossing points a depth from 1 to `deepest` has (proof,
-    /// step 6): the depths `z` that a multiple of `2^(r + 1)`, for a rank
-    /// `r` below `top`, with `z - 2^r` at least `2^r`, the depth at most
-    /// `2^r` after `z`, and `z + 2^r` at most `deepest`.
+    /// The most crossing points a depth from 1 to `deepest` has: the depths
+    /// `z` that are a multiple of `2^(r + 1)`, for a rank `r` below `top`,
+    /// with `z - 2^r` at least `2^r`, the depth at most `2^r` after `z`,
+    /// and `z + 2^r` at most `deepest`.
     fn crossing_points(deepest: usize, top: u32) -> usize {
         (1..=deepest)
             .map(|depth| {
@@ -2128,9 +2135,9 @@ mod tests {
     }
 
     /// Twice the most folders opened again for each lookup after the
-    /// first, with `most` handles and depths up to `deepest` (proof, step
-    /// 7): twice the crossing points, plus, where the ranks are capped
-    /// below the deepest folders, the deepest multiple of `2^top` less one.
+    /// first, with `most` handles and depths up to `deepest`: twice the
+    /// crossing points, plus, where the ranks are capped below the deepest
+    /// folders, the deepest multiple of `2^top` less one.
     fn twice_per_lookup(most: usize, deepest: usize) -> usize {
         let top = Window::new(most).top_rank();
         let twice = 2 * crossing_points(deepest, top);
@@ -2141,7 +2148,7 @@ mod tests {
     }
 
     #[test]
-    fn the_reopen_cap_is_the_proven_bound() {
+    fn the_reopen_cap_is_the_bound_for_the_default_lookups() {
         // A walk within its lookups goes at most this deep: the first
         // folder's listing is one lookup, and each folder entered two
         // (the step to it and its listing).

@@ -13,6 +13,12 @@
 //! assert_eq!(dirs.data_dirs().len(), 2);
 //! # Ok::<(), xdg_kit_basedir::Error>(())
 //! ```
+//!
+//! [`BaseDirs::find_config`] and [`BaseDirs::find_data`] give the most
+//! important file that exists; [`BaseDirs::read_config`] and
+//! [`BaseDirs::read_data`] (and their `_with` forms, taking [`Limits`]) read
+//! the most important one that can be read, skipping missing files and
+//! files that may not be read, as the spec says.
 
 #[cfg(not(unix))]
 compile_error!("xdg-kit-basedir supports Unix systems only");
@@ -29,7 +35,7 @@ mod testing;
 pub mod user_dirs;
 mod work;
 
-pub use base_dirs::BaseDirs;
+pub use base_dirs::{BaseDirs, ReadFile};
 pub use error::{Diagnostic, DiagnosticSource, Error};
 pub use read::{Limits, MAX_FILE_LEN, read_regular_file, read_regular_file_with};
 pub use runtime::RuntimeDirProblem;

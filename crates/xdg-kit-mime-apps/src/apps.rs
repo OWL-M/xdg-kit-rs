@@ -428,13 +428,17 @@ impl MimeApps {
     ///   Applications]` for that step, in the first `mimeapps.list` that
     ///   names one associated with the step or a less specific one (an
     ///   editor for `text/plain` set as the default for `text/x-csrc`
-    ///   counts, as in `GLib`; decision 9);
+    ///   counts, as in `GLib`);
     /// - else the most preferred installed application associated with the
     ///   step.
     ///
     /// The first step with an answer decides, so an application for the
     /// type itself wins over a default set for a type it is a kind of (as
     /// the spec says).
+    ///
+    /// An application with neither `Exec` nor `DBusActivatable=true` counts
+    /// as installed, as in `GLib`, so it may be the answer; launching it
+    /// then fails with [`LaunchError::NoExec`](xdg_kit_desktop_entry::LaunchError::NoExec).
     #[must_use]
     pub fn default_for(&self, mime: &MimeType) -> Option<AppEntry> {
         let steps = self.steps(mime);
@@ -543,9 +547,9 @@ impl MimeApps {
         work::count(4);
         let mut steps = vec![(TypePattern::Exact(canonical.clone()), Matched::Exact)];
         if mime.is_media("x-scheme-handler") || canonical.is_media("x-scheme-handler") {
-            // A URL is no data: its scheme's handlers, or none (decision 8),
-            // also when the database makes its type an alias of a type of
-            // another media type.
+            // A URL is no data: its scheme's handlers, or none, also when
+            // the database makes its type an alias of a type of another
+            // media type.
             let urls =
                 TypePattern::Media(MediaType::new("x-scheme-handler").expect("a valid name"));
             // The wildcard's name copied.
@@ -667,7 +671,8 @@ impl MimeApps {
 
     /// The application `id`, if it is installed: a visible `Type=Application`
     /// entry (links and folders open nothing), whose `TryExec` is found when
-    /// asked to check it.
+    /// asked to check it. As in `GLib`, an entry with neither `Exec` nor
+    /// `DBusActivatable=true` is installed too.
     fn installed(&self, id: &str) -> Option<AppEntry> {
         let app = self.apps.get(id)?;
         if app.entry().entry_type() != Some(EntryType::Application) {

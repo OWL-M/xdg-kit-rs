@@ -5,6 +5,11 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+readme.workspace = true
+documentation = "https://docs.rs/xdg-kit-mime-apps"
+keywords = ["xdg", "freedesktop", "mimeapps", "default-apps", "file-associations"]
+categories = ["os::unix-apis", "filesystem", "parser-implementations"]
 
 [dependencies]
 rustix = { workspace = true, features = ["fs"] }

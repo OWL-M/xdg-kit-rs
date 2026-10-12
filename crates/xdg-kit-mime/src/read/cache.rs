@@ -144,7 +144,10 @@ impl Reader<'_> {
     /// A list: a count at `at`, then `count` entries of `size` bytes. `None`
     /// (reported) if it does not fit in the file.
     fn list(&mut self, at: usize, size: usize, what: &str) -> Option<(usize, usize)> {
-        let count = self.offset_at(at)?;
+        let Some(count) = self.offset_at(at) else {
+            self.report(at, format!("{what} count outside the file, skipped"));
+            return None;
+        };
         let start = at + 4;
         let fits = count
             .checked_mul(size)
@@ -396,7 +399,9 @@ fn read_suffix_nodes(
             let Some(mime) = reader.mime_at(node + 4) else {
                 continue;
             };
-            if !reader.charge(node, 1 + reversed.len()) {
+            // The pattern's UTF-8 length, as the byte budget is documented.
+            let len = 1 + reversed.iter().map(|c| c.len_utf8()).sum::<usize>();
+            if !reader.charge(node, len) {
                 return;
             }
             let pattern: String = std::iter::once('*')
@@ -709,6 +714,54 @@ mod tests {
         );
     }
 
+    /// A version 1.2 cache of `len` zero bytes, its nine header offsets
+    /// `others` except the `list`th, which is `at`.
+    fn header_only(len: usize, list: usize, at: usize, others: usize) -> Vec<u8> {
+        let mut bytes = vec![0; len];
+        bytes[..4].copy_from_slice(&[0, 1, 0, 2]);
+        for index in 0..9 {
+            set_u32(
+                &mut bytes,
+                4 + 4 * index,
+                if index == list { at } else { others },
+            );
+        }
+        bytes
+    }
+
+    #[test]
+    fn a_list_count_outside_the_file_is_reported() {
+        // The alias list's count at 59 of 60 bytes.
+        let (result, folder, diagnostics) = decode(&header_only(60, 0, 59, 40));
+        assert!(result.is_ok());
+        assert!(folder.aliases.is_empty());
+        assert_eq!(
+            diagnostics,
+            [Diagnostic::new(
+                "mime.cache",
+                Some(Location::Offset(59)),
+                "alias list count outside the file, skipped"
+            )]
+        );
+        // A type's parents list at 79 of 80 bytes.
+        let mut bytes = header_only(80, 1, 40, 60);
+        set_u32(&mut bytes, 40, 1);
+        set_u32(&mut bytes, 44, 52);
+        set_u32(&mut bytes, 48, 79);
+        bytes[52..58].copy_from_slice(b"text/a");
+        let (result, folder, diagnostics) = decode(&bytes);
+        assert!(result.is_ok());
+        assert!(folder.parents.is_empty());
+        assert_eq!(
+            diagnostics,
+            [Diagnostic::new(
+                "mime.cache",
+                Some(Location::Offset(79)),
+                "parents count outside the file, skipped"
+            )]
+        );
+    }
+
     #[test]
     fn every_truncation_is_survived() {
         let bytes = cache_bytes();
@@ -822,5 +875,37 @@ mod tests {
         let (result, _, diagnostics) = decode(&bytes);
         assert!(result.is_ok());
         assert!(!diagnostics.is_empty());
+    }
+
+    #[test]
+    fn a_suffix_is_charged_its_utf8_length() {
+        // `*😀😀` is 9 bytes, and `a/b` 3: with no budget per byte, 12
+        // extra bytes read it and 11 do not: its two characters are charged
+        // their 8 bytes, not as two.
+        let dir = tempfile::tempdir().unwrap();
+        let package = r#"<?xml version="1.0"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="a/b"><glob pattern="*😀😀"/></mime-type>
+</mime-info>"#;
+        let mime = testing::build(dir.path(), &[("p.xml", package)]);
+        let bytes = std::fs::read(mime.join("mime.cache")).unwrap();
+        for (extra, read_it) in [(12, true), (11, false)] {
+            let limits = Limits {
+                cache_copy_per_byte: Some(0),
+                cache_copy_extra: extra,
+                ..Limits::default()
+            };
+            let mut folder = Folder::default();
+            let mut diagnostics = Vec::new();
+            let _ = read(
+                Path::new("mime.cache"),
+                &bytes,
+                &mut folder,
+                &mut diagnostics,
+                &limits,
+            );
+            let found = folder.globs.iter().any(|glob| glob.pattern == "*😀😀");
+            assert_eq!(found, read_it, "{extra}: {diagnostics:?}");
+        }
     }
 }

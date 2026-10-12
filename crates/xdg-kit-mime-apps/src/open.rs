@@ -20,13 +20,24 @@ pub enum OpenError {
     /// The file's type could not be found (its metadata or contents could
     /// not be read).
     Type(PathBuf, io::Error),
-    /// A URI without a scheme, or a `file:` URI that is not a local path.
+    /// A URI without a scheme, or with a raw NUL anywhere (as
+    /// [`LaunchError::BadUri`]), or a `file:` URI that is not a local path.
+    /// The scheme and the NUL are checked on the URI as given, for every
+    /// scheme: before a `file:` URI is looked at or a link followed, and
+    /// also when the application takes no targets.
     BadUri(String),
     /// No application is associated with the type.
     NoApplication(MimeType),
     /// A `Type=Link` desktop entry without a `URL`.
     LinkWithoutUrl(PathBuf),
-    /// The application cannot be launched with the target.
+    /// A `Type=Link` desktop entry in an `Encoding` that is not supported
+    /// ([`DesktopEntry::supports_encoding`]), such as `Legacy-Mixed`: the
+    /// spec says to ignore it, so its `URL` is not followed.
+    UnsupportedEncoding(PathBuf),
+    /// The application cannot be launched with the target. The default
+    /// application may have neither `Exec` nor `DBusActivatable=true` (it
+    /// still counts as installed, as in `GLib`): that is
+    /// [`LaunchError::NoExec`].
     Launch(LaunchError),
 }
 
@@ -38,6 +49,9 @@ impl fmt::Display for OpenError {
             // A type has only safe characters, and is short.
             Self::NoApplication(mime) => write!(f, "no application opens {mime}"),
             Self::LinkWithoutUrl(path) => write!(f, "{}: a link without URL", shown_path(path)),
+            Self::UnsupportedEncoding(path) => {
+                write!(f, "{}: a link in an unsupported encoding", shown_path(path))
+            }
             Self::Launch(err) => err.fmt(f),
         }
     }
@@ -59,8 +73,12 @@ impl std::error::Error for OpenError {
 /// - A file's type comes from the MIME database (by name and contents); a
 ///   desktop entry of `Type=Link` is followed to its `URL`, unless it is
 ///   larger than `apps`' [`Limits::max_file_len`](crate::Limits::max_file_len).
-/// - A `file:` URI is a file; any other URI has the type
-///   `x-scheme-handler/<scheme>`.
+///   A link in an unsupported `Encoding` is an error.
+/// - A URI without a scheme or with a raw NUL is refused first
+///   ([`OpenError::BadUri`]). A `file:` URI is a file; any other URI has
+///   the type `x-scheme-handler/<scheme>`.
+/// - The default application is [`MimeApps::default_for`]'s, which may have
+///   no `Exec`: then the error is [`LaunchError::NoExec`].
 ///
 /// # Errors
 ///
@@ -85,7 +103,13 @@ fn plan(
             Err(link) => return Ok(link),
         },
         Target::Uri(uri) => {
-            let scheme = scheme(uri).ok_or_else(|| OpenError::BadUri(uri.clone()))?;
+            // The check `prepare_launch` makes on every URI it passes, made
+            // here on the URI as given: before a `file:` URI's query is
+            // dropped or a link followed, and also for an application that
+            // takes no targets.
+            let scheme = scheme(uri)
+                .filter(|_| !uri.contains('\0'))
+                .ok_or_else(|| OpenError::BadUri(uri.clone()))?;
             if scheme == "file" {
                 let path = file_uri_path(uri).ok_or_else(|| OpenError::BadUri(uri.clone()))?;
                 match file(&path, apps, options, follow_links)? {
@@ -122,6 +146,11 @@ fn file(
         && let Ok(entry) = DesktopEntry::read_with_limits(path, &apps.limits().for_entries())
         && entry.entry_type() == Some(EntryType::Link)
     {
+        // Checked for links only: another entry in such an encoding is still
+        // a file of its type.
+        if !entry.supports_encoding() {
+            return Err(OpenError::UnsupportedEncoding(path.to_owned()));
+        }
         let url = entry
             .url()
             .ok_or_else(|| OpenError::LinkWithoutUrl(path.to_owned()))?;

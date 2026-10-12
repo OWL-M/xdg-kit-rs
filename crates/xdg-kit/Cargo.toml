@@ -5,6 +5,13 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+# A link to the workspace's README, so that its doctests (src/lib.rs) also
+# find it in the packaged crate.
+readme = "README.md"
+documentation = "https://docs.rs/xdg-kit"
+keywords = ["xdg", "freedesktop", "mime", "desktop-entry", "mimeapps"]
+categories = ["os::unix-apis", "filesystem", "parser-implementations", "config"]
 
 [features]
 default = ["basedir", "desktop-entry", "locale", "mime", "mime-apps"]

@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use xdg_kit_basedir::{BaseDirs, FileStamp};
 
 use crate::fnmatch::Pattern;
-use crate::merge::{self, Bytes, Merged, Ranked};
+use crate::merge::{self, Merged, Ranked};
 use crate::model::{Folder, Glob, MagicRule};
 use crate::read::{cache, text};
 use crate::work;
@@ -336,17 +336,30 @@ fn host_order(bytes: &[u8], word_size: u32) -> Vec<u8> {
         .collect()
 }
 
+/// `matchlets` in host order, each copied once.
 pub(crate) fn to_host(matchlets: &[crate::model::Matchlet]) -> Vec<crate::model::Matchlet> {
     matchlets
         .iter()
-        .map(|matchlet| crate::model::Matchlet {
-            value: host_order(&matchlet.value, matchlet.word_size),
-            mask: matchlet
-                .mask
-                .as_ref()
-                .map(|mask| host_order(mask, matchlet.word_size)),
-            children: to_host(&matchlet.children),
-            ..matchlet.clone()
+        .map(|matchlet| {
+            // Every field named, so a new one is not left out.
+            let crate::model::Matchlet {
+                start,
+                range,
+                word_size,
+                value,
+                mask,
+                children,
+            } = matchlet;
+            // The matchlet, and each byte of its value and mask copied.
+            work::count(1 + value.len() + mask.as_ref().map_or(0, Vec::len));
+            crate::model::Matchlet {
+                start: *start,
+                range: *range,
+                word_size: *word_size,
+                value: host_order(value, *word_size),
+                mask: mask.as_ref().map(|mask| host_order(mask, *word_size)),
+                children: to_host(children),
+            }
         })
         .collect()
 }
@@ -441,8 +454,12 @@ impl MimeDatabase {
         Self::from_candidates(candidates, limits)
     }
 
-    /// Loads the database from exactly `dirs`, each a `mime` folder, most
-    /// important first.
+    /// Loads the database from exactly `dirs`, each a `mime` folder, in
+    /// priority order, highest first. Converts relative paths to absolute paths now, without
+    /// following links. Later changes to the working directory do not change
+    /// their location, including during [`MimeDatabase::refresh`] or when
+    /// reading a description later. Keeps the supplied path if conversion
+    /// fails because it is empty or the current directory is gone.
     #[must_use]
     pub fn from_dirs(dirs: impl IntoIterator<Item = impl Into<PathBuf>>) -> Self {
         Self::from_dirs_with(dirs, &Limits::default())
@@ -456,7 +473,18 @@ impl MimeDatabase {
         dirs: impl IntoIterator<Item = impl Into<PathBuf>>,
         limits: &Limits,
     ) -> Self {
-        Self::from_candidates(dirs.into_iter().map(Into::into).collect(), limits)
+        let dirs = dirs
+            .into_iter()
+            .map(|dir| {
+                // Absolute now, so that a later change of folder does not
+                // move it; as given when it cannot be. Each byte copied.
+                let dir = dir.into();
+                let dir = std::path::absolute(&dir).unwrap_or(dir);
+                work::count(dir.as_os_str().len());
+                dir
+            })
+            .collect();
+        Self::from_candidates(dirs, limits)
     }
 
     /// The limits it was read within.
@@ -505,8 +533,9 @@ impl MimeDatabase {
             .magic
             .iter()
             .map(|ranked: &Ranked<MagicRule>| {
-                // Each byte copied.
-                work::count_by(|| 1 + ranked.rule.bytes());
+                // The type copied (shared: one step); `to_host` counts
+                // the matchlets.
+                work::count(1);
                 IndexedMagic {
                     mime: ranked.rule.mime.clone(),
                     matchlets: to_host(&ranked.rule.matchlets),
@@ -597,7 +626,8 @@ impl MimeDatabase {
         Some(Self::assemble(stamped, folders, self.limits))
     }
 
-    /// The `mime` folders read, most important first.
+    /// The `mime` folders read, most important first, made absolute when
+    /// given.
     #[must_use]
     pub fn dirs(&self) -> Vec<&Path> {
         self.folders
@@ -811,9 +841,10 @@ impl MimeDatabase {
     }
 
     /// Lists types as [`MimeDatabase::all_types`] does, with diagnostics for
-    /// failures to open or fully list folders of `MEDIA/SUBTYPE.xml` files.
-    /// Missing folders are not reported. Entries read before a listing error
-    /// are kept.
+    /// failures to open or fully list folders of `MEDIA/SUBTYPE.xml` files,
+    /// and for a folder or link in them that cannot be checked (an error
+    /// other than its absence). Missing folders are not reported. Entries
+    /// read before a listing error are kept.
     #[must_use]
     pub fn all_types_with_diagnostics(&self) -> (Vec<MimeType>, Vec<Diagnostic>) {
         let mut all: Vec<MimeType> = Vec::new();
@@ -832,8 +863,8 @@ impl MimeDatabase {
     /// The per-type XML of `mime`, read on first use. The files are read
     /// without holding the lock; only types that have a file are kept, so
     /// asking about made-up types does not grow the cache. An answer from
-    /// a folder listing that failed is not kept either, so the next lookup
-    /// lists again.
+    /// a folder listing that failed, or from a path that could not be
+    /// checked, is not kept either, so the next lookup looks again.
     ///
     /// Each folder's file is looked up by the spellings the folder
     /// registers for the type ([`registered`]), then by the lowercase
@@ -871,7 +902,7 @@ impl MimeDatabase {
         // Not kept after a listing error: the next lookup lists again.
         let listed = listing.is_empty();
         let info = Arc::new(TypeInfo::read(paths, listing, &self.limits));
-        if !info.found() || !listed {
+        if !info.found() || !listed || info.unchecked() {
             return info;
         }
         // Hashed, compared and kept.
@@ -894,7 +925,7 @@ fn registered(
     if let Some(types) = &loaded.folder.types {
         spellings_in(types, mime, false)
     } else {
-        let types = crate::xml::types_in_media(&loaded.dir, mime.media(), diagnostics, stamps);
+        let types = crate::xml::types_in_media(&loaded.dir, mime, diagnostics, stamps);
         spellings_in(&types, mime, true)
     }
 }
@@ -1072,6 +1103,30 @@ mod tests {
     }
 
     #[test]
+    fn to_host_counts_each_matchlet_and_byte_copied() {
+        use crate::model::Matchlet;
+        // A chain 200 deep; values of 1 to 7 bytes, every third unmasked.
+        let mut chain = Vec::new();
+        let mut expected = 0;
+        for depth in (0..200_usize).rev() {
+            let value = vec![0; 1 + depth % 7];
+            let mask = (depth % 3 != 0).then(|| vec![0xff; value.len()]);
+            expected += 1 + value.len() + mask.as_ref().map_or(0, Vec::len);
+            chain = vec![Matchlet {
+                start: 0,
+                range: 1,
+                word_size: 1,
+                value,
+                mask,
+                children: chain,
+            }];
+        }
+        let (copied, steps) = work::steps(|| to_host(&chain));
+        assert_eq!(copied, chain);
+        assert_eq!(steps, expected);
+    }
+
+    #[test]
     fn listing_errors_reach_the_type_list_and_the_lookup() {
         use crate::xml::LISTING_FAULT;
         let dir = tempfile::tempdir().unwrap();
@@ -1131,6 +1186,364 @@ mod tests {
         assert!(fresh.diagnostics().is_empty(), "{:?}", fresh.diagnostics());
         assert!(Arc::ptr_eq(&fresh, &db.type_info(&plain)));
         assert!(db.type_diagnostics(&png).is_empty());
+    }
+
+    /// A per-type file whose comment is `comment`.
+    fn per_type(comment: &str) -> String {
+        format!(
+            r#"<mime-type xmlns="http://www.freedesktop.org/standards/shared-mime-info"><comment>{comment}</comment></mime-type>"#
+        )
+    }
+
+    /// Sets `path`'s mode.
+    fn chmod(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// Asks `db` about `text/plain` while `locked` is at mode 000: its
+    /// description, its diagnostics and whether the answer was kept. `None`
+    /// when `probe` can be looked at anyway (root).
+    fn asked_while_locked(
+        db: &MimeDatabase,
+        locked: &Path,
+        probe: &Path,
+    ) -> Option<(Option<String>, Vec<Diagnostic>, bool)> {
+        asked_about(db, &MimeType::new("text/plain").unwrap(), locked, probe)
+    }
+
+    /// Asks `db` about `mime` as [`asked_while_locked`] does.
+    fn asked_about(
+        db: &MimeDatabase,
+        mime: &MimeType,
+        locked: &Path,
+        probe: &Path,
+    ) -> Option<(Option<String>, Vec<Diagnostic>, bool)> {
+        chmod(locked, 0o000);
+        if fs::metadata(probe).is_ok() {
+            chmod(locked, 0o755);
+            eprintln!("a locked folder can be looked into (root?): not checked");
+            return None;
+        }
+        let description = db.description(mime, &crate::Locales::untranslated());
+        let diagnostics = db.type_diagnostics(mime);
+        let kept = !db.descriptions.lock().unwrap().is_empty();
+        chmod(locked, 0o755);
+        Some((description, diagnostics, kept))
+    }
+
+    /// "cannot be read: " and the error for a refused lookup.
+    fn refused() -> String {
+        let err = io::Error::from_raw_os_error(rustix::io::Errno::ACCESS.raw_os_error());
+        format!("cannot be read: {err}")
+    }
+
+    #[test]
+    fn a_per_type_file_that_cannot_be_checked_is_reported_and_not_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = dir.path().join("text");
+        fs::create_dir(&text).unwrap();
+        fs::write(text.join("plain.xml"), per_type("Text")).unwrap();
+        fs::write(dir.path().join("types"), "text/plain\n").unwrap();
+        let db = MimeDatabase::from_dirs([dir.path()]);
+        let file = text.join("plain.xml");
+        let Some(asked) = asked_while_locked(&db, &text, &file) else {
+            return;
+        };
+        assert_eq!(
+            asked,
+            (None, vec![Diagnostic::new(&file, None, refused())], false)
+        );
+        let plain = m("text/plain");
+        let un = crate::Locales::untranslated();
+        assert_eq!(db.description(&plain, &un).as_deref(), Some("Text"));
+        // With a less important folder that has the file, its answer is not
+        // kept either.
+        let low = tempfile::tempdir().unwrap();
+        fs::create_dir(low.path().join("text")).unwrap();
+        fs::write(low.path().join("text/plain.xml"), per_type("Low")).unwrap();
+        let db = MimeDatabase::from_dirs([dir.path(), low.path()]);
+        let Some(asked) = asked_while_locked(&db, &text, &file) else {
+            return;
+        };
+        assert_eq!(
+            asked,
+            (
+                Some("Low".to_owned()),
+                vec![Diagnostic::new(&file, None, refused())],
+                false
+            )
+        );
+        assert_eq!(db.description(&plain, &un).as_deref(), Some("Text"));
+    }
+
+    #[test]
+    fn a_media_folder_that_cannot_be_checked_is_reported_and_not_kept() {
+        // No `types` file: the folder's names are listed. `text` is a link
+        // into a locked folder.
+        let dir = tempfile::tempdir().unwrap();
+        let locked = dir.path().join("locked");
+        fs::create_dir_all(locked.join("text")).unwrap();
+        fs::write(locked.join("text/plain.xml"), per_type("Text")).unwrap();
+        let text = dir.path().join("text");
+        std::os::unix::fs::symlink("locked/text", &text).unwrap();
+        let db = MimeDatabase::from_dirs([dir.path()]);
+        let Some(asked) = asked_while_locked(&db, &locked, &text) else {
+            return;
+        };
+        assert_eq!(
+            asked,
+            (
+                None,
+                vec![
+                    Diagnostic::new(&text, None, refused()),
+                    Diagnostic::new(text.join("plain.xml"), None, refused()),
+                ],
+                false
+            )
+        );
+        let un = crate::Locales::untranslated();
+        assert_eq!(
+            db.description(&m("text/plain"), &un).as_deref(),
+            Some("Text")
+        );
+    }
+
+    #[test]
+    fn a_linked_per_type_file_that_cannot_be_checked_is_reported_once_and_not_kept() {
+        // No `types` file: the folder's names are listed. `text/plain.xml`
+        // is a link into a locked folder; looked at by the listing, then
+        // by the lookup, it is reported once.
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let locked = outside.path().join("locked");
+        fs::create_dir(&locked).unwrap();
+        fs::write(locked.join("plain.xml"), per_type("Text")).unwrap();
+        let text = dir.path().join("text");
+        fs::create_dir(&text).unwrap();
+        let file = text.join("plain.xml");
+        std::os::unix::fs::symlink(locked.join("plain.xml"), &file).unwrap();
+        let db = MimeDatabase::from_dirs([dir.path()]);
+        let Some(asked) = asked_while_locked(&db, &locked, &file) else {
+            return;
+        };
+        assert_eq!(
+            asked,
+            (None, vec![Diagnostic::new(&file, None, refused())], false)
+        );
+        let un = crate::Locales::untranslated();
+        assert_eq!(
+            db.description(&m("text/plain"), &un).as_deref(),
+            Some("Text")
+        );
+        // The type list reports it too.
+        chmod(&locked, 0o000);
+        let (types, diagnostics) = db.all_types_with_diagnostics();
+        chmod(&locked, 0o755);
+        assert!(!types.contains(&m("text/plain")), "{types:?}");
+        assert_eq!(diagnostics, [Diagnostic::new(&file, None, refused())]);
+    }
+
+    #[test]
+    fn an_entry_that_cannot_be_checked_concerns_only_its_own_type() {
+        // No `types` file: the media folder is listed for each lookup.
+        // `text/other.xml` is a link into a locked folder: only a lookup of
+        // `text/other` gets its diagnostic and is not kept.
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let locked = outside.path().join("locked");
+        fs::create_dir(&locked).unwrap();
+        fs::write(locked.join("other.xml"), per_type("Other")).unwrap();
+        let text = dir.path().join("text");
+        fs::create_dir(&text).unwrap();
+        fs::write(text.join("plain.xml"), per_type("Text")).unwrap();
+        let other = text.join("other.xml");
+        std::os::unix::fs::symlink(locked.join("other.xml"), &other).unwrap();
+        let db = MimeDatabase::from_dirs([dir.path()]);
+        let un = crate::Locales::untranslated();
+        let kept = |mime: &MimeType| db.descriptions.lock().unwrap().contains_key(mime);
+        let (plain, made_up) = (m("text/plain"), m("text/other"));
+        chmod(&locked, 0o000);
+        if fs::metadata(&other).is_ok() {
+            chmod(&locked, 0o755);
+            eprintln!("a locked folder can be looked into (root?): not checked");
+            return;
+        }
+        let asked = (
+            db.description(&plain, &un),
+            db.type_diagnostics(&plain),
+            kept(&plain),
+            db.description(&made_up, &un),
+            db.type_diagnostics(&made_up),
+            kept(&made_up),
+        );
+        let (_, listed) = db.all_types_with_diagnostics();
+        chmod(&locked, 0o755);
+        assert_eq!(
+            asked,
+            (
+                Some("Text".to_owned()),
+                Vec::new(),
+                true,
+                None,
+                vec![Diagnostic::new(&other, None, refused())],
+                false
+            )
+        );
+        assert_eq!(listed, [Diagnostic::new(&other, None, refused())]);
+        // Kept: an edit is not seen without `refresh`.
+        fs::write(text.join("plain.xml"), per_type("Changed")).unwrap();
+        assert_eq!(db.description(&plain, &un).as_deref(), Some("Text"));
+    }
+
+    #[test]
+    fn an_entry_in_another_case_that_cannot_be_checked_is_the_types() {
+        // `text/Plain.xml` names `text/plain` too, but is not a candidate
+        // `TypeInfo::read` looks at: only the listing sees it. Its error is
+        // the lookup's, which is not kept: once it can be read, it gives the
+        // answer (registered spellings come first, in byte order), and
+        // nothing a stamp sees has changed.
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let locked = outside.path().join("locked");
+        fs::create_dir(&locked).unwrap();
+        fs::write(locked.join("t.xml"), per_type("Linked")).unwrap();
+        let text = dir.path().join("text");
+        fs::create_dir(&text).unwrap();
+        fs::write(text.join("plain.xml"), per_type("Hi")).unwrap();
+        let entry = text.join("Plain.xml");
+        std::os::unix::fs::symlink(locked.join("t.xml"), &entry).unwrap();
+        let db = MimeDatabase::from_dirs([dir.path()]);
+        let Some(asked) = asked_while_locked(&db, &locked, &entry) else {
+            return;
+        };
+        assert_eq!(
+            asked,
+            (
+                Some("Hi".to_owned()),
+                vec![Diagnostic::new(&entry, None, refused())],
+                false
+            )
+        );
+        let un = crate::Locales::untranslated();
+        assert_eq!(
+            db.description(&m("text/plain"), &un).as_deref(),
+            Some("Linked")
+        );
+    }
+
+    #[test]
+    fn an_entry_in_a_media_folder_in_another_case_that_cannot_be_checked_is_the_types() {
+        // `Text/plain.xml` names `text/plain` too; only the listing sees it.
+        // Its error is the lookup's, which is not kept (as above).
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let locked = outside.path().join("locked");
+        fs::create_dir(&locked).unwrap();
+        fs::write(locked.join("t.xml"), per_type("Linked")).unwrap();
+        let text = dir.path().join("text");
+        fs::create_dir(&text).unwrap();
+        fs::write(text.join("plain.xml"), per_type("Hi")).unwrap();
+        let un = crate::Locales::untranslated();
+        let high = tempfile::tempdir().unwrap();
+        let media = high.path().join("Text");
+        fs::create_dir(&media).unwrap();
+        let entry = media.join("plain.xml");
+        std::os::unix::fs::symlink(locked.join("t.xml"), &entry).unwrap();
+        let db = MimeDatabase::from_dirs([high.path(), dir.path()]);
+        let Some(asked) = asked_while_locked(&db, &locked, &entry) else {
+            return;
+        };
+        assert_eq!(
+            asked,
+            (
+                Some("Hi".to_owned()),
+                vec![Diagnostic::new(&entry, None, refused())],
+                false
+            )
+        );
+        assert_eq!(
+            db.description(&m("text/plain"), &un).as_deref(),
+            Some("Linked")
+        );
+    }
+
+    #[test]
+    fn checking_whose_an_entry_error_is_is_counted() {
+        // Two folders alike but for `text/x-other.xml`, a link into a locked
+        // folder in one (an error) and to nothing in the other (absent).
+        // Looking up `text/plain` costs one more step, and the bytes of
+        // `text/x-other` compared, for the error.
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let locked = outside.path().join("locked");
+        fs::create_dir(&locked).unwrap();
+        fs::write(locked.join("t.xml"), per_type("Other")).unwrap();
+        let folder = |name: &str, target: &Path| {
+            let text = dir.path().join(name).join("text");
+            fs::create_dir_all(&text).unwrap();
+            fs::write(text.join("plain.xml"), per_type("Hi")).unwrap();
+            std::os::unix::fs::symlink(target, text.join("x-other.xml")).unwrap();
+            MimeDatabase::from_dirs([dir.path().join(name)])
+        };
+        let erring = folder("e", &locked.join("t.xml"));
+        let absent = folder("a", &outside.path().join("gone"));
+        let plain = m("text/plain");
+        chmod(&locked, 0o000);
+        if fs::metadata(locked.join("t.xml")).is_ok() {
+            chmod(&locked, 0o755);
+            eprintln!("a locked folder can be looked into (root?): not checked");
+            return;
+        }
+        let (erring, more) = work::steps(|| erring.type_info(&plain));
+        let (absent, fewer) = work::steps(|| absent.type_info(&plain));
+        chmod(&locked, 0o755);
+        assert!(erring.diagnostics().is_empty() && absent.diagnostics().is_empty());
+        assert_eq!(more - fewer, 1 + "text/x-other".len());
+    }
+
+    #[test]
+    fn a_candidate_that_cannot_be_checked_ends_its_folders_search() {
+        // As a file that cannot be read does: the folder's next candidate,
+        // the lowercase name, is not tried.
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let locked = outside.path().join("locked");
+        fs::create_dir(&locked).unwrap();
+        fs::write(locked.join("x-Mixed.xml"), per_type("Linked")).unwrap();
+        let application = dir.path().join("application");
+        fs::create_dir(&application).unwrap();
+        let first = application.join("x-Mixed.xml");
+        std::os::unix::fs::symlink(locked.join("x-Mixed.xml"), &first).unwrap();
+        fs::write(application.join("x-mixed.xml"), per_type("Lowercase")).unwrap();
+        fs::write(dir.path().join("types"), "application/x-Mixed\n").unwrap();
+        let db = MimeDatabase::from_dirs([dir.path()]);
+        let Some((description, diagnostics, kept)) =
+            asked_about(&db, &m("application/x-mixed"), &locked, &first)
+        else {
+            return;
+        };
+        assert_eq!(description, None);
+        assert_eq!(diagnostics, [Diagnostic::new(&first, None, refused())]);
+        assert!(!kept);
+    }
+
+    #[test]
+    fn a_media_folder_that_is_a_file_holds_no_type() {
+        // `text` is a file: `text/plain.xml` is absent (`NotADirectory`),
+        // not an error, so the less important folder's answer is kept.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("types"), "text/plain\n").unwrap();
+        fs::write(dir.path().join("text"), "").unwrap();
+        let low = tempfile::tempdir().unwrap();
+        fs::create_dir(low.path().join("text")).unwrap();
+        fs::write(low.path().join("text/plain.xml"), per_type("Low")).unwrap();
+        let db = MimeDatabase::from_dirs([dir.path(), low.path()]);
+        let plain = m("text/plain");
+        let un = crate::Locales::untranslated();
+        assert_eq!(db.description(&plain, &un).as_deref(), Some("Low"));
+        assert!(db.type_diagnostics(&plain).is_empty());
+        assert!(db.descriptions.lock().unwrap().contains_key(&plain));
     }
 
     #[test]
@@ -1392,6 +1805,73 @@ mod tests {
             // for each of its thirteen paths and as a candidate, hashed
             // and compared twice).
             |items, bytes| 2 * (150 * items + 18 * bytes),
+        );
+    }
+
+    /// A `magic` file with one rule for `text/x-a`: a line per depth in
+    /// `depths`, each an eight-byte value with a mask.
+    fn magic_of(depths: impl IntoIterator<Item = usize>) -> Vec<u8> {
+        let mut file = b"MIME-Magic\0\n[50:text/x-a]\n".to_vec();
+        for depth in depths {
+            file.extend_from_slice(format!("{depth}>0=").as_bytes());
+            file.extend_from_slice(b"\0\x08abcdefgh&\xff\xff\xff\xff\xff\xff\xff\xff\n");
+        }
+        file
+    }
+
+    /// Loads a folder holding only `magic` within [`Limits::unlimited`],
+    /// counting the steps, and returns its one rule's matchlets.
+    fn magic_loaded(dir: &Path, magic: &[u8]) -> (Vec<crate::model::Matchlet>, usize) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join("magic"), magic).unwrap();
+        let (db, steps) = work::steps(|| MimeDatabase::from_dirs_with([dir], &Limits::unlimited()));
+        assert!(db.diagnostics().is_empty(), "{:?}", db.diagnostics());
+        let [rule] = &db.magic[..] else {
+            panic!("{} rules", db.magic.len())
+        };
+        (rule.matchlets.clone(), steps)
+    }
+
+    #[test]
+    fn nested_magic_is_loaded_in_linear_time() {
+        let root = tempfile::tempdir().unwrap();
+        // Twice the analysed cost. A line is a matchlet with 16 bytes of
+        // value and mask: 4 steps, plus 4 per byte (copied and hashed
+        // when merged, copied to host order), 68 in all. A byte of the
+        // folder's path: 12 (a path made and stamped for each file).
+        // About 200 more.
+        let bound = |lines, path| 2 * (200 + 12 * path + 68 * lines);
+        work::assert_linear(
+            300,
+            |n| {
+                let magic = magic_of(0..n);
+                let dir = root.path().join(format!("deep{n}/mime"));
+                let (matchlets, steps) = magic_loaded(&dir, &magic);
+                let mut depth = 0;
+                let mut level = &matchlets;
+                while let [only] = &level[..] {
+                    depth += 1;
+                    level = &only.children;
+                }
+                assert_eq!((depth, level.len()), (n, 0));
+                (steps, dir.as_os_str().len())
+            },
+            bound,
+        );
+        work::assert_linear(
+            1000,
+            |n| {
+                let magic = magic_of(std::iter::once(0).chain((0..n).map(|_| 1)));
+                let dir = root.path().join(format!("wide{n}/mime"));
+                let (matchlets, steps) = magic_loaded(&dir, &magic);
+                let [only] = &matchlets[..] else {
+                    panic!("{} matchlets", matchlets.len())
+                };
+                assert_eq!(only.children.len(), n);
+                (steps, dir.as_os_str().len())
+            },
+            // A line at depth 0 and `n` under it.
+            |n, path| bound(n + 1, path),
         );
     }
 

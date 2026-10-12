@@ -9,7 +9,20 @@ use crate::error::quoted;
 use crate::paths::{check_relative, normalize};
 use crate::runtime::{self, RuntimeDirProblem};
 use crate::work;
-use crate::{Diagnostic, Error};
+use crate::{Diagnostic, Error, Limits};
+
+/// What [`BaseDirs::read_config`] and [`BaseDirs::read_data`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ReadFile {
+    /// The most important file that could be read, and its contents;
+    /// `None` when no folder has one.
+    pub file: Option<(PathBuf, Vec<u8>)>,
+    /// The files skipped because they may not be read, most important
+    /// first: those before `file`, or every one when `file` is `None`.
+    /// Missing files are not listed.
+    pub skipped: Vec<Diagnostic>,
+}
 
 const DEFAULT_DATA_DIRS: &[&str] = &["/usr/local/share", "/usr/share"];
 const DEFAULT_CONFIG_DIRS: &[&str] = &["/etc/xdg"];
@@ -171,7 +184,8 @@ impl BaseDirs {
     /// The most important existing `rel` under the data directories:
     /// `$XDG_DATA_HOME`, then each of `$XDG_DATA_DIRS`. A folder is searched
     /// once, even when it is listed again, and the search stops at the
-    /// first file found.
+    /// first file found. Only checks that the file exists, not that it can
+    /// be read: [`BaseDirs::read_data`] reads the first that can be.
     ///
     /// # Errors
     ///
@@ -194,7 +208,9 @@ impl BaseDirs {
     /// The most important existing `rel` under the config directories:
     /// `$XDG_CONFIG_HOME`, then each of `$XDG_CONFIG_DIRS`. A folder is
     /// searched once, even when it is listed again, and the search stops
-    /// at the first file found.
+    /// at the first file found. Only checks that the file exists, not that
+    /// it can be read: [`BaseDirs::read_config`] reads the first that can
+    /// be.
     ///
     /// # Errors
     ///
@@ -213,6 +229,78 @@ impl BaseDirs {
     /// or names nothing (empty, or just `.`).
     pub fn config_files(&self, rel: impl AsRef<Path>) -> Result<Vec<PathBuf>, Error> {
         Ok(existing(&self.config_home, &self.config_dirs, rel.as_ref())?.collect())
+    }
+
+    /// Reads the highest-priority readable `rel` under the data directories,
+    /// in [`BaseDirs::find_data`]'s order, within the default [`Limits`].
+    ///
+    /// As the spec requires, skips a folder whose file is missing or may not
+    /// be read: missing files or folders (`NotFound`, `NotADirectory`)
+    /// silently, permission failures
+    /// ([`io::ErrorKind::PermissionDenied`](std::io::ErrorKind::PermissionDenied))
+    /// with a diagnostic in [`ReadFile::skipped`]. Every other
+    /// failure stops the search, including an overlong name or a link loop in
+    /// any path component. A damaged file is never silently passed over for a
+    /// lower-priority one.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidRelativePath`] for a bad `rel`; [`Error::Io`] when a
+    /// file cannot be read for another reason ([`crate::read_regular_file`]:
+    /// not a regular file, too large, a name too long, a link loop, an I/O
+    /// error).
+    pub fn read_data(&self, rel: impl AsRef<Path>) -> Result<ReadFile, Error> {
+        self.read_data_with(rel, &Limits::default())
+    }
+
+    /// As [`BaseDirs::read_data`], within `limits`.
+    ///
+    /// # Errors
+    ///
+    /// As [`BaseDirs::read_data`].
+    pub fn read_data_with(
+        &self,
+        rel: impl AsRef<Path>,
+        limits: &Limits,
+    ) -> Result<ReadFile, Error> {
+        first_readable(&self.data_home, &self.data_dirs, rel.as_ref(), limits)
+    }
+
+    /// As [`BaseDirs::read_data`], under the config directories, in
+    /// [`BaseDirs::find_config`]'s order.
+    ///
+    /// ```no_run
+    /// use xdg_kit_basedir::BaseDirs;
+    ///
+    /// let dirs = BaseDirs::from_env()?;
+    /// let read = dirs.read_config("app/settings.ini")?;
+    /// for skipped in &read.skipped {
+    ///     eprintln!("{skipped:?}");
+    /// }
+    /// if let Some((path, bytes)) = read.file {
+    ///     println!("{}: {} bytes", path.display(), bytes.len());
+    /// }
+    /// # Ok::<(), xdg_kit_basedir::Error>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// As [`BaseDirs::read_data`].
+    pub fn read_config(&self, rel: impl AsRef<Path>) -> Result<ReadFile, Error> {
+        self.read_config_with(rel, &Limits::default())
+    }
+
+    /// As [`BaseDirs::read_config`], within `limits`.
+    ///
+    /// # Errors
+    ///
+    /// As [`BaseDirs::read_data`].
+    pub fn read_config_with(
+        &self,
+        rel: impl AsRef<Path>,
+        limits: &Limits,
+    ) -> Result<ReadFile, Error> {
+        first_readable(&self.config_home, &self.config_dirs, rel.as_ref(), limits)
     }
 
     /// The path to write `rel` under `$XDG_DATA_HOME`, creating missing
@@ -354,6 +442,55 @@ fn existing<'a>(
     dirs: &'a [PathBuf],
     rel: &'a Path,
 ) -> Result<impl Iterator<Item = PathBuf> + 'a, Error> {
+    // Only a path whose stat succeeds: one whose stat fails, for whatever
+    // reason (missing, a folder on the way that may not be searched, a
+    // link loop), is skipped. Whether the file can be read is not checked;
+    // `first_readable` does that.
+    Ok(candidates(home, dirs, rel)?.filter(|path| matches!(path.try_exists(), Ok(true))))
+}
+
+/// Reads the first of [`candidates`] that can be read, within `limits`
+/// ([`BaseDirs::read_data`]).
+fn first_readable(
+    home: &Path,
+    dirs: &[PathBuf],
+    rel: &Path,
+    limits: &Limits,
+) -> Result<ReadFile, Error> {
+    use std::io::ErrorKind;
+    let mut skipped = Vec::new();
+    for path in candidates(home, dirs, rel)? {
+        match crate::read_regular_file_with(&path, limits.max_file_len) {
+            Ok(bytes) => {
+                return Ok(ReadFile {
+                    file: Some((path, bytes)),
+                    skipped,
+                });
+            }
+            Err(err) if matches!(err.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {}
+            Err(err) if err.kind() == ErrorKind::PermissionDenied => {
+                skipped.push(Diagnostic::file(
+                    path,
+                    None,
+                    format!("cannot be read: {err}"),
+                ));
+            }
+            Err(source) => return Err(Error::Io { path, source }),
+        }
+    }
+    Ok(ReadFile {
+        file: None,
+        skipped,
+    })
+}
+
+/// Yields the paths of `rel` under `home`, then `dirs`, in order of
+/// importance, each folder once.
+fn candidates<'a>(
+    home: &'a Path,
+    dirs: &'a [PathBuf],
+    rel: &'a Path,
+) -> Result<impl Iterator<Item = PathBuf> + 'a, Error> {
     check_relative(rel)?;
     // The list already has no duplicates. Search home first and skip any
     // matching list entry.
@@ -367,9 +504,7 @@ fn existing<'a>(
             // The folder, compared with home, then joined with `rel`.
             work::count(1 + 2 * base.as_os_str().len() + rel.as_os_str().len());
             base.join(rel)
-        })
-        // A path that cannot be checked is skipped, as the spec says.
-        .filter(|path| matches!(path.try_exists(), Ok(true))))
+        }))
 }
 
 fn place(base: &Path, rel: &Path) -> Result<PathBuf, Error> {
@@ -392,6 +527,7 @@ fn place(base: &Path, rel: &Path) -> Result<PathBuf, Error> {
 mod tests {
     use std::collections::HashMap;
     use std::fs;
+    use std::io;
     use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::PermissionsExt;
 
@@ -762,6 +898,137 @@ mod tests {
         let (few, many) = (steps(1), steps(1000));
         assert_eq!((few.0, few.1), (many.0, many.1));
         assert!(many.2 > few.2 + 1000, "{few:?} {many:?}");
+    }
+
+    /// Base directories under `root`: homes `config` and `data`, then
+    /// `sys-config` and `sys-data`.
+    fn under(root: &Path) -> BaseDirs {
+        let p = |name: &str| root.join(name).into_os_string().into_vec();
+        dirs(&[
+            ("HOME", b"/home/u"),
+            ("XDG_CONFIG_HOME", &p("config")),
+            ("XDG_CONFIG_DIRS", &p("sys-config")),
+            ("XDG_DATA_HOME", &p("data")),
+            ("XDG_DATA_DIRS", &p("sys-data")),
+        ])
+        .unwrap()
+    }
+
+    /// Both readers: of config files and of data files, within `limits`.
+    type Reader = fn(&BaseDirs, &str, &Limits) -> Result<ReadFile, Error>;
+    const READERS: [(&str, Reader); 2] = [
+        ("config", |dirs, rel, limits| {
+            dirs.read_config_with(rel, limits)
+        }),
+        ("data", |dirs, rel, limits| dirs.read_data_with(rel, limits)),
+    ];
+
+    fn write(path: &Path, bytes: &[u8]) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn reading_skips_a_file_that_may_not_be_read_and_reports_it() {
+        for (kind, read) in READERS {
+            let root = tempfile::tempdir().unwrap();
+            let dirs = under(root.path());
+            let user = root.path().join(format!("{kind}/app/a.conf"));
+            let system = root.path().join(format!("sys-{kind}/app/a.conf"));
+            write(&user, b"user");
+            write(&system, b"system");
+            fs::set_permissions(&user, fs::Permissions::from_mode(0o000)).unwrap();
+            if fs::read(&user).is_ok() {
+                eprintln!("an unreadable file can be read (root?): not checked");
+                return;
+            }
+            let found = read(&dirs, "app/a.conf", &Limits::default()).unwrap();
+            let refused = fs::read(&user).unwrap_err().to_string();
+            assert_eq!(found.file, Some((system, b"system".to_vec())), "{kind}");
+            assert_eq!(
+                found.skipped,
+                [Diagnostic::file(
+                    user,
+                    None,
+                    format!("cannot be read: {refused}")
+                )],
+                "{kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn reading_skips_a_missing_file_or_folder_without_a_report() {
+        for (kind, read) in READERS {
+            let root = tempfile::tempdir().unwrap();
+            let dirs = under(root.path());
+            let system = root.path().join(format!("sys-{kind}/app/a.conf"));
+            write(&system, b"system");
+            let found = read(&dirs, "app/a.conf", &Limits::default()).unwrap();
+            assert_eq!(found.file, Some((system.clone(), b"system".to_vec())));
+            assert!(found.skipped.is_empty(), "{:?}", found.skipped);
+            // A step on the way that is a file, not a folder.
+            write(&root.path().join(format!("{kind}/app")), b"");
+            let found = read(&dirs, "app/a.conf", &Limits::default()).unwrap();
+            assert_eq!(found.file, Some((system, b"system".to_vec())));
+            assert!(found.skipped.is_empty(), "{:?}", found.skipped);
+            // Nothing anywhere.
+            let found = read(&dirs, "app/none.conf", &Limits::default()).unwrap();
+            assert_eq!(found.file, None);
+            assert!(found.skipped.is_empty(), "{:?}", found.skipped);
+        }
+    }
+
+    #[test]
+    fn reading_stops_at_a_file_that_cannot_be_read_for_another_reason() {
+        for (kind, read) in READERS {
+            let root = tempfile::tempdir().unwrap();
+            let dirs = under(root.path());
+            let user = root.path().join(format!("{kind}/app/a.conf"));
+            write(
+                &root.path().join(format!("sys-{kind}/app/a.conf")),
+                b"system",
+            );
+            // A folder: not a regular file.
+            fs::create_dir_all(&user).unwrap();
+            let Err(Error::Io { path, source }) = read(&dirs, "app/a.conf", &Limits::default())
+            else {
+                panic!("{kind}: a folder gave no error");
+            };
+            assert_eq!(
+                (path, source.kind()),
+                (user.clone(), io::ErrorKind::InvalidInput)
+            );
+            // Too large.
+            fs::remove_dir(&user).unwrap();
+            write(&user, b"too long");
+            let limits = Limits {
+                max_file_len: Some(4),
+            };
+            let Err(Error::Io { path, source }) = read(&dirs, "app/a.conf", &limits) else {
+                panic!("{kind}: a file too large gave no error");
+            };
+            assert_eq!((path, source.kind()), (user, io::ErrorKind::FileTooLarge));
+            assert!(matches!(
+                read(&dirs, "../a.conf", &Limits::default()),
+                Err(Error::InvalidRelativePath(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn reading_without_limits_reads_as_with_the_default_ones() {
+        let root = tempfile::tempdir().unwrap();
+        let dirs = under(root.path());
+        write(&root.path().join("sys-config/a.conf"), b"c");
+        write(&root.path().join("sys-data/a.conf"), b"d");
+        let config = dirs.read_config("a.conf").unwrap().file.unwrap();
+        assert_eq!(
+            config,
+            (root.path().join("sys-config/a.conf"), b"c".to_vec())
+        );
+        let data = dirs.read_data("a.conf").unwrap().file.unwrap();
+        assert_eq!(data, (root.path().join("sys-data/a.conf"), b"d".to_vec()));
     }
 
     #[test]

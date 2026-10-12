@@ -3,8 +3,8 @@
 
 use std::borrow::Borrow;
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::ffi::OsStr;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
@@ -164,7 +164,7 @@ struct Level {
     /// The remaining entries in name order: each name and whether the listing
     /// identified it as a symbolic link. Keeping names instead of `DirEntry`
     /// values lets the listing's folder handle close.
-    entries: std::vec::IntoIter<(std::ffi::OsString, bool)>,
+    entries: std::vec::IntoIter<(OsString, bool)>,
     /// Its path relative to the root.
     relative: PathBuf,
     /// How deep it is below the root.
@@ -198,6 +198,11 @@ impl LinkStamp {
 /// diagnostics for each path. If paths produce the same ID and lead to the same
 /// file (device and inode), the file is listed once without a clash diagnostic.
 ///
+/// A `.desktop` file or a folder whose name is not UTF-8 is left out, with a
+/// diagnostic: a desktop file ID is a `String`, and read lossily the name
+/// could take the ID of another. `GLib` and `update-desktop-database` keep
+/// the name's bytes in the ID.
+///
 /// Links back to any ancestor folder are not followed. `GLib` and
 /// `update-desktop-database` follow these loops until the path is too long: one
 /// link produces dozens of IDs, and work grows exponentially with the number of
@@ -205,9 +210,12 @@ impl LinkStamp {
 ///
 /// Each root's walk stops with a diagnostic past [`Limits::max_listed`]
 /// entries listed, counted along every path. This bounds the
-/// work caused by links. A folder that cannot be listed in full also gets a
-/// diagnostic. This is an immutable snapshot; [`AppIndex::refresh`] returns a
-/// new one when files change.
+/// work caused by links. A folder is still read whole, so that the names
+/// the cap keeps are its smallest, the same every time, but only the names
+/// the cap still allows are held, so memory does not grow with its width.
+/// A folder that cannot be listed in full also gets a diagnostic. This is
+/// an immutable snapshot; [`AppIndex::refresh`] returns a new one when files
+/// change.
 #[derive(Debug)]
 pub struct AppIndex {
     /// The `applications` folders, most important first, with stamps.
@@ -259,8 +267,11 @@ impl AppIndex {
         Self::from_dirs_with(dirs, limits)
     }
 
-    /// The desktop entries under exactly these `applications` folders, most
-    /// important first.
+    /// Loads desktop entries from exactly these `applications` folders, in
+    /// priority order, highest first. Converts relative paths to absolute paths now, without
+    /// following links, so later changes to the working directory do not
+    /// change their location. Keeps the supplied path if conversion fails
+    /// because it is empty or the current directory is gone.
     #[must_use]
     pub fn from_dirs(dirs: impl IntoIterator<Item = impl Into<PathBuf>>) -> Self {
         Self::from_dirs_with(dirs, &Limits::default())
@@ -276,10 +287,13 @@ impl AppIndex {
         let mut roots: Vec<(PathBuf, FileStamp)> = Vec::new();
         let mut seen = HashSet::new();
         for dir in dirs {
+            // Absolute now, so that a later change of folder does not move
+            // it; as given when it cannot be.
             let dir = dir.into();
-            // The repeat check: a step, and the path copied, hashed and
-            // compared.
-            work::count(1 + 3 * dir.as_os_str().len());
+            let dir = std::path::absolute(&dir).unwrap_or(dir);
+            // The path made absolute, then the repeat check: a step, and the
+            // path copied, hashed and compared.
+            work::count(1 + 4 * dir.as_os_str().len());
             if seen.insert(dir.clone()) {
                 let stamp = FileStamp::of(&dir);
                 roots.push((dir, stamp));
@@ -336,7 +350,9 @@ impl AppIndex {
             files.sort_by(|a, b| compared(a.0.as_os_str().as_bytes(), b.0.as_os_str().as_bytes()));
             let mut ids_here: HashMap<String, (PathBuf, (u64, u64))> = HashMap::new();
             for (relative, path, file) in files {
-                let id = desktop_file_id(&relative);
+                let Some(id) = index.id_of(&relative, &path) else {
+                    continue;
+                };
                 // A step, and the ID hashed and compared.
                 work::count(1 + 2 * id.len());
                 if let Some((first, first_file)) = ids_here.get(&id) {
@@ -419,6 +435,29 @@ impl AppIndex {
         index
     }
 
+    /// Reports the folder at `path`, whose name is not UTF-8, as left out.
+    /// A link to it is stamped, as links the walk does not follow are, so
+    /// that `refresh` notices when it leads elsewhere.
+    fn left_out(&mut self, path: PathBuf, symlink: bool) {
+        if symlink {
+            // A step, and the path copied.
+            work::count(1 + path.as_os_str().len());
+            self.links.push((path.clone(), LinkStamp::of(&path)));
+        }
+        self.report(Diagnostic::new(Some(path), None, NOT_UTF8_FOLDER));
+    }
+
+    /// The desktop file ID of the file at `relative` under its root
+    /// ([`desktop_file_id`]); `None`, with a diagnostic for `path`, when a
+    /// name is not UTF-8.
+    fn id_of(&mut self, relative: &Path, path: &Path) -> Option<String> {
+        let id = desktop_file_id(relative);
+        if id.is_none() {
+            self.report(Diagnostic::new(Some(path.to_owned()), None, NOT_UTF8_FILE));
+        }
+        id
+    }
+
     /// Adds `diagnostic`, counting it as made: a step, its path copied and
     /// its message written.
     fn report(&mut self, diagnostic: Diagnostic) {
@@ -491,9 +530,30 @@ impl AppIndex {
             work::count(path.as_os_str().len() + relative.as_os_str().len());
             match fs::metadata(&path) {
                 Ok(metadata) if metadata.is_dir() => {
-                    self.enter(&path, relative, depth + 1, &mut walk, &mut stack);
+                    if walk.capped {
+                        // Past the cap no folder is entered or reported, but
+                        // a link to one is stamped, so `refresh` notices it
+                        // being retargeted. A step, and the path copied.
+                        if symlink {
+                            work::count(1 + path.as_os_str().len());
+                            let stamp = LinkStamp::of(&path);
+                            self.links.push((path, stamp));
+                        }
+                    } else if utf8(&name) {
+                        self.enter(&path, relative, depth + 1, &mut walk, &mut stack);
+                    } else {
+                        self.left_out(path, symlink);
+                    }
                 }
                 Ok(metadata) if metadata.is_file() && name.as_bytes().ends_with(b".desktop") => {
+                    // A link left out ([`AppIndex::id_of`]) is stamped
+                    // here, where the listing says it is a link.
+                    if symlink && !utf8(&name) {
+                        // A step, and the path copied.
+                        work::count(1 + path.as_os_str().len());
+                        let stamp = LinkStamp::of(&path);
+                        self.links.push((path.clone(), stamp));
+                    }
                     walk.files
                         .push((relative, path, (metadata.dev(), metadata.ino())));
                 }
@@ -562,7 +622,10 @@ impl AppIndex {
             walk.ancestors.remove(&identity);
             return;
         }
-        let (entries, failed) = listing(dir);
+        // In name order, so the walk, and where a cap stops it, are the same
+        // every time: of all the names, the smallest still allowed.
+        let left = self.limits.max_listed.map(|max| max - walk.listed);
+        let (entries, read, failed) = listing(dir, left);
         if let Some(err) = failed {
             self.report(Diagnostic::new(
                 Some(dir.to_owned()),
@@ -570,24 +633,9 @@ impl AppIndex {
                 format!("cannot be listed: {err}; the entries not read are left out"),
             ));
         }
-        // In name order, so the walk, and where a cap stops it, are the same
-        // every time. Each name copied once (a step, and one per byte).
-        let mut entries: Vec<_> = entries
-            .into_iter()
-            .map(|entry| {
-                let name = entry.file_name();
-                work::count(1 + name.len());
-                (name, entry)
-            })
-            .collect();
-        entries.sort_by(|(a, _), (b, _)| compared(a.as_bytes(), b.as_bytes()));
         // Past the cap the walk stops: what was found stays.
-        if let Some(max) = self.limits.max_listed {
-            let left = max - walk.listed;
-            if entries.len() > left {
-                entries.truncate(left);
-                walk.capped = true;
-            }
+        if left.is_some_and(|left| read > left) {
+            walk.capped = true;
         }
         walk.listed += entries.len();
         // Each entry kept, with whether the listing gives it as a link; the
@@ -619,10 +667,12 @@ impl AppIndex {
     ///
     /// Links the walk did not follow are compared by target identity: type,
     /// device and inode, or absence of a target. These include loops back to
-    /// ancestor folders, links to ignored or missing targets, and paths skipped
-    /// because they duplicate an ID. Retargeting a link or replacing its target
-    /// atomically (a new inode) is detected; editing the target in place is
-    /// not. The new snapshot uses the same [`AppIndex::limits`].
+    /// ancestor folders, links to ignored or missing targets, links left out
+    /// because their name is not UTF-8, links to folders met after the walk
+    /// reaches its cap (whatever their name), and paths skipped because
+    /// they duplicate an ID. Retargeting a link or replacing its target atomically (a new
+    /// inode) is detected; editing the target in place is not. The new
+    /// snapshot uses the same [`AppIndex::limits`].
     #[must_use]
     pub fn refresh(&self) -> Option<Self> {
         // A step per path checked, up to the first that changed; the stat
@@ -723,7 +773,8 @@ impl AppIndex {
             .filter_map(|at| at.map(|at| self.app(at)))
     }
 
-    /// The `applications` folders, most important first.
+    /// The `applications` folders, most important first, made absolute when
+    /// given.
     #[must_use]
     pub fn dirs(&self) -> Vec<&Path> {
         // A step per folder listed.
@@ -731,11 +782,12 @@ impl AppIndex {
         self.roots.iter().map(|(path, _)| path.as_path()).collect()
     }
 
-    /// Diagnostics for unreadable files, ignored encodings or types (including
-    /// shadowed files), ID clashes between different files, and problems inside
-    /// the winning files. Also reports incomplete or failed folder listings,
-    /// folders skipped for exceeding [`Limits::max_depth`], and walks stopped
-    /// at [`Limits::max_listed`] entries. A file reached through several paths
+    /// Diagnostics for unreadable files, ignored encodings or types
+    /// (including shadowed files), names that are not UTF-8, ID clashes
+    /// between different files, and problems inside the winning files. Also
+    /// reports incomplete or failed folder listings, folders skipped for
+    /// exceeding [`Limits::max_depth`], and walks stopped at
+    /// [`Limits::max_listed`] entries. A file reached through several paths
     /// has its problems reported under each.
     #[must_use]
     pub fn diagnostics(&self) -> &[Diagnostic] {
@@ -796,35 +848,132 @@ fn ignored_because(entry: &DesktopEntry) -> Option<String> {
     }
 }
 
-/// Lists the entries of `dir` and returns any error that cut the listing short.
-/// If opening or reading the folder is interrupted by a signal, discards the
-/// partial listing and restarts, retrying as often as needed. `NotFound` when
+/// Lists the entries of `dir`, keeping the `most` smallest names (all when
+/// `None`) in byte order with their entries. Also returns how many entries
+/// were read, and any error that cut the listing short. If opening or
+/// reading the folder is interrupted by a signal, discards the partial
+/// listing and restarts, retrying as often as needed. `NotFound` when
 /// opening the folder returns no entries and no error. Other errors end the
-/// listing and return the entries read so far.
-fn listing(dir: &Path) -> (Vec<fs::DirEntry>, Option<io::Error>) {
+/// listing and keep what was read so far.
+fn listing(
+    dir: &Path,
+    most: Option<usize>,
+) -> (Vec<(OsString, fs::DirEntry)>, usize, Option<io::Error>) {
     'again: loop {
         let entries = match read_dir(dir) {
             Ok(entries) => entries,
             Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
             // Gone since it was looked at: as if it were never there.
-            Err(err) if err.kind() == io::ErrorKind::NotFound => return (Vec::new(), None),
-            Err(err) => return (Vec::new(), Some(err)),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return (Vec::new(), 0, None),
+            Err(err) => return (Vec::new(), 0, Some(err)),
         };
-        let mut read = Vec::new();
+        let mut kept = Smallest::new(most);
+        let mut read = 0;
         for entry in entries {
             #[cfg(test)]
-            let entry = tests::listing_fault(dir, Some(read.len())).map_or(entry, Err);
+            let entry = tests::listing_fault(dir, Some(read)).map_or(entry, Err);
             match entry {
-                Ok(entry) => read.push(entry),
+                Ok(entry) => {
+                    read += 1;
+                    kept.add(entry);
+                }
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => {
                     // A step per entry read and dropped.
-                    work::count(read.len());
+                    work::count(read);
                     continue 'again;
                 }
-                Err(err) => return (read, Some(err)),
+                Err(err) => return (kept.sorted(), read, Some(err)),
             }
         }
-        return (read, None);
+        return (kept.sorted(), read, None);
+    }
+}
+
+/// A listed name with its entry, ordered by the name's bytes; counted
+/// tests count each comparison as [`compared`] does.
+struct Listed(OsString, fs::DirEntry);
+
+impl PartialEq for Listed {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for Listed {}
+
+impl Ord for Listed {
+    fn cmp(&self, other: &Self) -> Ordering {
+        compared(self.0.as_bytes(), other.0.as_bytes())
+    }
+}
+
+impl PartialOrd for Listed {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// The smallest names of a listing, at most `most`, so that a wide folder
+/// takes memory for the names the walk may still list, not for all.
+/// Until `most` are held they are kept in read order, and sorted at the
+/// end as a whole listing would be; from then on they are a max-heap
+/// (built once, about 2 comparisons per name), and each later name is
+/// compared with the largest and replaces it if smaller (about 2 log2
+/// `most` comparisons). So `n` names cost O(n log `most`) comparisons.
+struct Smallest {
+    /// The most names held.
+    most: usize,
+    /// The names held while fewer than `most`.
+    filling: Vec<Listed>,
+    /// The names held once `most` were reached.
+    full: BinaryHeap<Listed>,
+}
+
+impl Smallest {
+    fn new(most: Option<usize>) -> Self {
+        Self {
+            most: most.unwrap_or(usize::MAX),
+            filling: Vec::new(),
+            full: BinaryHeap::new(),
+        }
+    }
+
+    /// Adds `entry`, unless `most` smaller names are held. Its name is
+    /// copied (a step, and one per byte) whether it is kept or not.
+    fn add(&mut self, entry: fs::DirEntry) {
+        let name = entry.file_name();
+        work::count(1 + name.len());
+        let listed = Listed(name, entry);
+        if self.full.is_empty() {
+            if self.filling.len() < self.most {
+                self.filling.push(listed);
+                #[cfg(test)]
+                tests::note_held(self.filling.len());
+                return;
+            }
+            if self.most == 0 {
+                return;
+            }
+            self.full = BinaryHeap::from(std::mem::take(&mut self.filling));
+        }
+        if let Some(mut largest) = self.full.peek_mut()
+            && listed < *largest
+        {
+            *largest = listed;
+        }
+    }
+
+    /// The names held, in byte order, with their entries.
+    fn sorted(self) -> Vec<(OsString, fs::DirEntry)> {
+        let mut held = if self.full.is_empty() {
+            self.filling
+        } else {
+            self.full.into_vec()
+        };
+        held.sort();
+        held.into_iter()
+            .map(|Listed(name, entry)| (name, entry))
+            .collect()
     }
 }
 
@@ -840,18 +989,34 @@ fn read_dir(dir: &Path) -> io::Result<fs::ReadDir> {
 }
 
 /// The desktop file ID of a file at `relative` under `applications`: its
-/// components joined by `-`.
-fn desktop_file_id(relative: &Path) -> String {
+/// components joined by `-`. `None` when a component is not UTF-8: a
+/// `String` ID cannot hold it, and read lossily it could take the ID of
+/// another name (`GLib` and `update-desktop-database` keep the bytes).
+fn desktop_file_id(relative: &Path) -> Option<String> {
     let id = relative
         .iter()
-        .map(|part| part.to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("-");
+        .map(OsStr::to_str)
+        .collect::<Option<Vec<_>>>()
+        .map(|parts| parts.join("-"));
     // A step; each byte of the path split into parts and checked as UTF-8
     // (2), and each byte of the ID written.
-    work::count(1 + 2 * relative.as_os_str().len() + id.len());
+    work::count(1 + 2 * relative.as_os_str().len() + id.as_ref().map_or(0, String::len));
     id
 }
+
+/// Whether the name `name` is UTF-8, as a part of a desktop file ID must be
+/// ([`desktop_file_id`]). Each byte is checked.
+fn utf8(name: &OsStr) -> bool {
+    work::count(name.len());
+    name.to_str().is_some()
+}
+
+/// The diagnostic of a `.desktop` file whose name is not UTF-8.
+const NOT_UTF8_FILE: &str = "name not in UTF-8, so it has no desktop file ID; the file is ignored";
+
+/// The diagnostic of a folder whose name is not UTF-8.
+const NOT_UTF8_FOLDER: &str =
+    "name not in UTF-8, so its files have no desktop file ID; not scanned";
 
 #[cfg(test)]
 #[allow(
@@ -871,6 +1036,13 @@ mod tests {
             const { RefCell::new(None) };
         /// The listings interrupted on this thread.
         static INTERRUPTED: Cell<usize> = const { Cell::new(0) };
+        /// The most entries one listing held at once on this thread.
+        static MOST_HELD: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Notes that a listing holds `held` entries ([`MOST_HELD`]).
+    pub(super) fn note_held(held: usize) {
+        MOST_HELD.with(|most| most.set(most.get().max(held)));
     }
 
     #[cfg(target_os = "linux")]
@@ -1032,7 +1204,8 @@ mod tests {
                 ));
                 return;
             }
-            let (entries, failed) = listing(dir);
+            // Every name, in name order, cut below at the cap.
+            let (mut entries, _, failed) = listing(dir, None);
             if let Some(err) = failed {
                 self.report(Diagnostic::new(
                     Some(dir.to_owned()),
@@ -1040,17 +1213,6 @@ mod tests {
                     format!("cannot be listed: {err}; the entries not read are left out"),
                 ));
             }
-            // In name order, so the walk, and where a cap stops it, are the same
-            // every time. Each name copied once (a step, and one per byte).
-            let mut entries: Vec<_> = entries
-                .into_iter()
-                .map(|entry| {
-                    let name = entry.file_name();
-                    work::count(1 + name.len());
-                    (name, entry)
-                })
-                .collect();
-            entries.sort_by(|(a, _), (b, _)| compared(a.as_bytes(), b.as_bytes()));
             // Past the cap the walk stops: what was found stays.
             if let Some(max) = self.limits.max_listed {
                 let left = max - walk.listed;
@@ -1066,12 +1228,28 @@ mod tests {
                 // Both paths made: one per byte of each.
                 work::count(path.as_os_str().len() + relative.as_os_str().len());
                 match fs::metadata(&path) {
-                    Ok(metadata) if metadata.is_dir() => {
+                    Ok(metadata) if metadata.is_dir() && walk.capped => {
+                        if entry.file_type().is_ok_and(|kind| kind.is_symlink()) {
+                            work::count(1 + path.as_os_str().len());
+                            let stamp = LinkStamp::of(&path);
+                            self.links.push((path, stamp));
+                        }
+                    }
+                    Ok(metadata) if metadata.is_dir() && utf8(&name) => {
                         self.walk_recursive(&path, &relative, depth + 1, walk);
+                    }
+                    Ok(metadata) if metadata.is_dir() => {
+                        let symlink = entry.file_type().is_ok_and(|kind| kind.is_symlink());
+                        self.left_out(path, symlink);
                     }
                     Ok(metadata)
                         if metadata.is_file() && name.as_bytes().ends_with(b".desktop") =>
                     {
+                        if entry.file_type().is_ok_and(|kind| kind.is_symlink()) && !utf8(&name) {
+                            work::count(1 + path.as_os_str().len());
+                            let stamp = LinkStamp::of(&path);
+                            self.links.push((path.clone(), stamp));
+                        }
                         walk.files
                             .push((relative, path, (metadata.dev(), metadata.ino())));
                     }
@@ -1304,9 +1482,10 @@ mod tests {
         // about log6(n) deep, so an insert compares an ID with about
         // 2 (log2(n) + 1) others (15 at 200, measured); a sort compares
         // each item with about log2(n) + 1 others, and once when the items
-        // come in order. Per byte of the relative paths that is `sorting`
-        // times log2(n) + 1. The growth per doubling is then about 2.2,
-        // under the 2.5 allowed.
+        // come in order, `n` being the items sorted. Per byte of the
+        // relative paths that is `sorting`: so many sorts or B-trees times
+        // log2(n) + 1. The growth per doubling is then about 2.2, under
+        // the 2.5 allowed.
         for case in ["long names", "a long folder", "diagnostics"] {
             let dir = dir.path().join(case.replace(' ', "-"));
             let layout = |n: usize| -> (Vec<(String, &str)>, Vec<String>) {
@@ -1361,7 +1540,7 @@ mod tests {
                 },
                 |items, relative_bytes| {
                     let (files, path_bytes) = paths(items);
-                    let log = usize::try_from(items.ilog2()).unwrap() + 1;
+                    let log = |sorted: usize| usize::try_from(sorted.ilog2()).unwrap() + 1;
                     let (linear, sorting) = match case {
                         // Per file a step for each of the walk (2: its name
                         // copied, its entry kept), the ID made, looked up
@@ -1371,39 +1550,55 @@ mod tests {
                         // looked up 2 twice, put in two maps 3 twice,
                         // copied twice); per byte of the full path 4 (made
                         // by the walk, put in the folder's map, hashed for
-                        // the cache). Sorted: the IDs in two B-trees (4);
+                        // the cache); a folder's name checked as UTF-8 once
+                        // (1 per byte). Sorted: the IDs in two B-trees (4);
                         // the names sorted by the walk in read order (1),
                         // unless short; the files then in order (about 0).
-                        "long names" => (8 * files + 17 * relative_bytes + 4 * path_bytes, 5),
-                        "a long folder" => (8 * files + 17 * relative_bytes + 4 * path_bytes, 4),
+                        "long names" => (
+                            8 * files + 17 * relative_bytes + 4 * path_bytes,
+                            5 * log(items),
+                        ),
+                        "a long folder" => (
+                            8 * files + 17 * relative_bytes + 4 * path_bytes + folder.len(),
+                            4 * log(items),
+                        ),
                         // Per ID, with two files of `a` bytes of relative
-                        // path and `p` of full path each: at most 223 steps
-                        // (the walk 7: three entries, 2 each, and the
-                        // folder; the IDs made and looked up 4; the first
-                        // kept, checked for shadowing and looked up in the
-                        // cache 3; its reason, `no Type`, written 7; its
-                        // two messages 2, and 58 and 28 bytes besides their
+                        // path and `p` of full path each: at most 293 steps
+                        // (the walk 16: three entries, 2 each, the folder,
+                        // and the inner name's 9 bytes; the IDs made and
+                        // looked up 4; the first kept, checked for
+                        // shadowing and looked up in the cache 3; the key
+                        // file's message for its line made, 3 steps and 58
+                        // bytes; its reason, `no Type`, written 7; its two
+                        // messages 2, and 58 and 28 bytes besides their
                         // paths; the second's path stamped 1; its clash
                         // message 1, and at most 112 bytes besides the
                         // first's path: 77 and the ID cut to 32 characters
-                        // and `…`); 20 per byte of `a` (the walk 5: both
-                        // names and relative paths and the inner file's;
+                        // and `…`); 21 per byte of `a` (the walk 6: both
+                        // names and relative paths, the inner file's, and
+                        // the folder's name checked as UTF-8;
                         // the IDs made 6 and looked up 4; the first put in
                         // the folder's map 3 and checked for shadowing 2);
-                        // 14 per byte of `p` (the walk 4: both entries, the
+                        // 15 per byte of `p` (the walk 4: both entries, the
                         // folder kept and the inner file; the folder's map
                         // 1; the cache 2; the key file's message for the
                         // first's line made with its path 1; the messages
                         // 4, the first's two and the clash's with both
-                        // paths; the first's path made readable for it 2).
-                        // Per file, half that (at most 111.5 steps, taken
-                        // as 112). Sorted: the walk's names in read order
-                        // (1) and the files out of order (1); no ID is
-                        // indexed.
-                        _ => (112 * files + 10 * relative_bytes + 7 * path_bytes, 2),
+                        // paths; the second's path stamped 1; the first's
+                        // path made readable for it 2). Per file, half that
+                        // (at most 146.5 steps, taken as 147; 10.5 per byte
+                        // of its relative path, 7.5 of its full path).
+                        // Sorted: the walk's 2n names in read order (1) and
+                        // the 2n files out of order (1), each compared with
+                        // about log2(2n) + 1 others (9.7 measured at 400),
+                        // taken as floor(log2(2n)) + 2; no ID is indexed.
+                        _ => (
+                            147 * files + 21 * relative_bytes / 2 + 15 * path_bytes / 2,
+                            2 * (log(files) + 1),
+                        ),
                     };
                     // Twice the analysed cost.
-                    2 * (linear + sorting * log * relative_bytes)
+                    2 * (linear + sorting * relative_bytes)
                 },
             );
         }
@@ -1520,6 +1715,278 @@ mod tests {
         let index = AppIndex::from_dirs([high.path(), low.path()]);
         assert!(index.get("org.foo.desktop").is_none());
         assert_eq!(index.iter().count(), 0);
+    }
+
+    /// `relative` under `root`, from its bytes.
+    fn raw(root: &Path, relative: &[u8]) -> PathBuf {
+        root.join(OsStr::from_bytes(relative))
+    }
+
+    /// The paths and messages of `index`'s diagnostics, the paths as shown.
+    fn shown_diagnostics(index: &AppIndex) -> Vec<String> {
+        index
+            .diagnostics()
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn a_name_not_in_utf8_does_not_hide_the_name_it_looks_like() {
+        let high = tempfile::tempdir().unwrap();
+        let low = tempfile::tempdir().unwrap();
+        let hidden = "[Desktop Entry]\nType=Application\nName=x\nHidden=true\n";
+        // Read lossily, both would be `bad\u{fffd}.desktop`.
+        write(&raw(high.path(), b"bad\xff.desktop"), hidden);
+        write(&low.path().join("bad\u{fffd}.desktop"), &app("low"));
+        // So would a folder `d\xff` and `d\u{fffd}` give `d\u{fffd}-a.desktop`.
+        write(&raw(high.path(), b"d\xff/a.desktop"), hidden);
+        write(&low.path().join("d\u{fffd}/a.desktop"), &app("low"));
+        let index = AppIndex::from_dirs([high.path(), low.path()]);
+        let ids: Vec<_> = index.iter().map(|app| app.id().to_owned()).collect();
+        assert_eq!(ids, ["bad\u{fffd}.desktop", "d\u{fffd}-a.desktop"]);
+        assert_eq!(index.dir_of("bad\u{fffd}.desktop"), Some(1));
+        // Folders as the walk meets them, then files.
+        let high = shown_path(high.path());
+        assert_eq!(
+            shown_diagnostics(&index),
+            [
+                format!(r"{high}/d\xFF: {NOT_UTF8_FOLDER}"),
+                format!(r"{high}/bad\xFF.desktop: {NOT_UTF8_FILE}"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_name_not_in_utf8_is_left_out_in_its_own_folder_too() {
+        let root = tempfile::tempdir().unwrap();
+        // `\x80` comes before the UTF-8 of U+FFFD in byte order: read
+        // lossily, the first of each pair would win.
+        write(&raw(root.path(), b"bad\x80.desktop"), &app("raw"));
+        write(&root.path().join("bad\u{fffd}.desktop"), &app("text"));
+        write(&raw(root.path(), b"d\x80/a.desktop"), &app("raw"));
+        write(&root.path().join("d\u{fffd}/a.desktop"), &app("text"));
+        // Below a folder whose name is not UTF-8, nothing is looked at.
+        write(&raw(root.path(), b"e\x80/f/a.desktop"), &app("raw"));
+        write(&raw(root.path(), b"e\x80/b\x80.desktop"), &app("raw"));
+        let index = AppIndex::from_dirs([root.path()]);
+        let found: Vec<_> = index
+            .iter()
+            .map(|app| (app.id().to_owned(), app.path().to_owned()))
+            .collect();
+        assert_eq!(
+            found,
+            ["bad\u{fffd}.desktop", "d\u{fffd}/a.desktop"]
+                .map(|relative| (relative.replace('/', "-"), root.path().join(relative)))
+        );
+        let shown = shown_path(root.path());
+        assert_eq!(
+            shown_diagnostics(&index),
+            [
+                format!(r"{shown}/d\x80: {NOT_UTF8_FOLDER}"),
+                format!(r"{shown}/e\x80: {NOT_UTF8_FOLDER}"),
+                format!(r"{shown}/bad\x80.desktop: {NOT_UTF8_FILE}"),
+            ]
+        );
+        let folders: Vec<_> = index.folders.iter().map(|(path, _)| path.clone()).collect();
+        assert_eq!(
+            folders,
+            [root.path().to_owned(), root.path().join("d\u{fffd}")]
+        );
+        let [recursive, own_stack] = both_walks(root.path(), Limits::default());
+        assert_eq!(own_stack, recursive);
+        // Adding or removing such a file or folder is a change to its
+        // folder; a change inside a folder left out is none.
+        assert!(index.refresh().is_none());
+        write(&raw(root.path(), b"e\x80/f/a.desktop"), &app("changed"));
+        assert!(index.refresh().is_none());
+        fs::remove_file(raw(root.path(), b"bad\x80.desktop")).unwrap();
+        let fresh = index.refresh().unwrap();
+        assert_eq!(shown_diagnostics(&fresh).len(), 2);
+        write(&raw(root.path(), b"g\x80.desktop"), &app("raw"));
+        let fresh = fresh.refresh().unwrap();
+        assert_eq!(shown_diagnostics(&fresh).len(), 3);
+    }
+
+    #[test]
+    fn a_link_not_in_utf8_left_out_is_watched() {
+        let root = tempfile::tempdir().unwrap();
+        let ext = tempfile::tempdir().unwrap();
+        fs::create_dir(ext.path().join("dir")).unwrap();
+        write(&ext.path().join("plain"), "");
+        write(&ext.path().join("e.desktop"), &app("e"));
+        // Each through a link outside, so that only the target changes.
+        for (link, via, target) in [
+            (&b"d\x80"[..], "t", "dir"),
+            (b"l\x80.desktop", "u", "e.desktop"),
+        ] {
+            std::os::unix::fs::symlink(ext.path().join(target), ext.path().join(via)).unwrap();
+            std::os::unix::fs::symlink(ext.path().join(via), raw(root.path(), link)).unwrap();
+        }
+        let index = AppIndex::from_dirs([root.path()]);
+        let shown = shown_path(root.path());
+        assert_eq!(
+            shown_diagnostics(&index),
+            [
+                format!(r"{shown}/d\x80: {NOT_UTF8_FOLDER}"),
+                format!(r"{shown}/l\x80.desktop: {NOT_UTF8_FILE}"),
+            ]
+        );
+        assert!(index.refresh().is_none());
+        // A folder no more: the diagnostic goes.
+        retarget(&ext.path().join("t"), &ext.path().join("plain"));
+        let fresh = index.refresh().expect("retargeted");
+        assert_eq!(
+            shown_diagnostics(&fresh),
+            [format!(r"{shown}/l\x80.desktop: {NOT_UTF8_FILE}")]
+        );
+        assert!(fresh.refresh().is_none());
+        // A file no more.
+        retarget(&ext.path().join("u"), &ext.path().join("gone"));
+        let fresh = fresh.refresh().expect("retargeted");
+        assert_eq!(shown_diagnostics(&fresh), Vec::<String>::new());
+    }
+
+    #[test]
+    fn past_the_cap_no_folder_is_entered_or_reported_whatever_its_name() {
+        let root = tempfile::tempdir().unwrap();
+        let ext = tempfile::tempdir().unwrap();
+        // `a` reaches the cap; the folder `b\x80`, the link `c\x80` to a
+        // folder and the link `d\x80.desktop`, all listed, come after it.
+        // The folders are looked at (their type, their name checked as
+        // UTF-8) but neither entered nor reported; the link to the folder
+        // is stamped, so `refresh` notices it being retargeted, and the
+        // `.desktop` file is reported and its link stamped as usual.
+        for name in ["x", "y", "z"] {
+            write(&root.path().join(format!("a/{name}.desktop")), &app(name));
+        }
+        write(&raw(root.path(), b"b\x80/a.desktop"), &app("b"));
+        fs::create_dir(ext.path().join("dir")).unwrap();
+        std::os::unix::fs::symlink(ext.path().join("dir"), raw(root.path(), b"c\x80")).unwrap();
+        write(&ext.path().join("d.desktop"), &app("d"));
+        let file = raw(root.path(), b"d\x80.desktop");
+        std::os::unix::fs::symlink(ext.path().join("d.desktop"), &file).unwrap();
+        let limits = Limits {
+            max_listed: Some(5),
+            ..Limits::default()
+        };
+        let index = AppIndex::from_dirs_with([root.path()], &limits);
+        let shown = shown_path(root.path());
+        assert_eq!(
+            shown_diagnostics(&index),
+            [
+                format!("{shown}: more than 5 entries to list; not scanned further"),
+                format!("{}: {NOT_UTF8_FILE}", shown_path(&file)),
+            ]
+        );
+        let ids: Vec<_> = index.iter().map(|app| app.id().to_owned()).collect();
+        assert_eq!(ids, ["a-x.desktop"]);
+        let links: Vec<_> = index.links.iter().map(|(path, _)| path).collect();
+        assert_eq!(links, [&raw(root.path(), b"c\x80"), &file]);
+        let [recursive, own_stack] = both_walks(root.path(), limits);
+        assert_eq!(own_stack, recursive);
+    }
+
+    /// `root/a.desktop`, a link through `ext/bridge` to the folder
+    /// `ext/folder`, with `ext/valid.desktop` to point the bridge at.
+    fn a_desktop_link_to_a_folder(root: &Path, ext: &Path) {
+        fs::create_dir(ext.join("folder")).unwrap();
+        write(&ext.join("valid.desktop"), &app("valid"));
+        std::os::unix::fs::symlink(ext.join("folder"), ext.join("bridge")).unwrap();
+        std::os::unix::fs::symlink(ext.join("bridge"), root.join("a.desktop")).unwrap();
+    }
+
+    #[test]
+    fn a_folder_link_kept_past_the_cap_is_watched() {
+        // The root's listing reaches the cap; `a.desktop` is kept but not
+        // walked.
+        let root = tempfile::tempdir().unwrap();
+        let ext = tempfile::tempdir().unwrap();
+        a_desktop_link_to_a_folder(root.path(), ext.path());
+        write(&root.path().join("b.desktop"), &app("b"));
+        let limits = Limits {
+            max_listed: Some(1),
+            ..Limits::default()
+        };
+        let index = AppIndex::from_dirs_with([root.path()], &limits);
+        assert_eq!(index.iter().count(), 0);
+        let [recursive, own_stack] = both_walks(root.path(), limits);
+        assert_eq!(own_stack, recursive);
+        assert!(index.refresh().is_none());
+        retarget(
+            &ext.path().join("bridge"),
+            &ext.path().join("valid.desktop"),
+        );
+        let fresh = AppIndex::from_dirs_with([root.path()], &limits);
+        assert_eq!(fresh.iter().count(), 1);
+        let refreshed = index.refresh().expect("retargeted");
+        assert_same(&refreshed, &fresh);
+    }
+
+    #[test]
+    fn stamping_a_folder_link_past_the_cap_is_counted() {
+        // Two roots alike but for `b*`, past the cap: links to a folder
+        // (stamped) in one, folders (not entered) in the other. The links
+        // cost a step and their path copied each, no more.
+        let dir = tempfile::tempdir().unwrap();
+        let ext = tempfile::tempdir().unwrap();
+        let limits = Limits {
+            max_listed: Some(7),
+            ..Limits::default()
+        };
+        let names: Vec<String> = (0..5)
+            .map(|at| format!("b{at}{}", "n".repeat(100)))
+            .collect();
+        let steps = |root: &Path, links: bool| {
+            for name in ["x", "y", "z"] {
+                write(&root.join(format!("a/{name}.desktop")), &app(name));
+            }
+            for name in &names {
+                if links {
+                    std::os::unix::fs::symlink(ext.path(), root.join(name)).unwrap();
+                } else {
+                    fs::create_dir(root.join(name)).unwrap();
+                }
+            }
+            let (index, steps) = work::steps(|| AppIndex::from_dirs_with([root], &limits));
+            assert_eq!(index.links.len(), if links { names.len() } else { 0 });
+            steps
+        };
+        let (linked, plain) = (dir.path().join("l"), dir.path().join("p"));
+        let stamped: usize = names
+            .iter()
+            .map(|name| 1 + linked.join(name).as_os_str().len())
+            .sum();
+        assert_eq!(steps(&linked, true) - steps(&plain, false), stamped);
+    }
+
+    #[test]
+    fn a_folder_link_kept_after_a_subfolder_reaches_the_cap_is_watched() {
+        // The cap is reached inside `0`; the root's `a.desktop`, listed
+        // before, comes after it.
+        let root = tempfile::tempdir().unwrap();
+        let ext = tempfile::tempdir().unwrap();
+        a_desktop_link_to_a_folder(root.path(), ext.path());
+        write(&root.path().join("0/x.desktop"), &app("x"));
+        write(&root.path().join("0/y.desktop"), &app("y"));
+        let limits = Limits {
+            max_listed: Some(3),
+            ..Limits::default()
+        };
+        let index = AppIndex::from_dirs_with([root.path()], &limits);
+        let ids: Vec<_> = index.iter().map(|app| app.id().to_owned()).collect();
+        assert_eq!(ids, ["0-x.desktop"]);
+        let [recursive, own_stack] = both_walks(root.path(), limits);
+        assert_eq!(own_stack, recursive);
+        assert!(index.refresh().is_none());
+        retarget(
+            &ext.path().join("bridge"),
+            &ext.path().join("valid.desktop"),
+        );
+        let fresh = AppIndex::from_dirs_with([root.path()], &limits);
+        assert_eq!(fresh.iter().count(), 2);
+        let refreshed = index.refresh().expect("retargeted");
+        assert_same(&refreshed, &fresh);
     }
 
     #[test]
@@ -2012,6 +2479,99 @@ mod tests {
     }
 
     #[test]
+    fn a_wide_folder_holds_only_the_names_still_allowed() {
+        let root = tempfile::tempdir().unwrap();
+        write(&root.path().join("a.desktop"), &app("a"));
+        // Not in name order, so that the cut is not the order of reading.
+        for at in (0..1000).rev() {
+            write(&root.path().join(format!("w/{at:03}.desktop")), &app("w"));
+        }
+        for max in [0, 1, 2, 3, 10, 500, 1001, 1002, 1003] {
+            let limits = Limits {
+                max_listed: Some(max),
+                ..Limits::default()
+            };
+            MOST_HELD.set(0);
+            let index = AppIndex::from_dirs_with([root.path()], &limits);
+            // The root's two names, then those of `w` still allowed.
+            let most = max.min(2).max(max.saturating_sub(2).min(1000));
+            assert_eq!(MOST_HELD.get(), most, "{max}");
+            let (ids, messages) = ids_and_messages(&index);
+            let mut expected: Vec<_> = (0..max.saturating_sub(2).min(1000))
+                .map(|at| format!("w-{at:03}.desktop"))
+                .collect();
+            if max > 0 {
+                expected.insert(0, "a.desktop".to_owned());
+            }
+            assert_eq!(ids, expected, "{max}");
+            let capped = format!("more than {max} entries to list; not scanned further");
+            assert_eq!(messages, vec![capped; usize::from(max < 1002)], "{max}");
+            let [recursive, own_stack] = both_walks(root.path(), limits);
+            assert_eq!(own_stack, recursive, "{max}");
+        }
+    }
+
+    #[test]
+    fn a_wide_folder_past_the_cap_is_listed_in_linear_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = "l".repeat(200);
+        // Few enough that sorting every name would pass the bound.
+        let most = 3;
+        let limits = Limits {
+            max_listed: Some(most),
+            ..Limits::default()
+        };
+        work::assert_linear(
+            500,
+            |n| {
+                let root = dir.path().join(n.to_string());
+                // Not entries: only the names are compared and copied.
+                // Made in a fixed shuffled order (Fisher-Yates, xorshift64):
+                // tmpfs lists names newest first, and sorting every name
+                // takes runs already sorted in linear time.
+                let mut order: Vec<usize> = (0..n).collect();
+                let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+                for at in (1..n).rev() {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    let bound = u64::try_from(at + 1).unwrap();
+                    order.swap(at, usize::try_from(state % bound).unwrap());
+                }
+                for at in order {
+                    write(&root.join(format!("{prefix}{at}.txt")), "");
+                }
+                let (index, steps) = work::steps(|| AppIndex::from_dirs_with([&root], &limits));
+                assert_eq!(index.diagnostics().len(), 1);
+                let names = (0..n).map(|at| prefix.len() + format!("{at}.txt").len());
+                (steps, names.sum())
+            },
+            |names, name_bytes| {
+                let root = dir.path().join(names.to_string()).as_os_str().len();
+                let longest = prefix.len() + format!("{names}.txt").len();
+                // A comparison stops after the bytes two names share: the
+                // prefix, at most the digits of the shorter, and one more.
+                let digits = (names - 1).to_string().len();
+                let comparison = prefix.len() + digits + 1;
+                // Per name: copied (a step, and a byte each). The first 3
+                // are held; the 4th makes the heap (2 comparisons). From
+                // the 4th on, in any order, each is compared with the
+                // largest held and, if smaller, takes its place and the
+                // heap of 3 is sifted: at most 3 comparisons. The 3 kept
+                // are sorted at the end (at most 3). Per name kept: its
+                // paths made (both, the full one the root, a `/` and the
+                // name) and a step. The root: its repeat check, kept (1 + 4
+                // per byte) and its cap message (its path and 48).
+                let compared = (2 + 3 * (names - most) + 3) * comparison;
+                let kept = most * (1 + root + 1 + 2 * longest);
+                let analysed = names + name_bytes + compared + kept + 3 + 5 * root + 48;
+                // Twice the analysed cost.
+                2 * analysed
+            },
+        );
+    }
+
+    #[test]
     fn fan_out_through_links_stops_at_the_cap() {
         let apps = tempfile::tempdir().unwrap();
         let ext = tempfile::tempdir().unwrap();
@@ -2038,18 +2598,21 @@ mod tests {
     /// and with an explicit stack, for comparison: files found, folders and
     /// links recorded, and diagnostics.
     fn both_walks(root: &Path, limits: Limits) -> [String; 2] {
-        [true, false].map(|recursive| {
-            let mut index = AppIndex::scan(Vec::new(), &HashMap::new(), limits);
-            let files = if recursive {
-                index.walk_root_recursive(root)
-            } else {
-                index.walk_root(root)
-            };
-            format!(
-                "{:?}",
-                (files, &index.folders, &index.links, &index.diagnostics)
-            )
-        })
+        [true, false].map(|recursive| one_walk(root, limits, recursive))
+    }
+
+    /// The result of one walk of `root`, as [`both_walks`] gives it.
+    fn one_walk(root: &Path, limits: Limits, recursive: bool) -> String {
+        let mut index = AppIndex::scan(Vec::new(), &HashMap::new(), limits);
+        let files = if recursive {
+            index.walk_root_recursive(root)
+        } else {
+            index.walk_root(root)
+        };
+        format!(
+            "{:?}",
+            (files, &index.folders, &index.links, &index.diagnostics)
+        )
     }
 
     #[test]
@@ -2307,6 +2870,10 @@ mod tests {
         root
     }
 
+    /// IDs and diagnostics are as without the interruption. This does not
+    /// show that the partial listing is dropped: a name kept twice gives the
+    /// same ID and file, listed once without a diagnostic.
+    /// `an_interrupted_listing_keeps_none_of_its_names_below_the_cap` does.
     #[test]
     fn an_interrupted_listing_is_listed_again_from_the_start() {
         let root = four_entries();
@@ -2321,9 +2888,28 @@ mod tests {
                     LISTING_FAULT.with_borrow(Option::is_none),
                     "{folder:?} {at:?}: interrupted"
                 );
-                // Each ID once: the partial listing is dropped.
                 assert_eq!(ids_and_messages(&index), all, "{folder:?} {at:?}");
             }
+        }
+    }
+
+    #[test]
+    fn an_interrupted_listing_keeps_none_of_its_names_below_the_cap() {
+        let root = four_entries();
+        // The root's 3 names and `sub`'s 2 fit; those read before the
+        // interruption, kept again, would not.
+        let limits = Limits {
+            max_listed: Some(5),
+            ..Limits::default()
+        };
+        let whole = one_walk(root.path(), limits, true);
+        assert!(!whole.contains("more than"), "{whole}");
+        let interrupted = rustix::io::Errno::INTR.raw_os_error();
+        for recursive in [true, false] {
+            LISTING_FAULT.set(Some((root.path().to_owned(), Some(1), interrupted)));
+            let walked = one_walk(root.path(), limits, recursive);
+            assert!(LISTING_FAULT.with_borrow(Option::is_none), "{recursive}");
+            assert_eq!(walked, whole, "{recursive}");
         }
     }
 
@@ -2553,6 +3139,13 @@ mod tests {
             !path.as_os_str().as_bytes().contains(&b':'),
             "TMPDIR contains ':', which an XDG path list cannot hold; set TMPDIR to a path without ':'"
         );
+    }
+
+    #[test]
+    fn an_empty_folder_path_is_kept_as_given() {
+        let index = AppIndex::from_dirs([""]);
+        assert_eq!(index.dirs(), [Path::new("")]);
+        assert_eq!(index.iter().count(), 0);
     }
 
     #[test]

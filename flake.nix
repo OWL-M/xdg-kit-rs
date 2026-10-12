@@ -162,6 +162,9 @@
                 fileset = pkgs.lib.fileset.unions [
                   ./Cargo.toml
                   ./Cargo.lock
+                  ./LICENSE
+                  # Its examples run as doctests of the xdg-kit crate.
+                  ./README.md
                   ./crates
                   ./fuzz/fuzz_targets
                 ];
@@ -218,6 +221,7 @@
               root = ./.;
               fileset = pkgs.lib.fileset.unions [
                 ./Cargo.toml
+                ./LICENSE
                 ./crates
                 ./fuzz/Cargo.toml
                 ./fuzz/Cargo.lock

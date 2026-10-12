@@ -37,6 +37,29 @@ printf '<?xml version="1.0"?>\n<mime-type xmlns="http://www.freedesktop.org/stan
 printf '<?xml version="1.0"?>\n<!-- c --><s:seed xmlns:s="urn:seed" a="1">' > "$out/xml_root/prefixed"
 printf '<!DOCTYPE x><x xmlns="urn:any"/>' > "$out/xml_root/default"
 printf '\357\273\277<?pi data?><u:x/>' > "$out/xml_root/unbound"
+# Entities: a reference, forward, to an unusable entity (which makes the
+# referrer unusable too), nested references, and a namespace by entity.
+printf '<!DOCTYPE r [<!ENTITY a "&b;"><!ENTITY b "&#60;&b;">]><r xmlns="&a;"/>' > "$out/xml_root/unusable-loop"
+printf '<!DOCTYPE r [<!ENTITY a "&b;&b;"><!ENTITY b "&c;&c;"><!ENTITY c "lol">]><r xmlns="urn:&a;"/>' > "$out/xml_root/nested"
+printf '<!DOCTYPE svg [<!ENTITY ns_svg "http://www.w3.org/2000/svg">]><svg xmlns="&ns_svg;"/>' > "$out/xml_root/entity-namespace"
+printf '<!DOCTYPE r [<!ENTITY a "&b;$b;"><!ENTITY b "&c;c&;e&a;"\037xmY aurn:x"]a\015\012b">}>>]><r xmlns="&a;"\037xmY a "&b;&b;">+*\377="2"\000\000' > "$out/xml_root/oom-found"
+printf '<!DOCTYPE mime-type [<!ENTITY a "&b;"><!ENTITY b "&#60;&b;">]><mime-type xmlns="&a;"><comment>a</comment></mime-type>' > "$out/type_xml/unusable-loop"
+# Parameter entities: included text that declares, one including another,
+# an ATTLIST default in included text, a conditional section there
+# (refused), and standalone with a default in included text referring to
+# an entity declared there.
+printf '<!DOCTYPE r [<!ENTITY %% p "<!ENTITY ns '"'"'urn:x'"'"'>"> %%p;]><r xmlns="&ns;"/>' > "$out/xml_root/pe-include"
+printf '<!DOCTYPE r [<!ENTITY %% q "<!ENTITY ns '"'"'urn:x'"'"'>"><!ENTITY %% p "&#37;q;&#37;q;"> %%p;]><r xmlns="&ns;"/>' > "$out/xml_root/pe-chained"
+printf '<!DOCTYPE r SYSTEM "s" [<!ENTITY ns "urn:x"><!ENTITY e "&f;"><!ENTITY %% p "<!ATTLIST r a CDATA '"'"'&#38;e;'"'"'>"> %%p;<!ENTITY f "v">]><r xmlns="&ns;" b="&u;"/>' > "$out/xml_root/pe-attlist"
+printf '<!DOCTYPE r [<!ENTITY ns "urn:x"><!ENTITY %% p "<![IGNORE[ x ]]>"> %%p;]><r xmlns="&ns;"/>' > "$out/xml_root/pe-ignore"
+printf '<?xml version="1.0" standalone="yes"?><!DOCTYPE r [<!ENTITY ns "urn:x"><!ENTITY %% p "<!ENTITY a '"'"'v'"'"'><!ATTLIST r b CDATA '"'"'&#38;a;'"'"'>"> %%p;]><r xmlns="&ns;"/>' > "$out/xml_root/pe-standalone"
+printf '<!DOCTYPE mime-type [<!ENTITY %% p "<!ENTITY ns '"'"'http://www.freedesktop.org/standards/shared-mime-info'"'"'>"> %%p;]><mime-type xmlns="&ns;" type="a/b"><comment>c</comment></mime-type>' > "$out/type_xml/pe-include"
+printf '<?xml version="1.0" standalone="yes"?><!DOCTYPE mime-type [<!ENTITY ns "http://www.freedesktop.org/standards/shared-mime-info"><!ENTITY %% q "<!ENTITY a '"'"'v'"'"'>"><!ENTITY %% p "&#37;q;<!ATTLIST mime-type b CDATA '"'"'&#38;a;'"'"'>"> %%p;]><mime-type xmlns="&ns;"><comment>c</comment></mime-type>' > "$out/type_xml/pe-standalone"
+# The internal subset read by XML's grammar: every kind of declaration,
+# groups nested in a content model, a public literal, and the shape
+# freedesktop.org.xml has.
+printf '<!DOCTYPE r PUBLIC "-//x//EN" "s" [<!ENTITY ns "urn:x"><!ELEMENT r (a,(b|c)*,d?)+><!ELEMENT a (#PCDATA|b)*><!ATTLIST r a ID #IMPLIED b (x|y) "x" c NOTATION (n) #FIXED "n"><!NOTATION n PUBLIC "-//n//EN"><!ENTITY u SYSTEM "u.gif" NDATA n><!-- c --><?pi x?>]><r xmlns="&ns;"/>' > "$out/xml_root/subset-grammar"
+printf '<!DOCTYPE mime-type [<!ENTITY ns "http://www.freedesktop.org/standards/shared-mime-info"><!ELEMENT mime-type (comment+, (acronym,expanded-acronym)? , (icon? | glob | alias)*)><!ATTLIST mime-type type CDATA #REQUIRED><!ELEMENT comment (#PCDATA)><!ATTLIST comment xml:lang CDATA #IMPLIED><!ATTLIST glob weight CDATA "50">]><mime-type xmlns="&ns;" type="a/b"><comment>c</comment></mime-type>' > "$out/type_xml/subset-grammar"
 printf '*.tar.gz\000a.tar.gz' > "$out/fnmatch/star"
 printf 'seed-[0-9]?.*\000seed-4x.txt' > "$out/fnmatch/set"
 printf '[!a-c]\\*\000d*' > "$out/fnmatch/escape"

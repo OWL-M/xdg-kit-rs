@@ -28,10 +28,24 @@ pub(crate) fn quoted(text: &str) -> String {
     cut(text, 32)
 }
 
-/// Formats `path` for a message using [`escaped`]. Keeps the full path so
-/// the reader can locate the file.
+/// Formats `path` for a message using [`escaped`], keeping the full path
+/// so the reader can locate the file. Encodes each non-UTF-8 byte as
+/// `\xHH`, with two uppercase hex digits (such as `\xFF`), and `\` as
+/// `\\`, so different paths remain distinguishable. Escapes a combining
+/// mark after either sequence, as after any escape.
 pub(crate) fn shown_path(path: &Path) -> String {
-    escaped(&path.to_string_lossy())
+    let bytes = std::os::unix::ffi::OsStrExt::as_bytes(path.as_os_str());
+    let mut shown = String::with_capacity(bytes.len());
+    // Each part in UTF-8 starts the path or follows an escaped byte, as
+    // `escaped` takes the start of its text.
+    for chunk in bytes.utf8_chunks() {
+        shown.push_str(&escaped(chunk.valid()));
+        for byte in chunk.invalid() {
+            // Writing to a `String` cannot fail.
+            let _ = std::fmt::Write::write_fmt(&mut shown, format_args!("\\x{byte:02X}"));
+        }
+    }
+    shown
 }
 
 /// Formats `text` using [`escaped`], truncating to `limit` characters
@@ -165,6 +179,22 @@ mod tests {
             source: io::Error::other("gone"),
         };
         assert_eq!(failed.to_string(), format!("a\\u{{1b}}\\n{long}: gone"));
+    }
+    #[test]
+    fn names_differing_only_in_bytes_that_are_not_utf8_show_apart() {
+        use std::os::unix::ffi::OsStrExt;
+        let shown = |bytes: &[u8]| shown_path(Path::new(std::ffi::OsStr::from_bytes(bytes)));
+        // Read lossily, both would show as `/a\u{fffd}b`.
+        assert_ne!(shown(b"/a\xffb"), shown(b"/a\xfeb"));
+        assert_eq!(shown(b"/a\xffb"), r"/a\xFFb");
+        // Neither the text `\xFF` nor the replacement character.
+        assert_eq!(shown(br"/a\xFFb"), r"/a\\xFFb");
+        assert_eq!(shown("/a\u{fffd}b".as_bytes()), "/a\u{fffd}b");
+        // A mark after an escaped byte is escaped, as after any escape.
+        assert_eq!(
+            shown(b"/\xff\xcc\x81e\xcc\x81\n"),
+            "/\\xFF\\u{301}e\u{301}\\n"
+        );
     }
 
     #[test]

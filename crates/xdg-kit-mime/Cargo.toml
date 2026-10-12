@@ -4,7 +4,12 @@ description = "The freedesktop.org Shared MIME-info database: file types, their 
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license = "Apache-2.0 AND Unicode-3.0"
+repository.workspace = true
+readme.workspace = true
+documentation = "https://docs.rs/xdg-kit-mime"
+keywords = ["xdg", "freedesktop", "mime", "shared-mime-info", "file-type"]
+categories = ["os::unix-apis", "filesystem", "parser-implementations"]
 
 [features]
 ## Conversions to and from `mime::Mime`.

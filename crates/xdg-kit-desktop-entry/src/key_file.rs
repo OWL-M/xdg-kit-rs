@@ -903,7 +903,10 @@ impl KeyFile {
         Self::default()
     }
 
-    /// Reads the key file at `path`.
+    /// Reads the key file at `path`. Converts a relative path to an absolute
+    /// path now, without following links, so later changes to the working
+    /// directory do not change its location. Keeps the supplied path if
+    /// conversion fails because it is empty or the current directory is gone.
     ///
     /// # Errors
     ///
@@ -914,7 +917,8 @@ impl KeyFile {
         Self::read_with(path, KeyNames::DesktopEntry)
     }
 
-    /// Reads the key file at `path`, whose keys follow `key_names`.
+    /// Reads the key file at `path`, whose keys follow `key_names`. A
+    /// relative `path` is made absolute as [`KeyFile::read`] does.
     ///
     /// # Errors
     ///
@@ -926,7 +930,8 @@ impl KeyFile {
     }
 
     /// Reads the key file at `path`, whose keys follow `key_names`, within
-    /// `limits`.
+    /// `limits`. A relative `path` is made absolute as [`KeyFile::read`]
+    /// does.
     ///
     /// # Errors
     ///
@@ -937,9 +942,13 @@ impl KeyFile {
         key_names: KeyNames,
         limits: &Limits,
     ) -> io::Result<Self> {
+        // Absolute now, so that a later change of folder does not move it;
+        // as given when it cannot be. Each byte copied.
         let path = path.as_ref();
-        let bytes = xdg_kit_basedir::read_regular_file_with(path, limits.max_file_len)?;
-        Ok(Self::parse_from(&bytes, Some(path.to_owned()), key_names))
+        let path = std::path::absolute(path).unwrap_or_else(|_| path.to_owned());
+        work::count(path.as_os_str().len());
+        let bytes = xdg_kit_basedir::read_regular_file_with(&path, limits.max_file_len)?;
+        Ok(Self::parse_from(&bytes, Some(path), key_names))
     }
 
     /// Parses `bytes` as a key file. Problems are diagnostics; nothing fails.
@@ -1186,7 +1195,7 @@ impl KeyFile {
         None
     }
 
-    /// The file this was read from, if any.
+    /// The file this was read from, if any, made absolute when read.
     #[must_use]
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
@@ -2332,6 +2341,25 @@ mod tests {
         \n\
         [Desktop Action New]\n\
         Name=New Window\n";
+
+    #[test]
+    fn an_empty_path_is_kept_and_fails_to_read() {
+        let err = KeyFile::read("").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn reading_counts_the_copy_of_the_path() {
+        let text = b"[G]\nk=v\n";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a-rather-long-name-for-a-key-file.desktop");
+        fs::write(&path, text).unwrap();
+        let (_, parsed) = work::steps(|| KeyFile::parse(text));
+        let (read, steps) = work::steps(|| KeyFile::read(&path).unwrap());
+        assert_eq!(read.path(), Some(path.as_path()));
+        // The parse, and each byte of the path made absolute.
+        assert_eq!(steps, parsed + path.as_os_str().len());
+    }
 
     #[test]
     #[should_panic(expected = "the key file's entry ids are exhausted")]

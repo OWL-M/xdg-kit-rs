@@ -212,6 +212,9 @@ fn the_defaults_are_the_limits_without_with() {
     assert_eq!(limits.cache_copy_per_byte, Some(8));
     assert_eq!(limits.cache_copy_extra, 64 * 1024);
     assert_eq!(limits.max_rule_depth, 64);
+    assert_eq!(limits.max_namespace_bindings, Some(128));
+    assert_eq!(limits.entity_expansion_per_byte, Some(1));
+    assert_eq!(limits.entity_expansion_extra, 64 * 1024);
     let unlimited = Limits::unlimited();
     assert_eq!(
         (
@@ -220,11 +223,14 @@ fn the_defaults_are_the_limits_without_with() {
             unlimited.max_cache_string,
             unlimited.cache_copy_per_byte,
             unlimited.max_rule_depth,
+            unlimited.max_namespace_bindings,
         ),
-        (None, None, None, None, MAX_RULE_DEPTH)
+        (None, None, None, None, MAX_RULE_DEPTH, None)
     );
     // Kept, so that a budget set later has the default's shape.
     assert_eq!(unlimited.cache_copy_extra, 64 * 1024);
+    assert_eq!(unlimited.entity_expansion_per_byte, None);
+    assert_eq!(unlimited.entity_expansion_extra, 64 * 1024);
     let dir = tempfile::tempdir().unwrap();
     let mime = text_folder(dir.path(), &bad_lines(150));
     let db = MimeDatabase::from_dirs([&mime]);
@@ -648,6 +654,200 @@ fn both_readers_keep_a_leaf_at_the_deepest_level_and_cut_one_below() {
             messages.contains(&"magic nested too deep, branch skipped")
                 && messages.contains(&"nesting skips a level or is too deep, line skipped"),
             "{max}: {messages:?}"
+        );
+    }
+}
+
+#[test]
+fn namespace_bindings_in_scope_can_be_limited_or_unlimited() {
+    use std::fmt::Write as _;
+    let dir = tempfile::tempdir().unwrap();
+    let mime = text_folder(dir.path(), "50:text/x-a:*.a\n");
+    fs::write(
+        mime.join("magic"),
+        b"MIME-Magic\0\n[50:application/xml]\n>0=\x00\x02<r\n",
+    )
+    .unwrap();
+    fs::write(mime.join("subclasses"), "text/x-r application/xml\n").unwrap();
+    fs::write(mime.join("XMLnamespaces"), "urn:r r text/x-r\n").unwrap();
+    // 200 bindings in scope: the root's default and 199 more.
+    let mut more = String::new();
+    for at in 0..199 {
+        let _ = write!(more, " xmlns:p{at}=\"urn:{at}\"");
+    }
+    fs::create_dir_all(mime.join("text")).unwrap();
+    fs::write(
+        mime.join("text/x-a.xml"),
+        format!(
+            r#"<mime-type xmlns="http://www.freedesktop.org/standards/shared-mime-info"{more}><comment>A</comment></mime-type>"#
+        ),
+    )
+    .unwrap();
+    let document = format!(r#"<r xmlns="urn:r"{more}/>"#);
+    let a = m("text/x-a");
+    let untranslated = xdg_kit_mime::Locales::untranslated();
+    let mut limits = Limits::default();
+    for (max, read) in [(Some(128), false), (Some(200), true), (None, true)] {
+        limits.max_namespace_bindings = max;
+        let db = MimeDatabase::from_dirs_with([&mime], &limits);
+        let description = db.description(&a, &untranslated);
+        assert_eq!(description.is_some(), read, "{max:?}");
+        let problems: Vec<String> = db
+            .type_diagnostics(&a)
+            .into_iter()
+            .map(|d| d.message)
+            .collect();
+        if read {
+            assert!(problems.is_empty(), "{max:?}: {problems:?}");
+        } else {
+            assert_eq!(
+                problems,
+                [
+                    "bad XML (more than 128 namespace declarations on the open elements); the rest is skipped"
+                ]
+            );
+        }
+        let expected = if read { "text/x-r" } else { "application/xml" };
+        assert_eq!(
+            db.type_for_data(document.as_bytes()).mime,
+            m(expected),
+            "{max:?}"
+        );
+    }
+}
+
+#[test]
+fn the_entity_expansion_budget_can_be_set_or_lifted() {
+    // Parameter entities included in a document type and entities
+    // expanded in namespace declarations, within the bytes per byte of it
+    // plus the extra, in a per-type file and in root detection.
+    let dir = tempfile::tempdir().unwrap();
+    let mime = text_folder(dir.path(), "50:text/x-a:*.a\n");
+    fs::write(
+        mime.join("magic"),
+        b"MIME-Magic\0\n[50:application/xml]\n>0=\x00\x02<!\n",
+    )
+    .unwrap();
+    fs::write(mime.join("subclasses"), "text/x-r application/xml\n").unwrap();
+    fs::write(mime.join("XMLnamespaces"), "urn:r r text/x-r\n").unwrap();
+    let ten = "%p;".repeat(10);
+    fs::create_dir_all(mime.join("text")).unwrap();
+    fs::write(
+        mime.join("text/x-a.xml"),
+        format!(
+            r#"<!DOCTYPE mime-type [<!ENTITY % p "<!ENTITY ns 'http://www.freedesktop.org/standards/shared-mime-info'>">{ten}]><mime-type xmlns="&ns;"><comment>A</comment></mime-type>"#
+        ),
+    )
+    .unwrap();
+    let document =
+        format!(r#"<!DOCTYPE r [<!ENTITY % p "<!ENTITY a 'urn:r'>">{ten}]><r xmlns="&a;"/>"#);
+    let a = m("text/x-a");
+    let untranslated = xdg_kit_mime::Locales::untranslated();
+    let mut limits = Limits::default();
+    for (per_byte, extra, read) in [
+        (Some(1), 64 * 1024, true),
+        (Some(1), 0, false),
+        (Some(20), 0, true),
+        (Some(0), 2000, true),
+        (None, 0, true),
+    ] {
+        limits.entity_expansion_per_byte = per_byte;
+        limits.entity_expansion_extra = extra;
+        let db = MimeDatabase::from_dirs_with([&mime], &limits);
+        let description = db.description(&a, &untranslated);
+        assert_eq!(description.is_some(), read, "{per_byte:?} {extra}");
+        let expected = if read { "text/x-r" } else { "application/xml" };
+        assert_eq!(
+            db.type_for_data(document.as_bytes()).mime,
+            m(expected),
+            "{per_byte:?} {extra}"
+        );
+    }
+}
+
+#[test]
+fn an_entity_bomb_without_a_budget_is_refused_not_aborted() {
+    use std::fmt::Write as _;
+    // Reading with no limit returns an error, not an abort. A doubling
+    // chain of 40 and of 70 entities, in a per-type file and in a document
+    // whose root element is looked at.
+    let bomb = |levels: usize, root: &str| {
+        let mut text = String::from("<!DOCTYPE r [<!ENTITY g0 \"urn:\">");
+        for at in 1..=levels {
+            let _ = write!(text, "<!ENTITY g{at} \"&g{0};&g{0};\">", at - 1);
+        }
+        let _ = write!(text, "]>{root}");
+        text
+    };
+    for levels in [40, 70] {
+        let dir = tempfile::tempdir().unwrap();
+        let mime = text_folder(dir.path(), "50:text/x-a:*.a\n");
+        fs::write(
+            mime.join("magic"),
+            b"MIME-Magic\0\n[50:application/xml]\n>0=\x00\x02<!\n",
+        )
+        .unwrap();
+        fs::create_dir_all(mime.join("text")).unwrap();
+        let file = bomb(
+            levels,
+            &format!("<mime-type xmlns=\"&g{levels};\"><comment>A</comment></mime-type>"),
+        )
+        .replacen("<!DOCTYPE r", "<!DOCTYPE mime-type", 1);
+        fs::write(mime.join("text/x-a.xml"), file).unwrap();
+        let db = MimeDatabase::from_dirs_with([&mime], &Limits::unlimited());
+        let untranslated = xdg_kit_mime::Locales::untranslated();
+        assert_eq!(
+            db.description(&m("text/x-a"), &untranslated),
+            None,
+            "{levels}"
+        );
+        assert!(!db.type_diagnostics(&m("text/x-a")).is_empty(), "{levels}");
+        let document = bomb(levels, &format!("<r xmlns=\"&g{levels};\"/>"));
+        assert_eq!(
+            db.type_for_data(document.as_bytes()).mime,
+            m("application/xml"),
+            "{levels}"
+        );
+    }
+}
+
+#[test]
+fn a_namespace_entry_wins_over_a_local_name_entry() {
+    // The root element is looked up by namespace and local name, then by
+    // namespace alone, then by local name alone; with both of the last two
+    // listed, the namespace's entry is the one found.
+    let dir = tempfile::tempdir().unwrap();
+    let mime = text_folder(dir.path(), "50:text/x-a:*.a\n");
+    fs::write(
+        mime.join("magic"),
+        b"MIME-Magic\0\n[50:application/xml]\n>0=\x00\x01<\n",
+    )
+    .unwrap();
+    fs::write(
+        mime.join("subclasses"),
+        "text/x-ns application/xml\ntext/x-local application/xml\ntext/x-both application/xml\n",
+    )
+    .unwrap();
+    fs::write(
+        mime.join("XMLnamespaces"),
+        "urn:a  text/x-ns\n r text/x-local\nurn:b r text/x-both\n",
+    )
+    .unwrap();
+    let db = MimeDatabase::from_dirs([&mime]);
+    for (document, expected) in [
+        (r#"<r xmlns="urn:a"/>"#, "text/x-ns"),
+        (r#"<s xmlns="urn:a"/>"#, "text/x-ns"),
+        (r#"<r xmlns="urn:c"/>"#, "text/x-local"),
+        (r#"<r xmlns="urn:b"/>"#, "text/x-both"),
+        (
+            r#"<!DOCTYPE r [<!ENTITY a "urn:a">]><r xmlns="&a;"/>"#,
+            "text/x-ns",
+        ),
+    ] {
+        assert_eq!(
+            db.type_for_data(document.as_bytes()).mime,
+            m(expected),
+            "{document}"
         );
     }
 }

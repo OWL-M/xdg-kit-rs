@@ -11,10 +11,15 @@
 //! which stand for `c` itself (C-locale collation). A `[` without a closing
 //! `]` stands for itself.
 //!
-//! Items are characters when the name is UTF-8, and classes use Unicode
-//! properties for them. A name that is not UTF-8 is matched byte by byte,
-//! with ASCII classes, and only against ASCII patterns: it never matches a
-//! pattern with other characters.
+//! Items are characters when the name is UTF-8, and classes are then
+//! glibc's C.UTF-8 classes (which en_US.UTF-8 shares), locale-independent:
+//! tables generated from the Unicode 17.0.0 data (`class_tables`) plus
+//! std's Alphabetic, Uppercase and Lowercase properties and case mappings.
+//! With a toolchain whose std has another Unicode version, those follow
+//! the toolchain until the tables are regenerated (the crate's tests then
+//! fail). A name that is not UTF-8 is matched byte by byte, with ASCII
+//! classes, and only against ASCII patterns: it never matches a pattern
+//! with other characters.
 //!
 //! A case-insensitive pattern is matched against a name lowercased per
 //! character, without context (ASCII only when it is not UTF-8). Its
@@ -24,9 +29,13 @@
 //! lowercases to two characters) matches nothing. A range or a class tests
 //! the name's character and its one-to-one lowercase and uppercase:
 //! `[Σ-Σ]` matches `ς`. `[:upper:]` and `[:lower:]` match any letter that
-//! has case.
+//! has case: std's Lowercase or Uppercase. A titlecase letter (`ǅ`) has
+//! neither, but still matches through the name's lowercasing or its
+//! one-to-one case variants.
 
 use crate::work;
+
+mod class_tables;
 
 /// Whether `name` matches `pattern`, case-sensitively.
 #[cfg(any(test, fuzzing))]
@@ -191,7 +200,8 @@ trait Symbol: Copy + Eq + Ord {
     /// otherwise returns the original symbol for that form.
     fn lower(self) -> Self;
     fn upper(self) -> Self;
-    /// A letter with case: what `[:upper:]` and `[:lower:]` match
+    /// A letter with case (std's Lowercase or Uppercase, so not a
+    /// titlecase one): what `[:upper:]` and `[:lower:]` match
     /// case-insensitively.
     fn has_case(self) -> bool;
 }
@@ -229,22 +239,49 @@ impl Symbol for char {
         self.is_lowercase() || self.is_uppercase()
     }
 
+    /// glibc's C.UTF-8 classes: its `unicode_utils.py` formulas over std's
+    /// Alphabetic, Uppercase and Lowercase and case mappings (the
+    /// toolchain's Unicode version) and the generated Unicode 17.0.0
+    /// tables; `class_tables_are_for_std_unicode_version` fails when the
+    /// two differ. A table lookup is a binary search of a fixed table (at
+    /// most 10 probes, 735 ranges), so a constant per character, counted
+    /// with the member's step.
     fn in_class(self, class: Class) -> bool {
+        use class_tables::{ASSIGNED, BLANKS, CONTROLS, OTHER_DIGITS, SEPARATORS};
+        let has = |table| contains(table, self);
+        let space = || has(BLANKS) || has(SEPARATORS) || ('\n'..='\r').contains(&self);
+        let alnum = || self.is_alphabetic() || has(OTHER_DIGITS) || self.is_ascii_digit();
         match class {
-            Class::Alnum => self.is_alphanumeric(),
-            Class::Alpha => self.is_alphabetic(),
-            Class::Blank => matches!(self, ' ' | '\t'),
-            Class::Cntrl => self.is_control(),
+            Class::Alnum => alnum(),
+            Class::Alpha => self.is_alphabetic() || has(OTHER_DIGITS),
+            Class::Blank => has(BLANKS),
+            Class::Cntrl => has(CONTROLS) || has(SEPARATORS),
             Class::Digit => self.is_ascii_digit(),
-            Class::Graph => !self.is_control() && !self.is_whitespace(),
-            Class::Lower => self.is_lowercase(),
-            Class::Print => !self.is_control(),
-            Class::Punct => !self.is_control() && !self.is_whitespace() && !self.is_alphanumeric(),
-            Class::Space => self.is_whitespace(),
-            Class::Upper => self.is_uppercase(),
+            Class::Graph => has(ASSIGNED) && !has(CONTROLS) && !space(),
+            // A one-to-one case mapping, as glibc's simple mappings.
+            Class::Lower => self.is_lowercase() || self.upper() != self,
+            Class::Print => has(ASSIGNED) && !has(CONTROLS) && !has(SEPARATORS),
+            Class::Punct => has(ASSIGNED) && !has(CONTROLS) && !space() && !alnum(),
+            Class::Space => space(),
+            Class::Upper => self.is_uppercase() || self.lower() != self,
             Class::Xdigit => self.is_ascii_hexdigit(),
         }
     }
+}
+
+/// Whether `c` is in `table`, sorted ranges: a binary search.
+fn contains(table: &[(char, char)], c: char) -> bool {
+    table
+        .binary_search_by(|&(low, high)| {
+            if high < c {
+                std::cmp::Ordering::Less
+            } else if c < low {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+        .is_ok()
 }
 
 impl Symbol for u8 {
@@ -556,7 +593,7 @@ fn match_items<T: Symbol>(pattern: &[Item<T>], name: &[T], fold: bool) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Name, Pattern, matches, pattern_end};
+    use super::{Class, Name, Pattern, Symbol, matches, pattern_end};
     use crate::work;
 
     fn m(pattern: &str, name: &str) -> bool {
@@ -599,6 +636,11 @@ mod tests {
         assert!(m("[![:digit:]]", "x"));
         assert!(m("[[:alpha:][:digit:]]", "7"));
         assert!(m("[[:upper:]]", "É"), "Unicode classes for UTF-8 names");
+        // glibc's C.UTF-8 classes: an EM SPACE is blank, a line separator
+        // and an unassigned code point are not printable.
+        assert!(m("a[[:blank:]]b", "a\u{2003}b"));
+        assert!(!m("[[:print:]]", "\u{2028}"));
+        assert!(!m("[[:print:]]", "\u{378}"));
         assert!(!m("[[:nope:]]", "n"), "an unknown class matches nothing");
         assert!(!m("[![:nope:]]", "n"), "negated too");
         assert!(m("[a[:nope:]]", "a"), "a member before it still matches");
@@ -631,6 +673,70 @@ mod tests {
         // Also when an escaped `:` keeps the set open.
         assert_eq!(pattern_end("[:\\:cs"), 1);
         assert_eq!(pattern_end("x[:a\\:cs"), 2);
+    }
+
+    /// Every class matches what glibc's `iswctype` gives under C.UTF-8 for
+    /// every Unicode scalar value: tests/classes/glibc-c-utf8.txt, written
+    /// by glibc itself (see tests/classes/glibc-classes.c).
+    #[test]
+    fn classes_match_glibc_c_utf8_for_every_character() {
+        let reference = include_str!("../tests/classes/glibc-c-utf8.txt");
+        let mut expected: Vec<(&str, Class, Vec<bool>)> = Vec::new();
+        for line in reference.lines().filter(|line| !line.starts_with('#')) {
+            let mut words = line.split(' ');
+            let name = words.next().unwrap();
+            if expected.last().is_none_or(|(last, ..)| *last != name) {
+                let class = Class::named(name).unwrap();
+                expected.push((name, class, vec![false; 0x11_0000]));
+            }
+            let members = &mut expected.last_mut().unwrap().2;
+            for range in words {
+                let (low, high) = range.split_once('-').unwrap_or((range, range));
+                let low = usize::from_str_radix(low, 16).unwrap();
+                let high = usize::from_str_radix(high, 16).unwrap();
+                members[low..=high].fill(true);
+            }
+        }
+        let mut names: Vec<&str> = expected.iter().map(|(name, ..)| *name).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            [
+                "alnum", "alpha", "blank", "cntrl", "digit", "graph", "lower", "print", "punct",
+                "space", "upper", "xdigit"
+            ],
+            "every class has one reference"
+        );
+        let mut wrong = Vec::new();
+        for (name, class, members) in &expected {
+            let differ: Vec<char> = (0..=0x10_ffff_u32)
+                .filter_map(char::from_u32)
+                .filter(|&c| c.in_class(*class) != members[c as usize])
+                .collect();
+            if !differ.is_empty() {
+                let first: Vec<String> = differ
+                    .iter()
+                    .take(5)
+                    .map(|&c| format!("U+{:04X}", u32::from(c)))
+                    .collect();
+                wrong.push(format!("{name}: {} ({})", differ.len(), first.join(" ")));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "classes that differ from glibc: {wrong:#?}"
+        );
+    }
+
+    #[test]
+    fn class_tables_are_for_std_unicode_version() {
+        assert_eq!(
+            char::UNICODE_VERSION,
+            super::class_tables::UNICODE_VERSION,
+            "std's Unicode version is not the class tables' one: regenerate \
+             src/fnmatch/class_tables.rs and tests/classes/glibc-c-utf8.txt \
+             (see tests/classes/), with a glibc built for that version"
+        );
     }
 
     #[test]
@@ -675,7 +781,21 @@ mod tests {
         assert!(folded("[[=A=]]", "a"));
         assert!(folded("\\A", "a"));
         assert!(folded("İ", "İ"), "a character that lowercases to two");
-        assert!(!m("[[:upper:]]", "a"), "case-sensitive patterns as before");
+        // "A letter with case" is std's Lowercase or Uppercase: titlecase
+        // letters are neither. They still match when folded, by the
+        // lowercasing of names or by a case variant.
+        for titlecase in ['ǅ', '\u{1f88}'] {
+            assert!(!titlecase.has_case(), "{titlecase}");
+            let name = titlecase.to_string();
+            assert!(folded("[[:upper:]]", &name), "{titlecase}");
+            assert!(folded("[[:lower:]]", &name), "{titlecase}");
+            let unlowered = Name::new(name.as_bytes());
+            assert!(Pattern::new("[[:upper:]]", true).matches(&unlowered));
+        }
+        // Unfolded, glibc's classes: ǅ is upper and lower, U+1F88 upper.
+        assert!(m("[[:upper:]]", "ǅ") && m("[[:lower:]]", "ǅ"));
+        assert!(m("[[:upper:]]", "\u{1f88}") && !m("[[:lower:]]", "\u{1f88}"));
+        assert!(!m("[[:upper:]]", "a"), "case-sensitive patterns keep case");
         assert!(!m("[A-C]", "b"));
         // Names that are not UTF-8: ASCII folding.
         let ascii = Pattern::new("[[:upper:]]?", true);

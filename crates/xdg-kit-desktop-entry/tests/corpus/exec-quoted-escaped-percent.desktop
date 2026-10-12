@@ -1,6 +1,6 @@
 # Invalid whether or not a backslash before % in quotes hides the field
 # code, so it cannot tell the two apart: the unit tests in exec.rs cover
-# that rule (decision 23 of the review fixes).
+# that rule.
 [Desktop Entry]
 Type=Application
 Name=Foo
