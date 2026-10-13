@@ -14,6 +14,7 @@ use xdg_kit_locale::Locales;
 
 use crate::error::{quoted, quoted_message, shown_path};
 use crate::exec::{CommandLine, ExecError, Values};
+use crate::key_file::work;
 use crate::{Action, DesktopEntry, EntryType};
 
 /// Something to open: a local path or a URI.
@@ -329,8 +330,22 @@ fn exec_plan(
         .path()
         .map(|path| std::path::absolute(path).unwrap_or_else(|_| path.to_owned()));
     let location = location.as_deref().map(Path::as_os_str).unwrap_or_default();
-    let mut env = Vec::new();
-    let mut env_remove = Vec::new();
+    // Each byte of the absolute location written.
+    work::count(location.len());
+    // Read once: each read looks through the value's trailing spaces.
+    let terminal = if entry.terminal() {
+        Some(
+            options
+                .terminal
+                .as_ref()
+                .filter(|terminal| !terminal.is_empty())
+                .ok_or(LaunchError::NeedsTerminal)?,
+        )
+    } else {
+        None
+    };
+    let mut env: Vec<(OsString, OsString)> = Vec::new();
+    let mut env_remove: Vec<OsString> = Vec::new();
     for (name, value) in [
         ("XDG_ACTIVATION_TOKEN", &options.activation_token),
         ("DESKTOP_STARTUP_ID", &options.startup_id),
@@ -344,14 +359,22 @@ fn exec_plan(
         .working_dir()
         .filter(|dir| !dir.is_empty())
         .map(PathBuf::from);
-    let mut commands = Vec::new();
+    let copied = env
+        .iter()
+        .map(|(name, value)| name.len() + value.len())
+        .chain(env_remove.iter().map(|part| part.len()))
+        .chain(working_dir.iter().map(|dir| dir.as_os_str().len()))
+        .sum::<usize>();
+    // Everything but the file codes is expanded once, not for each
+    // command.
+    let prepared = line.prepare(Values {
+        icon: icon.as_deref(),
+        name: name.as_deref(),
+        location,
+    });
+    let mut commands = Vec::with_capacity(groups.len());
     for files in &groups {
-        let mut args = line.expand(&Values {
-            files,
-            icon: icon.as_deref(),
-            name: name.as_deref(),
-            location,
-        });
+        let mut args = prepared.expand(files);
         // The application's own command, before a terminal is put in front
         // of it, starts with its program as written: parsing refuses an
         // empty program and a field code in it, and only later arguments
@@ -360,14 +383,15 @@ fn exec_plan(
             args.first().is_some_and(|program| !program.is_empty()),
             "parsing refuses an empty program and field codes in it"
         );
-        if entry.terminal() {
-            let terminal = options
-                .terminal
-                .as_ref()
-                .filter(|terminal| !terminal.is_empty())
-                .ok_or(LaunchError::NeedsTerminal)?;
+        if let Some(terminal) = terminal {
+            // Each byte of the terminal command copied, and each argument
+            // moved after it.
+            work::count(terminal.iter().map(|part| part.len()).sum::<usize>() + args.len());
             args.splice(0..0, terminal.iter().cloned());
         }
+        // Each argument moved when the program is taken off, and each byte
+        // of the environment and the folder copied into the command.
+        work::count(args.len() + copied);
         let program = args.remove(0);
         commands.push(PlannedCommand {
             program,
@@ -395,6 +419,7 @@ fn target_groups(
     let converted: Vec<OsString> = targets
         .iter()
         .map(|target| {
+            work::count(1);
             if code.takes_urls() {
                 to_uri(target).map(OsString::from)
             } else {
@@ -405,6 +430,7 @@ fn target_groups(
     if code.takes_several() || converted.len() <= 1 {
         Ok((vec![converted], false))
     } else {
+        work::count(converted.len());
         Ok((converted.into_iter().map(|one| vec![one]).collect(), false))
     }
 }
@@ -429,6 +455,8 @@ fn to_uri(target: &Target) -> Result<String, LaunchError> {
     match target {
         Target::Uri(uri) => {
             check_uri(uri)?;
+            // Each byte copied.
+            work::count(uri.len());
             Ok(uri.clone())
         }
         Target::Path(path) => {
@@ -441,6 +469,8 @@ fn to_uri(target: &Target) -> Result<String, LaunchError> {
                     let _ = write!(uri, "%{byte:02X}");
                 }
             }
+            // Each byte of the path looked at, and of the URI written.
+            work::count(absolute.as_os_str().len() + uri.len());
             Ok(uri)
         }
     }
@@ -451,6 +481,9 @@ fn to_uri(target: &Target) -> Result<String, LaunchError> {
 /// as an option, and no NUL byte.
 fn check_uri(uri: &str) -> Result<(), LaunchError> {
     let scheme = uri.split_once(':').map(|(scheme, _)| scheme);
+    // The scheme looked through for `:` and checked, and the whole URI for a
+    // NUL byte.
+    work::count_with(|| 2 * scheme.map_or(uri.len(), str::len) + uri.len());
     let valid = scheme.is_some_and(|scheme| {
         scheme.starts_with(|c: char| c.is_ascii_alphabetic())
             && scheme
@@ -479,6 +512,9 @@ fn to_local(target: &Target) -> Result<OsString, LaunchError> {
             else {
                 return Err(LaunchError::NeedsLocalCopy(uri.clone()));
             };
+            // The rest looked through for the end of the host and for `?` or
+            // `#`.
+            work::count(2 * rest.len());
             // `file:///p`, `file://localhost/p`, or `file:/p` (no authority).
             let path = match rest.strip_prefix("//") {
                 Some(rest) => {
@@ -506,15 +542,22 @@ fn to_local(target: &Target) -> Result<OsString, LaunchError> {
 /// cannot be passed to a program.
 fn absolute(path: &Path) -> Result<PathBuf, LaunchError> {
     let bad = || LaunchError::BadPath(path.to_owned());
+    // Each byte looked at for a NUL.
+    work::count(path.as_os_str().len());
     if path.as_os_str().as_bytes().contains(&0) {
         return Err(bad());
     }
-    std::path::absolute(path).map_err(|_| bad())
+    let absolute = std::path::absolute(path).map_err(|_| bad())?;
+    // Each byte of the absolute path written.
+    work::count(absolute.as_os_str().len());
+    Ok(absolute)
 }
 
 /// Decodes `%XX` escapes; `None` when one is not two hexadecimal digits.
 fn percent_decode(text: &str) -> Option<Vec<u8>> {
     let bytes = text.as_bytes();
+    // Each byte looked at and written.
+    work::count(2 * bytes.len());
     let mut out = Vec::with_capacity(bytes.len());
     let mut at = 0;
     while at < bytes.len() {
@@ -542,7 +585,12 @@ impl LaunchPlan {
     ///
     /// When a program cannot be started ([`LaunchError::Spawn`] holds the
     /// handles of those started before it, which keep running) or the D-Bus
-    /// call fails.
+    /// call fails, which it also does when the bus and the application have
+    /// not answered within 25 seconds from the start of connecting. A bus
+    /// whose queue of waiting connections stays full can leave a thread of
+    /// the `blocking` crate's pool (zbus on async-io, as this crate builds
+    /// it) in `connect` for each such launch, as
+    /// many as the pool's limit on threads.
     pub fn spawn(&self) -> Result<Vec<Child>, LaunchError> {
         match &self.launch {
             Launch::Commands(commands) => {
@@ -577,21 +625,41 @@ impl LaunchPlan {
     }
 }
 
-/// How long a D-Bus activation call may take.
+/// How long a D-Bus activation may take, from connecting to the bus to the
+/// application's answer: the reference D-Bus library's default for a call.
+/// A bus or application that stops answering at any step would otherwise
+/// block the caller for ever.
 #[cfg(feature = "dbus")]
 const DBUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
 
 #[cfg(feature = "dbus")]
 fn call_dbus(call: &DBusCall) -> Result<(), LaunchError> {
+    let address = zbus::Address::session().map_err(|err| LaunchError::DBus(err.to_string()))?;
+    call_bus_at(call, address, DBUS_TIMEOUT)
+}
+
+/// Makes `call` on the bus at `address`. Connection, authentication, `Hello`
+/// and the call run as one task with deadline `limit`. At the deadline,
+/// dropping the task closes the connection.
+///
+/// zbus's own `method_timeout` bounds only the call, not the steps before
+/// it, and its socket is non-blocking, so a socket timeout bounds nothing.
+/// With async-io, as this crate builds zbus, zbus runs the blocking
+/// `connect` to a Unix socket on a thread of the `blocking` crate's pool.
+/// On a bus whose queue of waiting connections stays full, that `connect`
+/// blocks: the call still fails at the deadline, but the thread stays in
+/// `connect` until it returns, so each such launch can leave one thread
+/// behind, as many as the pool's limit on threads; once it is reached,
+/// later calls wait for a thread and still fail at the deadline.
+#[cfg(feature = "dbus")]
+fn call_bus_at(
+    call: &DBusCall,
+    address: zbus::Address,
+    limit: std::time::Duration,
+) -> Result<(), LaunchError> {
     use std::collections::HashMap;
     use zbus::zvariant::Value;
 
-    let failed = |err: zbus::Error| LaunchError::DBus(err.to_string());
-    // The reference D-Bus library's default; zbus has none, and a hung
-    // application would block the caller for ever.
-    let connection = zbus::blocking::connection::Builder::session()
-        .and_then(|builder| builder.method_timeout(DBUS_TIMEOUT).build())
-        .map_err(failed)?;
     let platform_data: HashMap<&str, Value<'_>> = call
         .platform_data
         .iter()
@@ -602,31 +670,60 @@ fn call_dbus(call: &DBusCall) -> Result<(), LaunchError> {
         call.object_path.as_str(),
         "org.freedesktop.Application",
     );
-    match &call.method {
-        DBusMethod::Activate => connection.call_method(
-            Some(bus),
-            path,
-            Some(interface),
-            "Activate",
-            &(platform_data,),
-        ),
-        DBusMethod::Open(uris) => connection.call_method(
-            Some(bus),
-            path,
-            Some(interface),
-            "Open",
-            &(uris, platform_data),
-        ),
-        DBusMethod::ActivateAction(name) => connection.call_method(
-            Some(bus),
-            path,
-            Some(interface),
-            "ActivateAction",
-            &(name, Vec::<Value<'_>>::new(), platform_data),
-        ),
-    }
-    .map(drop)
-    .map_err(failed)
+    let connect_and_call = async {
+        let connection = zbus::connection::Builder::address(address)?.build().await?;
+        match &call.method {
+            DBusMethod::Activate => {
+                connection
+                    .call_method(
+                        Some(bus),
+                        path,
+                        Some(interface),
+                        "Activate",
+                        &(&platform_data,),
+                    )
+                    .await
+            }
+            DBusMethod::Open(uris) => {
+                connection
+                    .call_method(
+                        Some(bus),
+                        path,
+                        Some(interface),
+                        "Open",
+                        &(uris, &platform_data),
+                    )
+                    .await
+            }
+            DBusMethod::ActivateAction(name) => {
+                connection
+                    .call_method(
+                        Some(bus),
+                        path,
+                        Some(interface),
+                        "ActivateAction",
+                        &(name, Vec::<Value<'_>>::new(), &platform_data),
+                    )
+                    .await
+            }
+        }
+        .map(drop)
+    };
+    let work = async {
+        connect_and_call
+            .await
+            .map_err(|err: zbus::Error| LaunchError::DBus(err.to_string()))
+    };
+    // Made before the task is first polled, so that the deadline counts
+    // from before connecting.
+    let timer = async_io::Timer::after(limit);
+    let deadline = async {
+        timer.await;
+        Err(LaunchError::DBus(format!(
+            "the bus or the application did not answer within {limit:?}"
+        )))
+    };
+    async_io::block_on(futures_lite::future::or(work, deadline))
 }
 
 #[cfg(not(feature = "dbus"))]
@@ -638,6 +735,8 @@ fn call_dbus(_call: &DBusCall) -> Result<(), LaunchError> {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
+
     use super::*;
     use crate::KeyFile;
 
@@ -1118,6 +1217,103 @@ mod tests {
     }
 
     #[test]
+    fn preparing_a_launch_is_linear_in_its_targets() {
+        // A `Terminal` value with n spaces after it; n arguments that
+        // vanish (no `Icon`); and n codes that expand to nothing (no `Icon`,
+        // no location) in the argument of `%f`: each with n targets, one
+        // command per target. What follows `%f` and the keys after `Exec`,
+        // for n.
+        type Shape = fn(usize) -> (String, String);
+        let shapes: [(&str, Shape); 4] = [
+            ("spaces after Terminal", |n| {
+                (String::new(), format!("Terminal=false{}\n", " ".repeat(n)))
+            }),
+            ("vanishing arguments", |n| (" %i".repeat(n), String::new())),
+            ("icons beside the file", |n| ("%i".repeat(n), String::new())),
+            ("locations beside the file", |n| {
+                ("%k".repeat(n), String::new())
+            }),
+        ];
+        for (what, extra) in shapes {
+            work::assert_linear(
+                1_000,
+                |n| {
+                    let (args, keys) = extra(n);
+                    let text = format!(
+                        "[Desktop Entry]\nType=Application\nName=a\nExec=app %f{args}\n{keys}"
+                    );
+                    let entry = DesktopEntry::parse(text.as_bytes());
+                    let targets: Vec<Target> = (0..n).map(|at| path(&format!("/t/{at}"))).collect();
+                    let bytes =
+                        text.len() + (0..n).map(|at| format!("/t/{at}").len()).sum::<usize>();
+                    let (found, steps) =
+                        work::steps(|| prepare_launch(&entry, &targets, &LaunchOptions::default()));
+                    let found = commands(&found.unwrap());
+                    assert_eq!(found.len(), n, "{what}");
+                    assert_eq!(found[n - 1], ["app".to_owned(), format!("/t/{}", n - 1)]);
+                    (steps, bytes)
+                },
+                // A step per target converted and grouped and per argument
+                // of its command, and each byte of the two environment names
+                // the command drops copied into it: about 50 per target; per
+                // byte of the entry's values looked up, parsed and expanded,
+                // and of each target's path checked, made absolute and
+                // copied: about 5 per byte. Twice that.
+                |targets, bytes| 100 * targets + 10 * bytes,
+            );
+        }
+    }
+
+    #[test]
+    fn each_command_gets_what_expanding_each_argument_gives() {
+        let terminal = LaunchOptions {
+            terminal: Some(vec!["foot".into(), "--".into()]),
+            ..LaunchOptions::default()
+        };
+        let target_sets = [
+            Vec::new(),
+            vec![path("/a")],
+            vec![path("/a b"), uri("file:///c%20d"), path("/e")],
+        ];
+        for exec in crate::exec::TEST_LINES {
+            for keys in ["Icon=foo\n", "Path=/srv\nTerminal=true\n", "Name[de]=Foo\n"] {
+                let entry = entry(&format!(
+                    "Exec={}\n{keys}",
+                    crate::key_file::escape(exec, false)
+                ));
+                let line = CommandLine::parse(&entry.exec().unwrap()).unwrap();
+                let (icon, name) = (entry.icon(&terminal.locales), entry.name(&terminal.locales));
+                let values = Values {
+                    icon: icon.as_deref(),
+                    name: name.as_deref(),
+                    location: OsStr::new(""),
+                };
+                for targets in &target_sets {
+                    let (groups, _) = target_groups(&line, targets).unwrap();
+                    let expected: Vec<Vec<String>> = groups
+                        .iter()
+                        .map(|files| {
+                            let args = line.expand_each_argument(&values, files);
+                            let front: &[&str] = if entry.terminal() {
+                                &["foot", "--"]
+                            } else {
+                                &[]
+                            };
+                            front
+                                .iter()
+                                .map(|&part| part.to_owned())
+                                .chain(args.iter().map(|arg| arg.to_string_lossy().into_owned()))
+                                .collect()
+                        })
+                        .collect();
+                    let found = prepare_launch(&entry, targets, &terminal).unwrap();
+                    assert_eq!(commands(&found), expected, "{exec} {keys:?} {targets:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn spawned_programs_get_their_arguments() {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("out");
@@ -1181,5 +1377,189 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+}
+
+// The fake bus uses a Linux abstract socket because a temporary folder's
+// path may be too long for a socket address.
+#[cfg(all(test, feature = "dbus", target_os = "linux"))]
+mod deadline_tests {
+    use std::io::{Read as _, Write as _};
+    use std::os::linux::net::SocketAddrExt as _;
+    use std::os::unix::net::{SocketAddr, UnixListener};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    use super::*;
+
+    /// The deadline the tests give the call: short, so that they do not
+    /// wait the 25 s a launch gets.
+    const LIMIT: Duration = Duration::from_millis(300);
+
+    /// How much later than the deadline the call may return, and the bus
+    /// may see the connection closed, on a slow machine.
+    const SLACK: Duration = Duration::from_secs(10);
+
+    /// The steps of the start of a connection that the fake bus answers,
+    /// in order; it answers the first `answered`, then nothing more.
+    const STEPS: [&str; 3] = ["authentication", "file descriptor passing", "Hello"];
+
+    /// A bus that answers the first `answered` of [`STEPS`] and then stays
+    /// silent. The receiver gets the moment the client closed the
+    /// connection, and all the client sent.
+    fn fake_bus(answered: usize) -> (zbus::Address, mpsc::Receiver<(Instant, Vec<u8>)>) {
+        // Unique to this run and bus: the process, the time and `answered`.
+        let name = format!(
+            "xdg-kit-test-{}-{}-{answered}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let listener =
+            UnixListener::bind_addr(&SocketAddr::from_abstract_name(&name).unwrap()).unwrap();
+        let address = format!("unix:abstract={name}").parse().unwrap();
+        let (closed, closed_at) = mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut read = Vec::new();
+            let mut sent = 0;
+            let mut buffer = [0; 4096];
+            loop {
+                let n = match stream.read(&mut buffer) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                read.extend_from_slice(&buffer[..n]);
+                while sent < answered {
+                    let Some(answer) = answer(sent, &read) else {
+                        break;
+                    };
+                    stream.write_all(&answer).unwrap();
+                    sent += 1;
+                }
+            }
+            let _ = closed.send((Instant::now(), read));
+        });
+        (address, closed_at)
+    }
+
+    /// The answer to step `step` of [`STEPS`], once what the client sent
+    /// so far, `read`, holds its request.
+    fn answer(step: usize, read: &[u8]) -> Option<Vec<u8>> {
+        let has = |line: &[u8]| read.windows(line.len()).any(|window| window == line);
+        match step {
+            0 => (has(b"AUTH EXTERNAL") && has(b"\r\n"))
+                .then(|| b"OK 0123456789abcdef0123456789abcdef\r\n".to_vec()),
+            1 => has(b"NEGOTIATE_UNIX_FD\r\n").then(|| b"AGREE_UNIX_FD\r\n".to_vec()),
+            _ => {
+                let at = read.windows(7).position(|window| window == b"BEGIN\r\n")? + 7;
+                let header = read.get(at..at + 12)?;
+                let serial: [u8; 4] = header[8..12].try_into().unwrap();
+                let serial = if header[0] == b'l' {
+                    u32::from_le_bytes(serial)
+                } else {
+                    u32::from_be_bytes(serial)
+                };
+                Some(hello_reply(serial))
+            }
+        }
+    }
+
+    /// The bus's reply to `Hello` (a little-endian method return to
+    /// `serial` from `org.freedesktop.DBus`, with the unique name `:1.1`).
+    fn hello_reply(serial: u32) -> Vec<u8> {
+        fn pad(message: &mut Vec<u8>, to: usize) {
+            while !message.len().is_multiple_of(to) {
+                message.push(0);
+            }
+        }
+        fn string(message: &mut Vec<u8>, text: &str) {
+            pad(message, 4);
+            message.extend_from_slice(&u32::try_from(text.len()).unwrap().to_le_bytes());
+            message.extend_from_slice(text.as_bytes());
+            message.push(0);
+        }
+        let body = ":1.1";
+        // Endianness, method return, no flags, version 1; the body's
+        // length; this message's serial.
+        let mut message = vec![b'l', 2, 0, 1];
+        message.extend_from_slice(&u32::try_from(4 + body.len() + 1).unwrap().to_le_bytes());
+        message.extend_from_slice(&1_u32.to_le_bytes());
+        // The header fields' length, filled in below.
+        message.extend_from_slice(&[0; 4]);
+        let fields = message.len();
+        // REPLY_SERIAL (5), a `u`.
+        pad(&mut message, 8);
+        message.extend_from_slice(&[5, 1, b'u', 0]);
+        message.extend_from_slice(&serial.to_le_bytes());
+        // SENDER (7), an `s`.
+        pad(&mut message, 8);
+        message.extend_from_slice(&[7, 1, b's', 0]);
+        string(&mut message, "org.freedesktop.DBus");
+        // SIGNATURE (8), a `g`: the body is one string.
+        pad(&mut message, 8);
+        message.extend_from_slice(&[8, 1, b'g', 0, 1, b's', 0]);
+        let length = u32::try_from(message.len() - fields).unwrap();
+        message[fields - 4..fields].copy_from_slice(&length.to_le_bytes());
+        pad(&mut message, 8);
+        string(&mut message, body);
+        message
+    }
+
+    /// Calls `Activate` on a fake bus that answers the first `answered` of
+    /// [`STEPS`], and checks that the call fails at the deadline and that
+    /// the bus sees the connection closed.
+    fn assert_given_up_at_the_deadline(answered: usize) {
+        let (address, closed_at) = fake_bus(answered);
+        let call = DBusCall {
+            bus_name: "org.example.Foo".to_owned(),
+            object_path: "/org/example/Foo".to_owned(),
+            method: DBusMethod::Activate,
+            platform_data: Vec::new(),
+        };
+        let started = Instant::now();
+        let found = call_bus_at(&call, address, LIMIT);
+        let took = started.elapsed();
+        let stage = STEPS.get(answered).map_or("the call", |step| *step);
+        assert!(
+            matches!(&found, Err(LaunchError::DBus(message)) if message.contains("did not answer")),
+            "stopped at {stage}: {found:?}"
+        );
+        assert!(
+            (LIMIT..LIMIT + SLACK).contains(&took),
+            "stopped at {stage}: returned after {took:?}"
+        );
+        let (closed, sent) = closed_at
+            .recv_timeout(SLACK)
+            .unwrap_or_else(|_| panic!("stopped at {stage}: the connection is still open"));
+        assert!(closed - started >= LIMIT, "stopped at {stage}");
+        let called = sent.windows(8).any(|window| window == b"Activate");
+        assert_eq!(
+            called,
+            answered == STEPS.len(),
+            "stopped at {stage}: the call was sent"
+        );
+    }
+
+    #[test]
+    fn a_bus_that_never_answers_fails_the_call_at_the_deadline() {
+        assert_given_up_at_the_deadline(0);
+    }
+
+    #[test]
+    fn a_bus_that_stops_after_authentication_fails_the_call_at_the_deadline() {
+        assert_given_up_at_the_deadline(1);
+    }
+
+    #[test]
+    fn a_bus_that_stops_before_hello_fails_the_call_at_the_deadline() {
+        assert_given_up_at_the_deadline(2);
+    }
+
+    #[test]
+    fn an_application_that_never_answers_fails_the_call_at_the_deadline() {
+        assert_given_up_at_the_deadline(3);
     }
 }

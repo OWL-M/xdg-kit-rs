@@ -148,7 +148,10 @@ pub(crate) fn valid_dbus_name(name: &str) -> bool {
 /// A boolean value as `GLib` reads one: `true`/`false`, and also `1`/`0`
 /// (which `validate` reports), with spaces or tabs after it ignored.
 fn parse_boolean(value: &str) -> Option<bool> {
-    match value.trim_end_matches([' ', '\t']) {
+    let trimmed = value.trim_end_matches([' ', '\t']);
+    // Each space or tab looked at, and the character before them.
+    work::count(value.len() - trimmed.len() + 1);
+    match trimmed {
         "true" | "1" => Some(true),
         "false" | "0" => Some(false),
         _ => None,

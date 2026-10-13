@@ -13,7 +13,7 @@ categories = ["os::unix-apis", "parser-implementations"]
 
 [features]
 ## Launching applications through D-Bus activation (`DBusActivatable=true`).
-dbus = ["dep:zbus"]
+dbus = ["dep:zbus", "dep:async-io", "dep:futures-lite"]
 # Not public API: compiles in the work counter of this crate's counted tests
 # (`work` in src/key_file.rs), for the workspace's own tests only.
 # `xdg-kit-mime-apps` turns it on in its dev-dependencies, so that its counted
@@ -22,6 +22,8 @@ dbus = ["dep:zbus"]
 __count-work = []
 
 [dependencies]
+async-io = { workspace = true, optional = true }
+futures-lite = { workspace = true, optional = true }
 rustix = { workspace = true, features = ["fs"] }
 xdg-kit-basedir.workspace = true
 xdg-kit-locale.workspace = true
@@ -34,6 +36,8 @@ libc.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# The D-Bus test (tests/dbus.rs) serves a bus through zbus's blocking API.
+zbus = { workspace = true, features = ["blocking-api"] }
 
 [lints]
 workspace = true

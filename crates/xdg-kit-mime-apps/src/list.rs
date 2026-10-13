@@ -71,7 +71,14 @@ impl fmt::Display for EditError {
     }
 }
 
-impl std::error::Error for EditError {}
+impl std::error::Error for EditError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::KeyFile(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 impl From<xdg_kit_desktop_entry::EditError> for EditError {
     fn from(error: xdg_kit_desktop_entry::EditError) -> Self {
@@ -351,10 +358,13 @@ impl MimeAppsList {
     /// (ignored), and an ID both added and removed for one type (the spec:
     /// invalid; the addition counts, as it is read first), however the keys
     /// spell the type: in another case, or, when [resolving
-    /// aliases](MimeAppsList::resolving_aliases), as an alias. Diagnostics
-    /// point to the key's original line. Key-file diagnostics retain their
-    /// own locations; diagnostics about a whole group in a desktop-specific
-    /// file point to the group's header.
+    /// aliases](MimeAppsList::resolving_aliases), as an alias.
+    ///
+    /// Line numbers are those of the text as it is now (after any edits),
+    /// counted from 1, as in [`KeyFile::diagnostics`]: a diagnostic about a
+    /// key points to the line holding that key as written; key-file
+    /// diagnostics keep the key file's line numbers; a diagnostic about a
+    /// whole group in a desktop-specific file points to the group's header.
     #[must_use]
     pub fn diagnostics(&self) -> Vec<Diagnostic> {
         let path_len = self.path.as_ref().map_or(0, |path| path.as_os_str().len());
@@ -791,6 +801,29 @@ mod tests {
     }
 
     #[test]
+    fn diagnostics_give_the_lines_of_the_text_as_it_is() {
+        // `BAD` is no type pattern; `garbage` is no entry, which the key
+        // file reports. Removing the line above both moves them up.
+        let mut list = MimeAppsList::parse(
+            b"[Added Associations]\ntext/plain=a.desktop;\nBAD=x;\ngarbage\n",
+            false,
+        );
+        let lines = |list: &MimeAppsList| {
+            let mut lines: Vec<(Option<usize>, bool)> = list
+                .diagnostics()
+                .into_iter()
+                .map(|diagnostic| (diagnostic.line, diagnostic.message.contains("BAD")))
+                .collect();
+            lines.sort_unstable();
+            lines
+        };
+        assert_eq!(lines(&list), [(Some(3), true), (Some(4), false)]);
+        assert!(list.forget(&p("text/plain")));
+        assert_eq!(list.to_bytes(), b"[Added Associations]\nBAD=x;\ngarbage\n");
+        assert_eq!(lines(&list), [(Some(2), true), (Some(3), false)]);
+    }
+
+    #[test]
     fn reads_every_group() {
         let list = MimeAppsList::parse(SAMPLE.as_bytes(), false);
         assert_eq!(
@@ -909,6 +942,18 @@ mod tests {
             b"[Default Applications]\ntext/plain=a.desktop;\n"
         );
         assert_eq!(list.to_bytes(), SAMPLE.as_bytes(), "unchanged");
+    }
+
+    #[test]
+    fn a_key_file_edit_error_is_the_source() {
+        let refused = xdg_kit_desktop_entry::KeyFile::new()
+            .set_list("bad]group", "key", &["a"])
+            .unwrap_err();
+        let error = EditError::from(refused.clone());
+        assert_eq!(error.to_string(), refused.to_string());
+        let source = std::error::Error::source(&error).expect("the key file's error");
+        assert_eq!(source.to_string(), refused.to_string());
+        assert!(std::error::Error::source(&EditError::DesktopSpecific).is_none());
     }
 
     #[test]

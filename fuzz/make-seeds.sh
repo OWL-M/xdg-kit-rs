@@ -60,6 +60,11 @@ printf '<?xml version="1.0" standalone="yes"?><!DOCTYPE mime-type [<!ENTITY ns "
 # freedesktop.org.xml has.
 printf '<!DOCTYPE r PUBLIC "-//x//EN" "s" [<!ENTITY ns "urn:x"><!ELEMENT r (a,(b|c)*,d?)+><!ELEMENT a (#PCDATA|b)*><!ATTLIST r a ID #IMPLIED b (x|y) "x" c NOTATION (n) #FIXED "n"><!NOTATION n PUBLIC "-//n//EN"><!ENTITY u SYSTEM "u.gif" NDATA n><!-- c --><?pi x?>]><r xmlns="&ns;"/>' > "$out/xml_root/subset-grammar"
 printf '<!DOCTYPE mime-type [<!ENTITY ns "http://www.freedesktop.org/standards/shared-mime-info"><!ELEMENT mime-type (comment+, (acronym,expanded-acronym)? , (icon? | glob | alias)*)><!ATTLIST mime-type type CDATA #REQUIRED><!ELEMENT comment (#PCDATA)><!ATTLIST comment xml:lang CDATA #IMPLIED><!ATTLIST glob weight CDATA "50">]><mime-type xmlns="&ns;" type="a/b"><comment>c</comment></mime-type>' > "$out/type_xml/subset-grammar"
+# Attribute defaults: an entity in a namespace declaration, a prefixed
+# namespace declaration with a type that collapses spaces, and a field's
+# language.
+printf '<!DOCTYPE p:r [<!ENTITY ns "urn:x"><!ATTLIST p:r xmlns CDATA "&ns;" xmlns:p NMTOKEN " urn:p ">]><p:r a="1"/>' > "$out/xml_root/attlist-defaults"
+printf '<!DOCTYPE mime-type [<!ATTLIST mime-type xmlns CDATA #FIXED "http://www.freedesktop.org/standards/shared-mime-info" xml:lang NMTOKEN " fr "><!ATTLIST comment xml:lang CDATA "de">]><mime-type type="a/b"><comment>c</comment><comment xml:lang="">u</comment><acronym>A</acronym></mime-type>' > "$out/type_xml/attlist-defaults"
 printf '*.tar.gz\000a.tar.gz' > "$out/fnmatch/star"
 printf 'seed-[0-9]?.*\000seed-4x.txt' > "$out/fnmatch/set"
 printf '[!a-c]\\*\000d*' > "$out/fnmatch/escape"

@@ -398,7 +398,11 @@ impl MimeDatabase {
     /// handles only its ASCII text correctly. Ignores the whole
     /// declaration if it violates XML's grammar: `version`, then optional
     /// `encoding`, then optional `standalone`, each appearing once with
-    /// a valid value.
+    /// a valid value. Namespace defaults from the document's internal subset
+    /// apply to the root as written declarations do (XML 1.0, 3.3.2). For
+    /// written or defaulted `xmlns` or `xmlns:` values declared with a type
+    /// other than `CDATA`, leading and trailing spaces are removed and runs
+    /// of spaces collapse to one (3.3.3).
     #[must_use]
     pub fn type_for_data(&self, data: &[u8]) -> Detection {
         if data.is_empty() {
@@ -443,7 +447,11 @@ impl MimeDatabase {
     /// handles only its ASCII text correctly. Ignores the whole
     /// declaration if it violates XML's grammar: `version`, then optional
     /// `encoding`, then optional `standalone`, each appearing once with
-    /// a valid value.
+    /// a valid value. Namespace defaults from the document's internal subset
+    /// apply to the root as written declarations do (XML 1.0, 3.3.2). For
+    /// written or defaulted `xmlns` or `xmlns:` values declared with a type
+    /// other than `CDATA`, leading and trailing spaces are removed and runs
+    /// of spaces collapse to one (3.3.3).
     #[must_use]
     pub fn type_for_name_and_data(&self, name: impl AsRef<OsStr>, data: &[u8]) -> Detection {
         let names = self.type_for_name(name);

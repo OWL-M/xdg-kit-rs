@@ -11,11 +11,13 @@
 //! `gkeyfile.c`: a repeated group continues the first one, and a repeated
 //! key's last value counts. Both produce diagnostics.
 
+use std::borrow::Borrow;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::fs::{self, OpenOptions};
-use std::hash::Hash;
+use std::hash::{BuildHasher, Hash, Hasher, RandomState};
 use std::io::{self, Write};
+use std::marker::PhantomData;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -275,6 +277,390 @@ fn depth(len: usize) -> usize {
     usize::try_from(usize::BITS - len.leading_zeros()).unwrap_or(usize::MAX)
 }
 
+/// Borrowed parts of an index key: a number (the group number for a group's
+/// key) and up to two names. Each map holds one key type ([`Text`]), so keys
+/// of different types cannot share a map even if their parts are identical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct Parts<'a> {
+    number: u64,
+    first: Option<&'a str>,
+    second: Option<&'a str>,
+}
+
+impl Parts<'_> {
+    /// The bytes of its names.
+    fn bytes(self) -> usize {
+        self.first.map_or(0, str::len) + self.second.map_or(0, str::len)
+    }
+}
+
+/// A key's text, represented by [`Parts`]. Building a key from parts must
+/// preserve those parts.
+trait Text: 'static {
+    fn parts(&self) -> Parts<'_>;
+    fn from_parts(parts: Parts<'_>) -> Self;
+}
+
+/// A group name, or a locale postfix without its `.ENCODING` part.
+impl Text for Box<str> {
+    fn parts(&self) -> Parts<'_> {
+        Parts {
+            number: 0,
+            first: Some(self),
+            second: None,
+        }
+    }
+
+    fn from_parts(parts: Parts<'_>) -> Self {
+        parts.first.unwrap_or_default().into()
+    }
+}
+
+/// A locale of a key (`None`: untranslated).
+impl Text for Option<Box<str>> {
+    fn parts(&self) -> Parts<'_> {
+        Parts {
+            number: 0,
+            first: self.as_deref(),
+            second: None,
+        }
+    }
+
+    fn from_parts(parts: Parts<'_>) -> Self {
+        parts.first.map(Box::from)
+    }
+}
+
+/// A key of a group with its locale (`None`: untranslated).
+type KeyText = (Box<str>, Option<Box<str>>);
+
+impl Text for KeyText {
+    fn parts(&self) -> Parts<'_> {
+        Parts {
+            number: 0,
+            first: Some(&self.0),
+            second: self.1.as_deref(),
+        }
+    }
+
+    fn from_parts(parts: Parts<'_>) -> Self {
+        (
+            parts.first.unwrap_or_default().into(),
+            parts.second.map(Box::from),
+        )
+    }
+}
+
+/// A key of the group whose first block has the number given.
+impl Text for (u64, Box<str>) {
+    fn parts(&self) -> Parts<'_> {
+        Parts {
+            number: self.0,
+            first: Some(&self.1),
+            second: None,
+        }
+    }
+
+    fn from_parts(parts: Parts<'_>) -> Self {
+        (parts.number, parts.first.unwrap_or_default().into())
+    }
+}
+
+/// An index key's text ([`Text`]) and cached hash. The index's [`Seed`]
+/// computes the hash during lookup, before insertion ([`Lookup::to_owned`]).
+/// Maps hash only this number ([`UseCached`]), so growth and shrinking cost
+/// one step per entry regardless of text length. Cloning copies both the
+/// text and its hash.
+///
+/// [`Lookup`] borrows names without copying them. Both forms expose a
+/// [`View`] with the same hashing and equality rules: hash the cached
+/// number, then compare text when hashes match. Text comparisons count one
+/// step per byte; equal hashes alone do not make keys equal.
+#[derive(Clone)]
+struct Hashed<T> {
+    hash: u64,
+    text: T,
+}
+
+impl<T: Text> Hashed<T> {
+    /// The bytes of its names.
+    fn bytes(&self) -> usize {
+        self.text.parts().bytes()
+    }
+}
+
+/// Its text only: the hash, random from run to run, is left out.
+impl<T: fmt::Debug> fmt::Debug for Hashed<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.text.fmt(f)
+    }
+}
+
+/// A borrowed lookup in a map keyed by [`Hashed`] text. Holds the names as
+/// [`Parts`] and their hash, computed with the stored key's [`Seed`].
+struct Lookup<'a, T> {
+    hash: u64,
+    parts: Parts<'a>,
+    text: PhantomData<fn() -> T>,
+}
+
+impl<'a, T: Text> Lookup<'a, T> {
+    /// What a map is searched with.
+    fn view(&self) -> &(dyn View<T> + 'a) {
+        self
+    }
+
+    /// Builds a stored key by copying the names (one step per byte) and
+    /// keeping the hash. The parts must match the key type's shape
+    /// ([`Text`]), as [`Seed`]'s lookups do. A key that discards any lookup
+    /// parts would no longer match that lookup.
+    fn to_owned(&self) -> Hashed<T> {
+        work::count(self.parts.bytes());
+        let text = T::from_parts(self.parts);
+        debug_assert_eq!(
+            text.parts(),
+            self.parts,
+            "a lookup of a shape its kind of key does not take"
+        );
+        Hashed {
+            hash: self.hash,
+            text,
+        }
+    }
+}
+
+/// A key of a map keyed by [`Hashed`] text, stored or looked up: its cached
+/// hash and its text. The two forms hash and compare alike, as their views
+/// do ([`Borrow`]).
+trait View<T> {
+    fn cached(&self) -> u64;
+    fn parts(&self) -> Parts<'_>;
+}
+
+impl<T: Text> View<T> for Hashed<T> {
+    fn cached(&self) -> u64 {
+        self.hash
+    }
+
+    fn parts(&self) -> Parts<'_> {
+        self.text.parts()
+    }
+}
+
+impl<T> View<T> for Lookup<'_, T> {
+    fn cached(&self) -> u64 {
+        self.hash
+    }
+
+    fn parts(&self) -> Parts<'_> {
+        self.parts
+    }
+}
+
+impl<T> Hash for dyn View<T> + '_ {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.cached());
+    }
+}
+
+impl<T> PartialEq for dyn View<T> + '_ {
+    fn eq(&self, other: &Self) -> bool {
+        self.cached() == other.cached() && {
+            let (parts, others) = (self.parts(), other.parts());
+            // A step per byte compared.
+            work::count(parts.bytes().min(others.bytes()));
+            parts == others
+        }
+    }
+}
+
+impl<T> Eq for dyn View<T> + '_ {}
+
+/// The stored key lends its view, so that a map keyed by it is searched by
+/// a [`Lookup`], which copies nothing.
+impl<'a, T: Text> Borrow<dyn View<T> + 'a> for Hashed<T> {
+    fn borrow(&self) -> &(dyn View<T> + 'a) {
+        self
+    }
+}
+
+/// As its view hashes.
+impl<T: Text> Hash for Hashed<T> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.hash);
+    }
+}
+
+/// As its view compares.
+impl<T: Text> PartialEq for Hashed<T> {
+    fn eq(&self, other: &Self) -> bool {
+        let (view, other): (&dyn View<T>, &dyn View<T>) = (self, other);
+        view == other
+    }
+}
+
+impl<T: Text> Eq for Hashed<T> {}
+
+/// A map keyed by [`Hashed`] text.
+type ByText<K, V> = HashMap<Hashed<K>, V, UseCached>;
+
+/// Applies `change` to the value of `key` in `map`. If the key is absent,
+/// inserts the default value first. Copies the key's text only on insertion
+/// ([`Lookup::to_owned`]).
+fn change_or_add<T: Text, V: Default>(
+    map: &mut ByText<T, V>,
+    key: &Lookup<'_, T>,
+    change: impl FnOnce(&mut V),
+) {
+    if let Some(value) = map.get_mut(key.view()) {
+        change(value);
+    } else {
+        let mut value = V::default();
+        change(&mut value);
+        map.insert(key.to_owned(), value);
+    }
+}
+
+/// The index's random hash seed prevents choosing colliding names in
+/// advance. Clones preserve it so lookups agree with the copied keys' hashes.
+#[derive(Debug, Clone, Default)]
+struct Seed(RandomState);
+
+impl Seed {
+    /// A lookup of `parts`, hashed with a step per byte. Stored keys are
+    /// made from lookups ([`Lookup::to_owned`]), so that a key and a lookup
+    /// of the same text have the same hash.
+    fn lookup<'a, T: Text>(&self, parts: Parts<'a>) -> Lookup<'a, T> {
+        work::count(parts.bytes());
+        Lookup {
+            hash: self.0.hash_one(parts),
+            parts,
+            text: PhantomData,
+        }
+    }
+
+    fn name<'a>(&self, name: &'a str) -> Lookup<'a, Box<str>> {
+        self.lookup(Parts {
+            number: 0,
+            first: Some(name),
+            second: None,
+        })
+    }
+
+    fn key<'a>(&self, key: &'a str, locale: Option<&'a str>) -> Lookup<'a, KeyText> {
+        self.lookup(Parts {
+            number: 0,
+            first: Some(key),
+            second: locale,
+        })
+    }
+
+    fn entry<'a>(&self, group: u64, key: &'a str) -> Lookup<'a, (u64, Box<str>)> {
+        self.lookup(Parts {
+            number: group,
+            first: Some(key),
+            second: None,
+        })
+    }
+
+    fn locale<'a>(&self, locale: Option<&'a str>) -> Lookup<'a, Option<Box<str>>> {
+        self.lookup(Parts {
+            number: 0,
+            first: locale,
+            second: None,
+        })
+    }
+}
+
+/// Builds hashers for maps keyed by [`Hashed`] text. Each uses the key's
+/// cached hash directly, so hashing a key costs one step.
+#[derive(Debug, Clone, Copy, Default)]
+struct UseCached;
+
+impl BuildHasher for UseCached {
+    type Hasher = Cached;
+
+    fn build_hasher(&self) -> Cached {
+        Cached(0)
+    }
+}
+
+/// Uses the single number written by a [`Hashed`] key's [`View`] as its
+/// hash. Additional writes are a bug, checked by tests, but are still folded
+/// into the hash.
+#[derive(Debug)]
+struct Cached(u64);
+
+#[cfg(test)]
+thread_local! {
+    /// The bytes written to [`Cached`] hashers on this thread, in tests.
+    static FED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+impl Cached {
+    /// Notes `bytes` bytes written, in tests.
+    fn fed(bytes: usize) {
+        #[cfg(test)]
+        FED.with(|fed| fed.set(fed.get() + bytes));
+        #[cfg(not(test))]
+        let _ = bytes;
+    }
+}
+
+impl Hasher for Cached {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        #[cfg(test)]
+        {
+            let _ = bytes;
+            panic!("only a cached hash is written to the hasher of a map keyed by text");
+        }
+        #[cfg(not(test))]
+        for &byte in bytes {
+            self.0 = self.0.rotate_left(8) ^ u64::from(byte);
+        }
+    }
+
+    fn write_u64(&mut self, hash: u64) {
+        Self::fed(8);
+        // The hash itself when it is the first thing written.
+        self.0 = self.0.rotate_left(32) ^ hash;
+    }
+}
+
+/// Shrinks `map` when less than an eighth of its capacity is used. The map
+/// and its clones then use memory proportional to the entries still present,
+/// rather than the peak entry count.
+///
+/// Shrinking moves each entry kept to a table sized to fit them (a step
+/// per entry: keys of text carry their hash, so none is hashed again,
+/// however long). It is constant amortized work per removal: right after
+/// a map grows or shrinks to room for more than seven entries, its
+/// capacity is at most about twice its entries (its buckets are a power of
+/// two, seven eighths of them usable), so before it shrinks again more
+/// than three entries were removed for each entry it then keeps. A map
+/// with room for seven or fewer shrinks only once empty, at one step.
+fn fit<K: Eq + Hash, V, S: BuildHasher>(map: &mut HashMap<K, V, S>) {
+    if 8 * map.len() < map.capacity() {
+        work::count(1 + map.len());
+        map.shrink_to_fit();
+    }
+}
+
+/// Shrinks `items` when less than an eighth of its capacity is used, as
+/// [`fit`] does for maps. This costs one step per retained item and constant
+/// amortized work per removal: growth beyond the minimum capacity at most
+/// doubles it, and shrinking leaves no unused capacity.
+fn fit_list<T>(items: &mut Vec<T>) {
+    if 8 * items.len() < items.capacity() {
+        work::count(1 + items.len());
+        items.shrink_to_fit();
+    }
+}
+
 /// The lines of one key in a group, found by locale: finding, adding or
 /// removing the lines of one locale is constant work for distinct locales,
 /// and log n among the n variants that share a postfix once their
@@ -290,58 +676,49 @@ struct KeyLines {
     /// The ids of the lines of each locale (`None`: untranslated), in file
     /// order; as a repeated key's last value counts, the last one is the
     /// one read.
-    lines: HashMap<Option<String>, Vec<u64>>,
+    lines: ByText<Option<Box<str>>, Vec<u64>>,
     /// The ids of the lines of each locale postfix with an `.ENCODING`
     /// part, under the postfix without it.
-    encoded: HashMap<String, BTreeSet<u64>>,
+    encoded: ByText<Box<str>, BTreeSet<u64>>,
 }
 
 impl KeyLines {
     /// Adds the line of the entry `id` for `locale`; it comes after the
-    /// key's other lines.
-    fn add(&mut self, locale: Option<&str>, id: u64) {
-        // Looked through for a `.`, then copied, hashed and compared as a
-        // key (see [`work`]).
-        work::count(4 * locale.map_or(0, str::len));
+    /// key's other lines. Names are hashed with `seed`, the index's.
+    fn add(&mut self, seed: &Seed, locale: Option<&str>, id: u64) {
+        // Looked through for a `.`.
+        work::count(locale.map_or(0, str::len));
         if let Some(locale) = locale.filter(|locale| locale.contains('.')) {
-            let stripped = strip_encoding(locale).into_owned();
-            // The postfix without its encoding hashed and compared as a key,
-            // and the place added to its set.
-            work::count(2 * stripped.len());
-            let ids = self.encoded.entry(stripped).or_default();
-            work::count(depth(ids.len()));
-            ids.insert(id);
+            let stripped = strip_encoding(locale);
+            change_or_add(&mut self.encoded, &seed.name(&stripped), |ids| {
+                // The place added to the postfix's set.
+                work::count(depth(ids.len()));
+                ids.insert(id);
+            });
         }
-        self.lines
-            .entry(locale.map(str::to_owned))
-            .or_default()
-            .push(id);
+        change_or_add(&mut self.lines, &seed.locale(locale), |ids| ids.push(id));
     }
 
     /// The id of the last line of `locale`.
-    fn last(&self, locale: Option<&str>) -> Option<u64> {
-        // Copied, hashed and compared.
-        work::count(3 * locale.map_or(0, str::len));
+    fn last(&self, seed: &Seed, locale: Option<&str>) -> Option<u64> {
         self.lines
-            .get(&locale.map(str::to_owned))
+            .get(seed.locale(locale).view())
             .and_then(|ids| ids.last())
             .copied()
     }
 
     /// The id of the line holding the value of `locale`: the last one, as
     /// a repeated key's last value counts.
-    fn find(&self, locale: Option<&str>) -> Option<u64> {
-        let id = self.last(locale);
+    fn find(&self, seed: &Seed, locale: Option<&str>) -> Option<u64> {
+        let id = self.last(seed, locale);
         work::count(1);
         id
     }
 
     /// The id of the last line whose locale postfix is `wanted` once its
     /// `.ENCODING` part is stripped, `wanted` having none.
-    fn last_encoded(&self, wanted: &str) -> Option<u64> {
-        // Hashed and compared.
-        work::count(2 * wanted.len());
-        let ids = self.encoded.get(wanted)?;
+    fn last_encoded(&self, seed: &Seed, wanted: &str) -> Option<u64> {
+        let ids = self.encoded.get(seed.name(wanted).view())?;
         work::count(depth(ids.len()));
         ids.last().copied()
     }
@@ -352,63 +729,46 @@ impl KeyLines {
         let lines: usize = self
             .lines
             .iter()
-            .map(|(locale, ids)| 1 + locale.as_ref().map_or(0, String::len) + ids.len())
+            .map(|(locale, ids)| 1 + locale.bytes() + ids.len())
             .sum();
         let encoded: usize = self
             .encoded
             .iter()
-            .map(|(postfix, ids)| 1 + postfix.len() + ids.len())
+            .map(|(postfix, ids)| 1 + postfix.bytes() + ids.len())
             .sum();
         lines + encoded
     }
 
     /// Takes out the lines of `locale` and returns their ids, in file
     /// order.
-    fn remove(&mut self, locale: Option<&str>) -> Vec<u64> {
-        // Copied, hashed and compared.
-        work::count(3 * locale.map_or(0, str::len));
+    fn remove(&mut self, seed: &Seed, locale: Option<&str>) -> Vec<u64> {
         let ids = self
             .lines
-            .remove(&locale.map(str::to_owned))
+            .remove(seed.locale(locale).view())
             .unwrap_or_default();
+        // Looked through for a `.`.
+        work::count(locale.map_or(0, str::len));
         if let Some(locale) = locale.filter(|locale| locale.contains('.')) {
             let stripped = strip_encoding(locale);
-            // Looked through for a `.`; then the postfix without its
-            // encoding hashed and compared, twice when its set empties.
-            work::count(locale.len() + 4 * stripped.len());
-            if let Some(set) = self.encoded.get_mut(stripped.as_ref()) {
+            let stripped = seed.name(&stripped);
+            if let Some(set) = self.encoded.get_mut(stripped.view()) {
                 for id in &ids {
                     work::count(depth(set.len()));
                     set.remove(id);
                 }
                 if set.is_empty() {
-                    self.encoded.remove(stripped.as_ref());
+                    self.encoded.remove(stripped.view());
+                    fit(&mut self.encoded);
                 }
             }
         }
+        fit(&mut self.lines);
         ids
     }
 
     /// Every id of the key's lines.
     fn ids(&self) -> impl Iterator<Item = u64> {
         self.lines.values().flatten().copied()
-    }
-}
-
-/// How many bytes an item of a [`Listed`] has, for [`work`].
-trait Bytes {
-    fn bytes(&self) -> usize;
-}
-
-impl Bytes for String {
-    fn bytes(&self) -> usize {
-        self.len()
-    }
-}
-
-impl Bytes for (String, Option<String>) {
-    fn bytes(&self) -> usize {
-        self.0.len() + self.1.as_ref().map_or(0, String::len)
     }
 }
 
@@ -420,9 +780,9 @@ impl Bytes for (String, Option<String>) {
 #[derive(Debug, Clone)]
 struct Listed<T> {
     /// The items with their numbers, and gaps.
-    items: Vec<Option<(u64, T)>>,
+    items: Vec<Option<(u64, Hashed<T>)>>,
     /// Each item's number.
-    numbers: HashMap<T, u64>,
+    numbers: ByText<T, u64>,
     /// Where each item is in `items`, by its number.
     at: HashMap<u64, usize>,
     /// The number the next item gets. Numbers are never reused. Running
@@ -435,23 +795,22 @@ impl<T> Default for Listed<T> {
     fn default() -> Self {
         Self {
             items: Vec::new(),
-            numbers: HashMap::new(),
+            numbers: HashMap::default(),
             at: HashMap::new(),
             next: 0,
         }
     }
 }
 
-impl<T: Bytes + Clone + Eq + Hash> Listed<T> {
+impl<T: Text + Clone> Listed<T> {
     /// Adds `item` at the end unless it is listed; whether it was new.
-    fn insert(&mut self, item: T) -> bool {
-        // Hashed and compared; when new, copied, hashed and compared again,
-        // and its number hashed.
-        work::count(2 * item.bytes());
-        if self.numbers.contains_key(&item) {
+    fn insert(&mut self, item: &Lookup<'_, T>) -> bool {
+        if self.numbers.contains_key(item.view()) {
             return false;
         }
-        work::count(3 * item.bytes() + 1);
+        let item = item.to_owned();
+        // Copied again, and its number hashed.
+        work::count(item.bytes() + 1);
         let number = self.next;
         self.next = number
             .checked_add(1)
@@ -462,10 +821,8 @@ impl<T: Bytes + Clone + Eq + Hash> Listed<T> {
         true
     }
 
-    fn remove(&mut self, item: &T) {
-        // Hashed and compared.
-        work::count(2 * item.bytes());
-        let Some(number) = self.numbers.remove(item) else {
+    fn remove(&mut self, item: &Lookup<'_, T>) {
+        let Some(number) = self.numbers.remove(item.view()) else {
             return;
         };
         // Its number hashed.
@@ -473,11 +830,14 @@ impl<T: Bytes + Clone + Eq + Hash> Listed<T> {
         if let Some(at) = self.at.remove(&number) {
             self.items[at] = None;
         }
+        fit(&mut self.numbers);
+        fit(&mut self.at);
         if 2 * self.at.len() < self.items.len() {
             // A step per item or gap, and per item kept for its number
             // hashed to note its new place.
             work::count(self.items.len() + self.at.len());
             self.items.retain(Option::is_some);
+            fit_list(&mut self.items);
             for (at, (number, _)) in self.items.iter().flatten().enumerate() {
                 self.at.insert(*number, at);
             }
@@ -498,7 +858,7 @@ impl<T: Bytes + Clone + Eq + Hash> Listed<T> {
     /// The items in order, with a step per item or gap.
     fn iter(&self) -> impl Iterator<Item = &T> {
         work::count(self.items.len());
-        self.items.iter().flatten().map(|(_, item)| item)
+        self.items.iter().flatten().map(|(_, item)| &item.text)
     }
 
     fn is_empty(&self) -> bool {
@@ -514,18 +874,24 @@ impl<T: Bytes + Clone + Eq + Hash> Listed<T> {
 /// that the work per entry does not grow with the group's name. Past
 /// `entries`, an entry is named by its id, so that moving its line does
 /// not grow with its key or locale.
+///
+/// Its maps keyed by text key on [`Hashed`] text, hashed with its `seed`:
+/// each name is hashed once per edit or lookup that gives it, and never
+/// again as its map grows or shrinks.
 #[derive(Debug, Clone, Default)]
 struct Index {
+    /// What the names in its maps are hashed with.
+    seed: Seed,
     /// Group names, each once, in the order they first appear.
-    groups: Listed<String>,
+    groups: Listed<Box<str>>,
     /// The numbers of the blocks of each group's headers, in file order. The
     /// first names the group; a new entry goes at the end of the `lines` of
     /// the last.
-    headers: HashMap<String, Vec<u64>>,
+    headers: ByText<Box<str>, Vec<u64>>,
     /// Each group's keys with their locales, each once, in order.
-    keys: HashMap<u64, Listed<(String, Option<String>)>>,
+    keys: HashMap<u64, Listed<KeyText>>,
     /// The lines of each (group, key), by locale.
-    entries: HashMap<(u64, String), KeyLines>,
+    entries: ByText<(u64, Box<str>), KeyLines>,
     /// The place of each indexed entry, by its id ([`Kind::Entry`]):
     /// moving a line updates its place here in constant work, without its
     /// key or locale.
@@ -563,7 +929,9 @@ impl Index {
     /// number hashed.
     fn take_place(&mut self, id: u64) -> Option<Place> {
         work::count(1);
-        self.places.remove(&id)
+        let place = self.places.remove(&id);
+        fit(&mut self.places);
+        place
     }
 
     /// The steps of copying it: one per group, key and entry, per byte of
@@ -573,13 +941,13 @@ impl Index {
         let headers: usize = self
             .headers
             .iter()
-            .map(|(name, numbers)| 1 + name.len() + numbers.len())
+            .map(|(name, numbers)| 1 + name.bytes() + numbers.len())
             .sum();
         let keys: usize = self.keys.values().map(|keys| 1 + keys.copy_steps()).sum();
         let entries: usize = self
             .entries
             .iter()
-            .map(|((_, key), lines)| 1 + key.len() + lines.copy_steps())
+            .map(|(name, lines)| 1 + name.bytes() + lines.copy_steps())
             .sum();
         self.groups.copy_steps() + headers + keys + entries + self.places.len()
     }
@@ -587,7 +955,10 @@ impl Index {
 
 /// A key file: groups of `key=value` entries, with comments.
 ///
-/// Two key files are equal when their text is.
+/// Two key files are equal when their text is. Removing keys or groups
+/// lets go of the room they took, amortized, so that after removals the
+/// memory a key file keeps, and what a clone of it copies, follow the keys
+/// and groups left rather than the most it once held.
 #[derive(Debug)]
 pub struct KeyFile {
     /// The lines before the first group header, then one block per header,
@@ -1047,22 +1418,20 @@ impl KeyFile {
                 }
                 match &mut line.kind {
                     Kind::Group(name) => {
-                        // Hashed and compared; when new, copied, hashed and
-                        // compared again (the group list counts its own).
-                        work::count(2 * name.len());
-                        if let Some(found) = index.headers.get_mut(name) {
+                        let name = index.seed.name(name);
+                        if let Some(found) = index.headers.get_mut(name.view()) {
                             found.push(number);
                             group = Some(found[0]);
                             let problem = format!(
                                 "group [{}] appears again; its entries join the first one",
-                                quoted(name)
+                                quoted(name.parts.first.unwrap_or_default())
                             );
                             work::count(problem.len());
                             problems.push((at, problem));
                         } else {
-                            work::count(3 * name.len());
-                            index.headers.insert(name.clone(), vec![number]);
-                            index.groups.insert(name.clone());
+                            // The group list counts its own copies.
+                            index.headers.insert(name.to_owned(), vec![number]);
+                            index.groups.insert(&name);
                             group = Some(number);
                         }
                     }
@@ -1075,23 +1444,17 @@ impl KeyFile {
                             problems.push((at, "entry before the first group; ignored".to_owned()));
                             continue;
                         };
-                        // The key and locale copied for the key list (which
-                        // counts the rest), and the key copied, hashed and
-                        // compared for the entries.
-                        work::count(4 * key.len() + locale.as_ref().map_or(0, String::len));
                         let new = index
                             .keys
                             .entry(group)
                             .or_default()
-                            .insert((key.clone(), locale.clone()));
+                            .insert(&index.seed.key(key, locale.as_deref()));
                         if !new {
                             problems.push((at, repeated_key(key, locale.as_deref())));
                         }
-                        index
-                            .entries
-                            .entry((group, key.clone()))
-                            .or_default()
-                            .add(locale.as_deref(), *id);
+                        change_or_add(&mut index.entries, &index.seed.entry(group, key), |lines| {
+                            lines.add(&index.seed, locale.as_deref(), *id);
+                        });
                         index.set_place(*id, (number, at));
                     }
                     Kind::Blank | Kind::Comment | Kind::Invalid | Kind::Removed => {}
@@ -1254,15 +1617,15 @@ impl KeyFile {
     /// The group names, each once, in the order they first appear.
     #[must_use]
     pub fn groups(&self) -> Vec<&str> {
-        self.index.groups.iter().map(String::as_str).collect()
+        self.index.groups.iter().map(AsRef::as_ref).collect()
     }
 
     /// Whether the file has the group.
     #[must_use]
     pub fn has_group(&self, group: &str) -> bool {
-        // Hashed and compared.
-        work::count(2 * group.len());
-        self.index.headers.contains_key(group)
+        self.index
+            .headers
+            .contains_key(self.index.seed.name(group).view())
     }
 
     /// The keys of `group` with their locales, each once, in the order they
@@ -1281,9 +1644,10 @@ impl KeyFile {
     /// The number of the first block of `group`, which names it in the
     /// index.
     fn group_number(&self, group: &str) -> Option<u64> {
-        // Hashed and compared.
-        work::count(2 * group.len());
-        self.index.headers.get(group).map(|found| found[0])
+        self.index
+            .headers
+            .get(self.index.seed.name(group).view())
+            .map(|found| found[0])
     }
 
     /// The lines of `key` in `group`, by locale.
@@ -1327,11 +1691,11 @@ impl KeyFile {
         let plain = if wanted.contains('.') {
             None
         } else {
-            lines.last(Some(wanted))
+            lines.last(&self.index.seed, Some(wanted))
         };
         // A key's ids order as its lines do: the later one counts.
         plain
-            .max(lines.last_encoded(wanted))
+            .max(lines.last_encoded(&self.index.seed, wanted))
             .inspect(|_| work::count(1))
             .and_then(|id| self.line(self.index.place(id)).value())
     }
@@ -1360,7 +1724,7 @@ impl KeyFile {
             .select(|locale| self.translated(lines, locale))
             .or_else(|| {
                 lines
-                    .find(None)
+                    .find(&self.index.seed, None)
                     .and_then(|id| self.line(self.index.place(id)).value())
             })
     }
@@ -1449,13 +1813,11 @@ impl KeyFile {
     /// lists. It also puts the entry after every other line for `key`, as
     /// [`KeyLines::add`] requires; its id, given last, is the largest.
     fn insert_entry(&mut self, group: &str, key: &str, locale: Option<&str>, mut line: Line) {
-        // The group hashed and compared to find its blocks.
-        work::count(2 * group.len());
         // The first block names the group; the entry goes in the last.
         let found = self
             .index
             .headers
-            .get(group)
+            .get(self.index.seed.name(group).view())
             .and_then(|found| Some((*found.first()?, *found.last()?)));
         debug_assert!(found.is_some(), "insert_entry into missing group [{group}]");
         let Some((first, number)) = found else {
@@ -1473,22 +1835,15 @@ impl KeyFile {
         self.blocks[slot].push(line);
         self.sizes.add(slot, 1);
         self.index.set_place(id, place);
-        // The key copied, hashed and compared for the entries (the key's
-        // lines count the locale).
-        work::count(3 * key.len());
-        self.index
-            .entries
-            .entry((first, key.to_owned()))
-            .or_default()
-            .add(locale, id);
-        // The key and locale copied for the key list (which counts the
-        // rest).
-        work::count(key.len() + locale.map_or(0, str::len));
-        self.index
+        let index = &mut self.index;
+        change_or_add(&mut index.entries, &index.seed.entry(first, key), |lines| {
+            lines.add(&index.seed, locale, id);
+        });
+        index
             .keys
             .entry(first)
             .or_default()
-            .insert((key.to_owned(), locale.map(str::to_owned)));
+            .insert(&index.seed.key(key, locale));
         self.changed();
     }
 
@@ -1554,33 +1909,33 @@ impl KeyFile {
     /// block is then compacted at one step per line, paid for by removals
     /// since the previous compaction. Moved lines are found by entry ID,
     /// and the key list removes gaps using key numbers. Neither operation
-    /// hashes a key or locale again.
+    /// hashes a key or locale again. Nor do the index's maps when they
+    /// shrink as they empty: they move each entry kept at a step, paid for
+    /// by the removals since they last grew or shrank, as the names in them
+    /// carry the hash worked out when they were added. So the names kept,
+    /// however long, cost nothing per removal.
     pub fn remove(&mut self, group: &str, key: &str, locale: Option<&str>) -> bool {
         let Some(group) = self.group_number(group) else {
             return false;
         };
-        // The key copied, hashed and compared to find its lines.
-        work::count(3 * key.len());
-        let name = (group, key.to_owned());
-        let Some(lines) = self.index.entries.get_mut(&name) else {
+        let index = &mut self.index;
+        let name = index.seed.entry(group, key);
+        let Some(lines) = index.entries.get_mut(name.view()) else {
             return false;
         };
-        let ids = lines.remove(locale);
+        let ids = lines.remove(&index.seed, locale);
         if ids.is_empty() {
             return false;
         }
         if lines.lines.is_empty() {
-            // Hashed and compared again to drop them.
-            work::count(2 * key.len());
-            self.index.entries.remove(&name);
+            index.entries.remove(name.view());
+            fit(&mut index.entries);
         }
-        if let Some(keys) = self.index.keys.get_mut(&group) {
-            // The key and locale copied for the key list (which counts the
-            // rest).
-            work::count(key.len() + locale.map_or(0, str::len));
-            keys.remove(&(key.to_owned(), locale.map(str::to_owned)));
+        if let Some(keys) = index.keys.get_mut(&group) {
+            keys.remove(&index.seed.key(key, locale));
             if keys.is_empty() {
-                self.index.keys.remove(&group);
+                index.keys.remove(&group);
+                fit(&mut index.keys);
             }
         }
         // In file order, as the ids are.
@@ -1657,6 +2012,9 @@ impl KeyFile {
                 block.tail_problems.push_front((stored, problem));
             }
         }
+        fit_list(&mut block.lines);
+        fit_list(&mut block.problems);
+        fit_list(&mut block.live.tree);
         if 2 * block.removed > block.lines.len() {
             compact(block, number, index);
             return;
@@ -1725,9 +2083,8 @@ impl KeyFile {
             self.blocks[last].tail.push_back(blank);
             self.sizes.add(last, 1);
         }
-        // Copied into the header twice, then copied, hashed and compared
-        // for the index (the group list counts its own).
-        work::count(5 * group.len());
+        // Copied into the header twice (the index counts its own copies).
+        work::count(2 * group.len());
         let mut header = Line {
             raw: format!("[{group}]").into_bytes(),
             kind: Kind::Group(group.to_owned()),
@@ -1750,8 +2107,9 @@ impl KeyFile {
         self.blocks.push(block);
         self.sizes.push(1);
         self.blocks[previous].next = Some(number);
-        self.index.headers.insert(group.to_owned(), vec![number]);
-        self.index.groups.insert(group.to_owned());
+        let name = self.index.seed.name(group);
+        self.index.headers.insert(name.to_owned(), vec![number]);
+        self.index.groups.insert(&name);
         self.changed();
     }
 
@@ -1800,13 +2158,15 @@ impl KeyFile {
     /// file, nor with the names of other groups. Amortized: once the emptied
     /// blocks of removed groups outnumber the others, they are let go, at a
     /// step per block, which the removals since they were last let go pay
-    /// for.
+    /// for; and the index's maps shrink as they empty at a step per entry
+    /// kept, without hashing the names kept again (see
+    /// [`KeyFile::remove`]).
     pub fn remove_group(&mut self, group: &str) -> bool {
-        // Hashed and compared.
-        work::count(2 * group.len());
-        let Some(numbers) = self.index.headers.remove(group) else {
+        let name = self.index.seed.name(group);
+        let Some(numbers) = self.index.headers.remove(name.view()) else {
             return false;
         };
+        fit(&mut self.index.headers);
         let first = numbers[0];
         // The blocks stay, empty, so that no other block moves.
         for number in numbers {
@@ -1843,23 +2203,28 @@ impl KeyFile {
             self.sizes.pop();
             self.dead -= 1;
         }
+        fit(&mut self.slots);
+        fit_list(&mut self.blocks);
+        fit_list(&mut self.sizes.tree);
         if 2 * self.dead > self.blocks.len() {
             self.reclaim();
         }
-        // Copied for the group list (which counts the rest).
-        work::count(group.len());
-        self.index.groups.remove(&group.to_owned());
+        self.index.groups.remove(&name);
         if let Some(keys) = self.index.keys.remove(&first) {
             for (key, _) in keys.iter() {
-                // The key copied, hashed and compared; then its lines'
-                // places dropped.
-                work::count(3 * key.len());
-                if let Some(lines) = self.index.entries.remove(&(first, key.clone())) {
+                // Its lines' places dropped.
+                if let Some(lines) = self
+                    .index
+                    .entries
+                    .remove(self.index.seed.entry(first, key).view())
+                {
                     for id in lines.ids() {
                         self.index.take_place(id);
                     }
                 }
             }
+            fit(&mut self.index.keys);
+            fit(&mut self.index.entries);
         }
         self.changed();
         true
@@ -1884,6 +2249,50 @@ impl KeyFile {
             self.slots.insert(block.number, slot);
             self.sizes.push(block.len());
         }
+    }
+
+    /// The room its maps and lists hold, in items: what it keeps whether
+    /// used or not.
+    #[cfg(test)]
+    fn room(&self) -> usize {
+        fn listed<T>(listed: &Listed<T>) -> usize {
+            listed.items.capacity() + listed.numbers.capacity() + listed.at.capacity()
+        }
+        let blocks: usize = self
+            .blocks
+            .iter()
+            .map(|block| {
+                block.lines.capacity()
+                    + block.tail.capacity()
+                    + block.problems.capacity()
+                    + block.tail_problems.capacity()
+                    + block.live.tree.capacity()
+            })
+            .sum();
+        let index = &self.index;
+        let headers: usize = index.headers.values().map(Vec::capacity).sum();
+        let keys: usize = index.keys.values().map(listed).sum();
+        let entries: usize = index
+            .entries
+            .values()
+            .map(|lines| {
+                lines.lines.capacity()
+                    + lines.lines.values().map(Vec::capacity).sum::<usize>()
+                    + lines.encoded.capacity()
+            })
+            .sum();
+        self.blocks.capacity()
+            + blocks
+            + self.slots.capacity()
+            + self.sizes.tree.capacity()
+            + listed(&index.groups)
+            + index.headers.capacity()
+            + headers
+            + index.keys.capacity()
+            + keys
+            + index.entries.capacity()
+            + entries
+            + index.places.capacity()
     }
 
     /// The file's text: an unchanged file gives back exactly what was read.
@@ -1947,7 +2356,7 @@ impl<'a> Group<'a> {
             .get(&self.number)
             .map(|keys| {
                 keys.iter()
-                    .map(|(key, locale)| (key.as_str(), locale.as_deref()))
+                    .map(|(key, locale)| (key.as_ref(), locale.as_deref()))
                     .collect()
             })
             .unwrap_or_default()
@@ -1955,15 +2364,14 @@ impl<'a> Group<'a> {
 
     /// The lines of `key`, by locale.
     fn key_lines(self, key: &str) -> Option<&'a KeyLines> {
-        // The key copied, hashed and compared.
-        work::count(3 * key.len());
-        self.file.index.entries.get(&(self.number, key.to_owned()))
+        let index = &self.file.index;
+        index.entries.get(index.seed.entry(self.number, key).view())
     }
 
     /// The place of the line holding the value of `key[locale]`: the last
     /// one, as a repeated key's last value counts.
     fn find(self, key: &str, locale: Option<&str>) -> Option<Place> {
-        let id = self.key_lines(key)?.find(locale)?;
+        let id = self.key_lines(key)?.find(&self.file.index.seed, locale)?;
         Some(self.file.index.place(id))
     }
 
@@ -1972,7 +2380,7 @@ impl<'a> Group<'a> {
     /// [`Group::raw`] returns a value.
     pub(crate) fn has(self, key: &str, locale: Option<&str>) -> bool {
         self.key_lines(key)
-            .and_then(|lines| lines.find(locale))
+            .and_then(|lines| lines.find(&self.file.index.seed, locale))
             .is_some()
     }
 
@@ -2239,11 +2647,15 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// scan of a value or line looks at, whether the loop is written here or
 /// is a library call such as `find` or `from_utf8` (counted by the bytes
 /// it may walk). So does each character of input text copied (`to_owned`,
-/// `clone`, `format!`), hashed (a set or map key inserted or looked up:
-/// hashed and compared, two steps per byte) or compared with other input,
-/// and each byte of a message that input is written into. Comparing with a
-/// fixed name (a literal or an entry of a fixed table) is bounded by that
-/// name and not counted; nor is file I/O. `validate`'s final sort of its
+/// `clone`, `format!`), hashed or compared with other input, and each byte
+/// of a message that input is written into. The index's maps keyed by text
+/// hash a name once, when the key looked up or stored is built (a step per
+/// byte, counted there), and compare its text only with a key of the same
+/// hash (a step per byte compared, counted by the comparison); a map
+/// growing or shrinking takes the hashes its keys carry, a step per entry,
+/// whatever their length. Comparing with a fixed name (a literal or an
+/// entry of a fixed table) is bounded by that name and not counted; nor is
+/// file I/O. `validate`'s final sort of its
 /// issues is n log n in the number of issues and not counted. A new loop
 /// over input on such a path must count its steps too.
 ///
@@ -2331,6 +2743,7 @@ pub(crate) mod work {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
 
     const SAMPLE: &str = "# A comment\n\
         [Desktop Entry]\n\
@@ -2380,11 +2793,11 @@ mod tests {
     #[test]
     #[should_panic(expected = "the key file's list numbers are exhausted")]
     fn running_out_of_list_numbers_panics() {
-        let mut listed = Listed::<String> {
+        let mut listed = Listed::<Box<str>> {
             next: u64::MAX,
             ..Listed::default()
         };
-        listed.insert("a".to_owned());
+        listed.insert(&Seed::default().name("a"));
     }
 
     #[test]
@@ -3418,6 +3831,316 @@ mod tests {
         );
     }
 
+    /// Checks that `stored`, the key stored for a lookup, and `same`, a
+    /// lookup of the same text, hash alike and compare equal, both as
+    /// themselves and through a map; and that `other`, a lookup of other
+    /// text, does not, even given the same hash.
+    fn assert_agree<T: Text + Clone>(
+        stored: &Lookup<'_, T>,
+        same: &Lookup<'_, T>,
+        other: &Lookup<'_, T>,
+    ) {
+        let key = stored.to_owned();
+        assert_eq!(key.text.parts(), same.parts);
+        let hash = |view: &dyn View<T>| UseCached.hash_one(view);
+        assert_eq!(UseCached.hash_one(&key), hash(same.view()));
+        assert_eq!(hash(key.borrow()), hash(same.view()));
+        assert!(Borrow::<dyn View<T>>::borrow(&key) == same.view());
+        assert!(key == same.to_owned());
+        assert!(Borrow::<dyn View<T>>::borrow(&key) != other.view());
+        let collides = Lookup::<T> {
+            hash: key.hash,
+            parts: other.parts,
+            text: PhantomData,
+        };
+        assert!(Borrow::<dyn View<T>>::borrow(&key) != collides.view());
+        assert!(key != collides.to_owned());
+        let map: ByText<T, usize> = HashMap::from_iter([(key, 0)]);
+        assert!(map.contains_key(same.view()));
+        assert!(!map.contains_key(other.view()));
+        assert!(!map.contains_key(collides.view()));
+    }
+
+    #[test]
+    fn a_stored_key_and_a_lookup_of_its_text_agree() {
+        // A map keyed by text is searched by a view borrowing the names
+        // given: it must hash and compare as the key stored for them does,
+        // for every kind of key.
+        let seed = Seed::default();
+        let (name, other) = (
+            String::from("Desktop Entry"),
+            String::from("Desktop Action"),
+        );
+        assert_agree(
+            &seed.name(&name),
+            &seed.name("Desktop Entry"),
+            &seed.name(&other),
+        );
+        // Lookups of the same text written elsewhere.
+        let (de, key) = (String::from("de_DE"), String::from("Name"));
+        assert_agree(
+            &seed.locale(Some("de_DE")),
+            &seed.locale(Some(&de)),
+            &seed.locale(None),
+        );
+        assert_agree(
+            &seed.locale(None),
+            &seed.locale(None),
+            &seed.locale(Some("")),
+        );
+        assert_agree(
+            &seed.key("Name", Some("de")),
+            &seed.key(&key, Some("de")),
+            &seed.key("Name", None),
+        );
+        assert_agree(
+            &seed.key("Name", None),
+            &seed.key("Name", None),
+            &seed.key("Named", None),
+        );
+        assert_agree(
+            &seed.entry(3, "Name"),
+            &seed.entry(3, &key),
+            &seed.entry(4, "Name"),
+        );
+        // A clone of the seed hashes as the seed does.
+        assert_eq!(
+            seed.clone().name("Desktop Entry").hash,
+            seed.name(&name).hash
+        );
+    }
+
+    #[test]
+    fn names_of_one_hash_stay_apart_and_are_found_by_their_text() {
+        // Equal hashes do not make names equal: a map holding names of one
+        // hash keeps each, and finds each by comparing its text, with a
+        // step per byte compared.
+        let lookup = |text: &'static str| Lookup::<Box<str>> {
+            hash: 7,
+            parts: Parts {
+                number: 0,
+                first: Some(text),
+                second: None,
+            },
+            text: PhantomData,
+        };
+        let mut map: ByText<Box<str>, usize> = HashMap::default();
+        for (at, text) in ["first", "second", "third"].into_iter().enumerate() {
+            assert!(map.insert(lookup(text).to_owned(), at).is_none());
+        }
+        assert_eq!(map.len(), 3);
+        for (at, text) in ["first", "second", "third"].into_iter().enumerate() {
+            assert_eq!(map.get(lookup(text).view()), Some(&at));
+        }
+        assert_eq!(map.get(lookup("fourth").view()), None);
+        let lone: ByText<Box<str>, usize> = HashMap::from_iter([(lookup("first").to_owned(), 0)]);
+        let (found, steps) = work::steps(|| lone.contains_key(lookup("first").view()));
+        assert!(found);
+        assert_eq!(steps, "first".len());
+    }
+
+    #[test]
+    fn the_maps_keyed_by_text_key_on_hashed_text() {
+        // Bound to maps keyed by hashed text: a field moved off them, to a
+        // map keyed by plain text, which hashes each name again each time
+        // it grows or shrinks, does not compile here. A change to those
+        // maps themselves, to their key or hasher, is caught by
+        // `the_maps_hasher_is_fed_a_number_per_key_whatever_the_names`.
+        let index = Index::default();
+        let lines = KeyLines::default();
+        let keys = Listed::<KeyText>::default();
+        let _: &ByText<Box<str>, Vec<u64>> = &index.headers;
+        let _: &ByText<Box<str>, u64> = &index.groups.numbers;
+        let _: &HashMap<u64, Listed<KeyText>> = &index.keys;
+        let _: &ByText<KeyText, u64> = &keys.numbers;
+        let _: &ByText<(u64, Box<str>), KeyLines> = &index.entries;
+        let _: &ByText<Option<Box<str>>, Vec<u64>> = &lines.lines;
+        let _: &ByText<Box<str>, BTreeSet<u64>> = &lines.encoded;
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "a lookup of a shape its kind of key does not take")]
+    fn a_lookup_of_another_shape_is_caught_when_its_key_is_stored() {
+        // A group name has no number: stored, it would lose the one given,
+        // and its own lookup would no longer find it.
+        let lookup = Seed::default().lookup::<Box<str>>(Parts {
+            number: 3,
+            first: Some("Name"),
+            second: None,
+        });
+        let _ = lookup.to_owned();
+    }
+
+    #[test]
+    #[should_panic(expected = "only a cached hash is written")]
+    fn the_maps_hasher_takes_only_a_cached_hash() {
+        UseCached.build_hasher().write(b"text");
+    }
+
+    #[test]
+    fn the_maps_hasher_is_fed_a_number_per_key_whatever_the_names() {
+        // The maps' hasher is given eight bytes per key hashed, whatever
+        // the key's text: a name of a MiB kept while short ones come and go
+        // feeds it no more than a name of a byte does, but for a few keys a
+        // map's layout, which follows the random hashes, may have it hash
+        // again. A map that hashed the text would be fed the long name each
+        // time it took it in, grew or shrank: more than a MiB.
+        let long = 1 << 20;
+        let fed = |kept, long| {
+            let before = FED.with(std::cell::Cell::get);
+            long_name_kept(kept, long, 4);
+            FED.with(std::cell::Cell::get) - before
+        };
+        for kept in [Kept::Key, Kept::Group, Kept::Locale] {
+            let (short, beside_long) = (fed(kept, 1), fed(kept, long));
+            assert!(short > 0 && short % 8 == 0, "{kept:?}: {short} bytes");
+            assert!(beside_long % 8 == 0, "{kept:?}: {beside_long} bytes");
+            assert!(
+                beside_long < 2 * short && beside_long < long,
+                "{kept:?}: {beside_long} bytes fed beside a name of {long} bytes against \
+                 {short} beside a name of one"
+            );
+        }
+    }
+
+    #[test]
+    fn a_clone_finds_and_edits_every_name() {
+        // A clone keeps the seed its names were hashed with: one that hashed
+        // its lookups otherwise would find none of them.
+        let file = KeyFile::parse(SAMPLE.as_bytes());
+        let mut copy = file.clone();
+        for group in file.groups() {
+            assert!(copy.has_group(group));
+            for (key, locale) in file.keys(group) {
+                assert_eq!(copy.raw(group, key, locale), file.raw(group, key, locale));
+            }
+        }
+        assert!(copy.remove("Desktop Entry", "Name", Some("de")));
+        copy.set_string("Desktop Entry", "Name", "Bar").unwrap();
+        assert!(copy.remove_group("Desktop Action New"));
+        assert_eq!(copy.groups(), ["Desktop Entry"]);
+        assert_eq!(copy.string("Desktop Entry", "Name").as_deref(), Some("Bar"));
+        assert_like_reparse(&copy);
+    }
+
+    /// What a long name is kept as while short names of the same kind come
+    /// and go beside it.
+    #[derive(Debug, Clone, Copy)]
+    enum Kept {
+        Key,
+        Group,
+        Locale,
+    }
+
+    /// A file with one name of `long` bytes kept as `kept`, and `rounds`
+    /// rounds of 64 short names of the same kind added and then removed, so
+    /// that the maps holding the long name grow and shrink each round: the
+    /// steps counted, the bytes of the text and of the names given, and the
+    /// time taken.
+    fn long_name_kept(kept: Kept, long: usize, rounds: usize) -> (usize, usize, Duration) {
+        let name = "L".repeat(long);
+        let text = match kept {
+            Kept::Key => format!("[G]\n{name}=v\n"),
+            Kept::Group => format!("[{name}]\nk=v\n"),
+            Kept::Locale => format!("[G]\nName[{name}]=v\n"),
+        };
+        let short: Vec<String> = (0..64).map(|at| format!("S{at}")).collect();
+        // The text, and per round each short name given twice with the
+        // group and key it goes in (none for a group).
+        let given: usize = short
+            .iter()
+            .map(|short| match kept {
+                Kept::Key => "G".len() + short.len() + "v".len() + "G".len() + short.len(),
+                Kept::Group => 2 * short.len(),
+                Kept::Locale => 2 * ("GName".len() + short.len()) + "v".len(),
+            })
+            .sum();
+        let bytes = text.len() + rounds * given;
+        let start = Instant::now();
+        let (file, steps) = work::steps(|| {
+            let mut file = KeyFile::parse(text.as_bytes());
+            for _ in 0..rounds {
+                for short in &short {
+                    match kept {
+                        Kept::Key => file.set_string("G", short, "v"),
+                        Kept::Group => file.add_group(short),
+                        Kept::Locale => file.set_locale_string("G", "Name", short, "v"),
+                    }
+                    .unwrap();
+                }
+                for short in &short {
+                    assert!(match kept {
+                        Kept::Key => file.remove("G", short, None),
+                        Kept::Group => file.remove_group(short),
+                        Kept::Locale => file.remove("G", "Name", Some(short)),
+                    });
+                }
+            }
+            file
+        });
+        let elapsed = start.elapsed();
+        match kept {
+            Kept::Key => assert_eq!(file.keys("G"), [(name.as_str(), None)]),
+            Kept::Group => assert_eq!(file.groups(), [name.as_str()]),
+            Kept::Locale => assert_eq!(file.keys("G"), [("Name", Some(name.as_str()))]),
+        }
+        (steps, bytes, elapsed)
+    }
+
+    #[test]
+    fn a_long_name_kept_while_short_ones_come_and_go_takes_linear_work() {
+        // A long name of 16 KiB per round: work per round that grew with
+        // it, such as hashing it again each time a map holding it grows or
+        // shrinks, would grow quadratically (see also
+        // `the_maps_hasher_is_fed_a_number_per_key_whatever_the_names`).
+        for kept in [Kept::Key, Kept::Group, Kept::Locale] {
+            work::assert_linear(
+                8,
+                |n| {
+                    let (steps, bytes, _) = long_name_kept(kept, n << 14, n);
+                    (steps, bytes)
+                },
+                // Per character of the text, which the long name makes most
+                // of the bytes: split off, checked for UTF-8, looked through
+                // for the line's parts, copied into the line, checked, and
+                // hashed and copied for each map of the index keyed by it
+                // and for the list of keys or groups. Per character of the
+                // short names given: checked, copied, hashed and compared
+                // to add and drop them, with a step per line, block and
+                // entry added or dropped, per entry kept when a map shrinks
+                // (none is hashed again), and per item or gap of a list
+                // whose gaps are dropped: about 12 per byte, items
+                // included. Twice that.
+                |_, bytes| 24 * bytes,
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "timing: run with `--release -- --ignored`"]
+    fn a_long_name_kept_while_short_ones_come_and_go_takes_linear_time() {
+        // As counted above, timed too: the counts show only the steps they
+        // are told of, and the time is what a step left uncounted would
+        // show in. The least of three runs, so that a run slowed by other
+        // work on the machine counts less. Four times the size: linear time
+        // about quadruples, quadratic time grows sixteenfold.
+        for kept in [Kept::Key, Kept::Group, Kept::Locale] {
+            let time = |n: usize| {
+                (0..3)
+                    .map(|_| long_name_kept(kept, n << 14, n).2)
+                    .min()
+                    .unwrap_or_default()
+            };
+            let (single, quadrupled) = (time(16), time(64));
+            assert!(
+                quadrupled < single * 8,
+                "{kept:?}: {quadrupled:?} for 64 rounds beside a name of 1 MiB against \
+                 {single:?} for 16 rounds beside 256 KiB"
+            );
+        }
+    }
+
     #[test]
     fn removed_groups_blocks_outnumbering_the_rest_are_let_go() {
         use std::fmt::Write as _;
@@ -3748,6 +4471,134 @@ mod tests {
             + (1 + 1 + (1 + 1)) // k's lines
             + 1; // its place
         assert_eq!(steps(&file), blocks + index);
+    }
+
+    /// A way of making a file, by adding n keys, groups or lines and
+    /// removing all but what adding one gives, with what it is.
+    type Removal = (&'static str, fn(usize) -> KeyFile);
+
+    fn removals() -> [Removal; 8] {
+        fn added_keys(n: usize) -> KeyFile {
+            let mut file = KeyFile::parse(b"[G]\nk0=v\n");
+            for at in 1..n {
+                file.set_string("G", &format!("k{at}"), "v").unwrap();
+            }
+            file
+        }
+        fn added_groups(n: usize) -> KeyFile {
+            let mut file = KeyFile::parse(b"[G]\nk0=v\n");
+            for at in 1..n {
+                let group = format!("H{at}");
+                file.add_group(&group).unwrap();
+                file.set_string(&group, "k", "v").unwrap();
+                file.set_locale_string(&group, "Name", "de.UTF-8", "v")
+                    .unwrap();
+            }
+            file
+        }
+        [
+            ("keys removed first to last", |n| {
+                let mut file = added_keys(n);
+                for at in 1..n {
+                    assert!(file.remove("G", &format!("k{at}"), None));
+                }
+                file
+            }),
+            ("keys removed last to first", |n| {
+                let mut file = added_keys(n);
+                for at in (1..n).rev() {
+                    assert!(file.remove("G", &format!("k{at}"), None));
+                }
+                file
+            }),
+            ("groups removed first to last", |n| {
+                let mut file = added_groups(n);
+                for at in 1..n {
+                    assert!(file.remove_group(&format!("H{at}")));
+                }
+                file
+            }),
+            ("groups removed last to first", |n| {
+                let mut file = added_groups(n);
+                for at in (1..n).rev() {
+                    assert!(file.remove_group(&format!("H{at}")));
+                }
+                file
+            }),
+            ("locales of one key", |n| {
+                let mut file = KeyFile::parse(b"[G]\nk0=v\nName=x\n");
+                for at in 1..n {
+                    file.set_locale_string("G", "Name", &format!("l{at}"), "v")
+                        .unwrap();
+                }
+                for at in 1..n {
+                    assert!(file.remove("G", "Name", Some(&format!("l{at}"))));
+                }
+                file
+            }),
+            ("locales with an encoding of one key", |n| {
+                let mut file = KeyFile::parse(b"[G]\nk0=v\nName=x\n");
+                for at in 1..n {
+                    file.set_locale_string("G", "Name", &format!("l{at}.UTF-8"), "v")
+                        .unwrap();
+                }
+                for at in 1..n {
+                    assert!(file.remove("G", "Name", Some(&format!("l{at}.UTF-8"))));
+                }
+                file
+            }),
+            ("a key read many times", |n| {
+                let mut file =
+                    KeyFile::parse(format!("[G]\nk0=v\n{}", "k1=v\n".repeat(n)).as_bytes());
+                assert!(file.remove("G", "k1", None));
+                file
+            }),
+            ("groups emptied of their keys, then removed", |n| {
+                let mut file = added_groups(n);
+                for at in 1..n {
+                    let group = format!("H{at}");
+                    assert!(file.remove(&group, "k", None));
+                    assert!(file.remove(&group, "Name", Some("de.UTF-8")));
+                }
+                for at in 1..n {
+                    assert!(file.remove_group(&format!("H{at}")));
+                }
+                file
+            }),
+        ]
+    }
+
+    #[test]
+    fn removed_room_is_let_go() {
+        // After n additions and all but what one gives removed, the room the
+        // file and a copy of it hold follows what is left, however large n
+        // was. Each way of removing lets go of room in its own places: keys
+        // removed from the front leave the block to be compacted, from the
+        // back to be cut short; a key with many locales empties its own
+        // maps; a key read many times leaves its problems; groups emptied by
+        // their keys are no longer in the key lists when they go.
+        let mut kept = Vec::new();
+        for (what, made) in removals() {
+            let one = made(1);
+            let small = one.room();
+            for n in [1_000, 16_000] {
+                let file = made(n);
+                assert_eq!(
+                    (file.groups(), file.keys("G")),
+                    (one.groups(), one.keys("G")),
+                    "{what}"
+                );
+                let copy = file.clone();
+                if file.room() > 4 * small || copy.room() > 4 * small {
+                    kept.push(format!(
+                        "{what}: room {} and {} in a copy after {n}, against {small} for 1",
+                        file.room(),
+                        copy.room()
+                    ));
+                }
+            }
+        }
+        assert!(kept.is_empty(), "{kept:#?}");
     }
 
     #[test]

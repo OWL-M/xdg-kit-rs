@@ -773,6 +773,8 @@ dependencies = [
 name = "xdg-kit-desktop-entry"
 version = "0.1.0"
 dependencies = [
+ "async-io",
+ "futures-lite",
  "libc",
  "rustix",
  "tempfile",

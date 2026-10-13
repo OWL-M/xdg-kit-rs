@@ -183,16 +183,50 @@ pub struct CommandLine {
     problems: Vec<ExecProblem>,
 }
 
-/// What field codes expand to, for [`CommandLine::expand`].
+/// Replacement values for non-file field codes in [`CommandLine::prepare`].
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct Values<'a> {
-    /// The targets for `%f %F %u %U`, already paths or URLs as the code
-    /// needs; at most one for `%f` and `%u`.
-    pub(crate) files: &'a [OsString],
     pub(crate) icon: Option<&'a str>,
     /// The name for `%c`: the translated `Name`, `None` when the entry has
     /// none for these languages and no untranslated one.
     pub(crate) name: Option<&'a str>,
     pub(crate) location: &'a OsStr,
+}
+
+/// A command line with non-file field codes expanded once for the whole
+/// launch. [`Prepared::expand`] inserts each command's targets without
+/// repeating the other expansions.
+#[derive(Debug)]
+pub(crate) struct Prepared {
+    parts: Vec<Part>,
+}
+
+/// One part of a [`Prepared`] command line.
+#[derive(Debug)]
+enum Part {
+    /// An expanded argument, shared by every command.
+    Done(OsString),
+    /// A standalone file field code: all targets for `%F` and `%U`, or the
+    /// first target otherwise. Quotes preserve an empty argument when there
+    /// are no targets.
+    Targets { all: bool, had_quote: bool },
+    /// An argument mixing file field codes with other pieces. Each file
+    /// code becomes the first target; each run of other pieces is expanded
+    /// in advance.
+    Joined {
+        pieces: Vec<Joined>,
+        /// Whether it is left out when it expands to nothing, which
+        /// depends only on its pieces and on whether there is a name.
+        may_vanish: bool,
+    },
+}
+
+/// One piece of a [`Part::Joined`] argument.
+#[derive(Debug)]
+enum Joined {
+    Text(OsString),
+    /// A file field code: the first target.
+    File,
 }
 
 impl CommandLine {
@@ -325,9 +359,65 @@ impl CommandLine {
             })
     }
 
-    /// The arguments with the field codes expanded. Each replacement is one
-    /// argument (or, for `%F`, `%U` and `%i`, several) and is not expanded
-    /// again.
+    /// Expands non-file field codes, whose values are shared by every
+    /// command in a launch.
+    pub(crate) fn prepare(&self, values: Values<'_>) -> Prepared {
+        let mut parts = Vec::with_capacity(self.args.len());
+        let mut done = Vec::new();
+        for arg in &self.args {
+            // A step per argument, and per piece looked at for a file code.
+            work::count(1 + arg.pieces.len());
+            let holds_file_code = arg
+                .pieces
+                .iter()
+                .any(|piece| matches!(piece, Piece::Code('f' | 'F' | 'u' | 'U')));
+            if !holds_file_code {
+                expand_arg(arg, &values, &[], &mut done);
+                parts.extend(done.drain(..).map(Part::Done));
+            } else if let [Piece::Code(code)] = arg.pieces.as_slice()
+                && !arg.quoted
+            {
+                parts.push(Part::Targets {
+                    all: matches!(code, 'F' | 'U'),
+                    had_quote: arg.had_quote,
+                });
+            } else {
+                parts.push(join(arg, &values));
+            }
+        }
+        Prepared { parts }
+    }
+
+    /// Expands field codes, using `files` for the file code, through
+    /// [`Prepared::expand`].
+    #[cfg(test)]
+    pub(crate) fn expand(&self, values: &Values<'_>, files: &[OsString]) -> Vec<OsString> {
+        self.prepare(*values).expand(files)
+    }
+
+    /// Expands each argument in full for each `files`, without preparing
+    /// shared expansions. [`Prepared::expand`] must produce the same result.
+    #[cfg(any(test, fuzzing))]
+    pub(crate) fn expand_each_argument(
+        &self,
+        values: &Values<'_>,
+        files: &[OsString],
+    ) -> Vec<OsString> {
+        let mut out = Vec::new();
+        for arg in &self.args {
+            expand_arg(arg, values, files, &mut out);
+        }
+        out
+    }
+}
+
+impl Prepared {
+    /// The arguments of one command, with `files` for the file field code:
+    /// the targets, already paths or URLs as the code needs, at most one for
+    /// `%f` and `%u`.
+    ///
+    /// Each replacement is one argument (or, for `%F`, `%U` and `%i`,
+    /// several) and is not expanded again.
     ///
     /// The spec allows `%f`, `%F`, `%u` and `%U` to vanish when there are no
     /// files, `%i` when there is no icon, and `%k` when there is no location.
@@ -339,63 +429,155 @@ impl CommandLine {
     /// Any quote preserves the argument, even `""` beside a code (`""%c`,
     /// `%f""`). If it expands to nothing, it remains an empty argument.
     /// These rules match `GLib`.
-    pub(crate) fn expand(&self, values: &Values<'_>) -> Vec<OsString> {
-        let mut out = Vec::new();
-        for arg in &self.args {
-            if let [Piece::Code(code)] = arg.pieces.as_slice()
-                && !arg.quoted
-            {
-                let before = out.len();
-                match code {
-                    'F' | 'U' => out.extend(values.files.iter().cloned()),
-                    'f' | 'u' => out.extend(values.files.first().cloned()),
-                    'i' => {
-                        if let Some(icon) = values.icon.filter(|icon| !icon.is_empty()) {
-                            out.push("--icon".into());
-                            out.push(icon.into());
+    pub(crate) fn expand(&self, files: &[OsString]) -> Vec<OsString> {
+        let mut out = Vec::with_capacity(self.parts.len());
+        for part in &self.parts {
+            match part {
+                Part::Done(arg) => {
+                    // A step for the argument, and each byte copied.
+                    work::count(1 + arg.len());
+                    out.push(arg.clone());
+                }
+                Part::Targets { all, had_quote } => {
+                    let before = out.len();
+                    if *all {
+                        out.extend(files.iter().cloned());
+                    } else {
+                        out.extend(files.first().cloned());
+                    }
+                    if *had_quote && out.len() == before {
+                        out.push(OsString::new());
+                    }
+                    // A step for the argument, and per argument given and
+                    // byte copied.
+                    work::count_with(|| {
+                        1 + out[before..].iter().map(|arg| 1 + arg.len()).sum::<usize>()
+                    });
+                }
+                Part::Joined { pieces, may_vanish } => {
+                    let first = files.first().map(OsString::as_os_str);
+                    let mut text = OsString::new();
+                    for piece in pieces {
+                        match piece {
+                            Joined::Text(part) => text.push(part),
+                            Joined::File => text.push(first.unwrap_or_default()),
                         }
                     }
-                    'c' => out.extend(values.name.map(OsString::from)),
-                    'k' if !values.location.is_empty() => out.push(values.location.into()),
-                    _ => {}
-                }
-                if arg.had_quote && out.len() == before {
-                    out.push(OsString::new());
-                }
-                continue;
-            }
-            let mut text = OsString::new();
-            for piece in &arg.pieces {
-                match piece {
-                    Piece::Text(part) => text.push(part),
-                    Piece::Code(code) => match code {
-                        'f' | 'u' | 'F' | 'U' => {
-                            if let Some(first) = values.files.first() {
-                                text.push(first);
-                            }
-                        }
-                        'c' => {
-                            if let Some(name) = values.name {
-                                text.push(name);
-                            }
-                        }
-                        'k' => text.push(values.location),
-                        _ => {}
-                    },
+                    // A step for the argument and per piece, and each byte
+                    // copied.
+                    work::count(1 + pieces.len() + text.len());
+                    if !(*may_vanish && text.is_empty()) {
+                        out.push(text);
+                    }
                 }
             }
-            let may_vanish = !arg.had_quote
-                && arg.pieces.iter().all(|piece| match piece {
-                    Piece::Code('f' | 'F' | 'u' | 'U' | 'i' | 'k') => true,
-                    Piece::Code('c') => values.name.is_none(),
-                    _ => false,
-                });
-            if may_vanish && text.is_empty() {
-                continue;
-            }
-            out.push(text);
         }
         out
+    }
+}
+
+/// Appends the expansion of `arg` to `out`, using `files` for file field
+/// codes and the rules of [`Prepared::expand`].
+fn expand_arg(arg: &Arg, values: &Values<'_>, files: &[OsString], out: &mut Vec<OsString>) {
+    // A step for the argument; and per piece and byte, below.
+    work::count(1);
+    if let [Piece::Code(code)] = arg.pieces.as_slice()
+        && !arg.quoted
+    {
+        let before = out.len();
+        match code {
+            'F' | 'U' => out.extend(files.iter().cloned()),
+            'f' | 'u' => out.extend(files.first().cloned()),
+            'i' => {
+                if let Some(icon) = values.icon.filter(|icon| !icon.is_empty()) {
+                    out.push("--icon".into());
+                    out.push(icon.into());
+                }
+            }
+            'c' => out.extend(values.name.map(OsString::from)),
+            'k' if !values.location.is_empty() => out.push(values.location.into()),
+            _ => {}
+        }
+        if arg.had_quote && out.len() == before {
+            out.push(OsString::new());
+        }
+        // A step per argument given, and each byte copied.
+        work::count_with(|| out[before..].iter().map(|arg| 1 + arg.len()).sum());
+        return;
+    }
+    let mut text = OsString::new();
+    for piece in &arg.pieces {
+        work::count(1);
+        match piece {
+            Piece::Text(part) => text.push(part),
+            Piece::Code(code) => match code {
+                'f' | 'u' | 'F' | 'U' => {
+                    if let Some(first) = files.first() {
+                        text.push(first);
+                    }
+                }
+                'c' => {
+                    if let Some(name) = values.name {
+                        text.push(name);
+                    }
+                }
+                'k' => text.push(values.location),
+                _ => {}
+            },
+        }
+    }
+    // Each byte copied, and each piece looked at again.
+    work::count(text.len() + arg.pieces.len());
+    let may_vanish = !arg.had_quote
+        && arg.pieces.iter().all(|piece| match piece {
+            Piece::Code('f' | 'F' | 'u' | 'U' | 'i' | 'k') => true,
+            Piece::Code('c') => values.name.is_none(),
+            _ => false,
+        });
+    if may_vanish && text.is_empty() {
+        return;
+    }
+    out.push(text);
+}
+
+/// Prepares `arg`, which mixes file field codes with other pieces. Leaves
+/// file codes unexpanded and combines each run of other pieces into one
+/// string. Counts one step per piece and per byte copied.
+fn join(arg: &Arg, values: &Values<'_>) -> Part {
+    let mut pieces = Vec::new();
+    let mut text = OsString::new();
+    for piece in &arg.pieces {
+        work::count(1);
+        match piece {
+            Piece::Text(part) => text.push(part),
+            Piece::Code('f' | 'u' | 'F' | 'U') => {
+                if !text.is_empty() {
+                    work::count(text.len());
+                    pieces.push(Joined::Text(std::mem::take(&mut text)));
+                }
+                pieces.push(Joined::File);
+            }
+            Piece::Code('c') => {
+                if let Some(name) = values.name {
+                    text.push(name);
+                }
+            }
+            Piece::Code('k') => text.push(values.location),
+            Piece::Code(_) => {}
+        }
+    }
+    if !text.is_empty() {
+        work::count(text.len());
+        pieces.push(Joined::Text(text));
+    }
+    Part::Joined {
+        pieces,
+        may_vanish: !arg.had_quote
+            && arg.pieces.iter().all(|piece| match piece {
+                Piece::Code('f' | 'F' | 'u' | 'U' | 'i' | 'k') => true,
+                Piece::Code('c') => values.name.is_none(),
+                _ => false,
+            }),
     }
 }
 
@@ -474,6 +656,32 @@ fn read_quoted(
     }
 }
 
+/// `Exec` lines with every field code, alone, inside other text and
+/// inside quotes, with quoting, escapes and deprecated codes.
+#[cfg(test)]
+pub(crate) const TEST_LINES: &[&str] = &[
+    "app",
+    "app %f",
+    "app %F",
+    "app %u",
+    "app %U",
+    "app %i %c %k",
+    "app --file=%f --name=%c",
+    "app --uri=%u%k x",
+    "app %f %U",
+    "app --all=%F --x=%U",
+    "app %f%f",
+    "app x%c%iy%f%k%%z%fw%c",
+    r#"app ""%f %f"" %c"" ""%i"#,
+    r#"app "%f" "a \"q\" \$HOME \\ \`x\`" %u"#,
+    r#""/opt/My App/bin/app" "%%" 100%% %F"#,
+    r#"app "abc\q" "\%%z" %f"#,
+    "app %d %f x%m %D%u%n --v=%v%N",
+    r#"app ""%d %d"" %U"#,
+    "app %k%k %i%k %c%k %f%k",
+    "app  spaced   out %u  %i",
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -515,15 +723,45 @@ mod tests {
     fn expand(exec: &str, files: &[&str]) -> Vec<String> {
         let line = CommandLine::parse(exec).unwrap();
         let files: Vec<OsString> = files.iter().map(OsString::from).collect();
-        line.expand(&Values {
-            files: &files,
-            icon: Some("fooview"),
-            name: Some("Foo Viewer"),
-            location: OsStr::new("/usr/share/applications/foo.desktop"),
-        })
+        line.expand(
+            &Values {
+                icon: Some("fooview"),
+                name: Some("Foo Viewer"),
+                location: OsStr::new("/usr/share/applications/foo.desktop"),
+            },
+            &files,
+        )
         .into_iter()
         .map(|arg| arg.into_string().unwrap())
         .collect()
+    }
+
+    #[test]
+    fn expanding_ahead_gives_what_expanding_each_argument_gives() {
+        let file_sets: [&[&str]; 4] = [&[], &["/a"], &["/a b", "/c"], &["file:///x?y#z", ""]];
+        for exec in TEST_LINES {
+            let line = CommandLine::parse(exec).unwrap();
+            for icon in [Some("fooview"), Some(""), None] {
+                for name in [Some("Foo Viewer"), Some(""), None] {
+                    for location in ["/usr/share/applications/foo.desktop", ""] {
+                        let values = Values {
+                            icon,
+                            name,
+                            location: OsStr::new(location),
+                        };
+                        let prepared = line.prepare(values);
+                        for files in file_sets {
+                            let files: Vec<OsString> = files.iter().map(OsString::from).collect();
+                            assert_eq!(
+                                prepared.expand(&files),
+                                line.expand_each_argument(&values, &files),
+                                "{exec} with {values:?} and {files:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -562,12 +800,14 @@ mod tests {
         let expand_bare = |exec: &str, name: Option<&str>| -> Vec<String> {
             CommandLine::parse(exec)
                 .unwrap()
-                .expand(&Values {
-                    files: &[],
-                    icon: None,
-                    name,
-                    location: OsStr::new(""),
-                })
+                .expand(
+                    &Values {
+                        icon: None,
+                        name,
+                        location: OsStr::new(""),
+                    },
+                    &[],
+                )
                 .into_iter()
                 .map(|arg| arg.into_string().unwrap())
                 .collect()
@@ -590,12 +830,14 @@ mod tests {
         let expand_bare = |exec: &str| -> Vec<String> {
             CommandLine::parse(exec)
                 .unwrap()
-                .expand(&Values {
-                    files: &[],
-                    icon: None,
-                    name: Some(""),
-                    location: OsStr::new(""),
-                })
+                .expand(
+                    &Values {
+                        icon: None,
+                        name: Some(""),
+                        location: OsStr::new(""),
+                    },
+                    &[],
+                )
                 .into_iter()
                 .map(|arg| arg.into_string().unwrap())
                 .collect()
@@ -612,12 +854,14 @@ mod tests {
         let expand_bare = |exec: &str| -> Vec<String> {
             CommandLine::parse(exec)
                 .unwrap()
-                .expand(&Values {
-                    files: &[],
-                    icon: None,
-                    name: None,
-                    location: OsStr::new(""),
-                })
+                .expand(
+                    &Values {
+                        icon: None,
+                        name: None,
+                        location: OsStr::new(""),
+                    },
+                    &[],
+                )
                 .into_iter()
                 .map(|arg| arg.into_string().unwrap())
                 .collect()
@@ -636,12 +880,14 @@ mod tests {
         let expand_bare = |exec: &str| -> Vec<String> {
             CommandLine::parse(exec)
                 .unwrap()
-                .expand(&Values {
-                    files: &[],
-                    icon: None,
-                    name: None,
-                    location: OsStr::new(""),
-                })
+                .expand(
+                    &Values {
+                        icon: None,
+                        name: None,
+                        location: OsStr::new(""),
+                    },
+                    &[],
+                )
                 .into_iter()
                 .map(|arg| arg.into_string().unwrap())
                 .collect()

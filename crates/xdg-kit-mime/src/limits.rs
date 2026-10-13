@@ -91,6 +91,13 @@ pub struct Limits {
     ///   the document type declare nothing.
     /// - All namespace declarations together may use the file's length times
     ///   this value, plus the extra. A declaration that exceeds it is unreadable.
+    ///   Each application of an internal subset's `ATTLIST` default for
+    ///   `xmlns`, a prefixed `xmlns:` declaration, or `xml:lang` charges its
+    ///   name and literal as if written. The first tag whose defaults exceed
+    ///   the budget skips the rest of a per-type file with a diagnostic, or
+    ///   leaves a document's root element unmatched. If a default's entity
+    ///   expansion exceeds the budget, only that value is unreadable, as for
+    ///   a written declaration.
     ///
     /// Both budgets count bytes read, keeping work linear in the file's size.
     /// Memory use also grows with this value. Included bytes can contain
@@ -100,7 +107,8 @@ pub struct Limits {
     ///
     /// `None` disables the budget and protection against entity bombs. Nested
     /// entities can make time and memory grow exponentially with file size,
-    /// up to the memory the system grants. Every allocation sized by an
+    /// up to the memory the system grants, and a long `ATTLIST` default given
+    /// to many elements costs its length each time. Every allocation sized by an
     /// expansion reserves memory first. If an expansion or its copy exceeds
     /// `usize` or allocation fails, the namespace declaration is unreadable.
     /// If included defaults cannot be held, the document type declares nothing.

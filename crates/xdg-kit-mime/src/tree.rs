@@ -8,7 +8,7 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path};
 
-use rustix::fs::{Access, AtFlags, Dir, FileType, Mode, OFlags};
+use rustix::fs::{Access, AtFlags, Dir, DirEntry, FileType, Mode, OFlags};
 use rustix::io::Errno;
 
 use crate::model::{TreeKind, TreeMatchlet};
@@ -172,11 +172,26 @@ fn is_dot(name: &[u8]) -> bool {
     matches!(name, b"." | b"..")
 }
 
-/// Whether `name` in `folder` is a folder that has an entry.
+/// Whether `name` in `folder` is a folder that has an entry (see
+/// [`lists_an_entry`]).
 fn has_entries(folder: BorrowedFd<'_>, name: &OsStr) -> bool {
-    list_folder(folder, Path::new(name)).is_ok_and(|mut entries| {
-        entries.any(|entry| !entry.is_ok_and(|entry| is_dot(entry.file_name().to_bytes())))
-    })
+    fn name_of(entry: &DirEntry) -> &[u8] {
+        entry.file_name().to_bytes()
+    }
+    list_folder(folder, Path::new(name)).is_ok_and(|entries| lists_an_entry(entries, name_of))
+}
+
+/// Whether `listing` contains an entry other than `.` and `..`, using
+/// `name` to read each item's name. Failed reads do not count as entries:
+/// errors below the root do not match, as in `GLib`. A folder whose listing
+/// fails therefore does not satisfy `non-empty`.
+fn lists_an_entry<T, E>(
+    listing: impl IntoIterator<Item = Result<T, E>>,
+    name: impl Fn(&T) -> &[u8],
+) -> bool {
+    listing
+        .into_iter()
+        .any(|entry| entry.is_ok_and(|entry| !is_dot(name(&entry))))
 }
 
 /// Finds entries in `folder` named `name`. With `match_case`, looks up the
@@ -1959,6 +1974,24 @@ mod tests {
             find_entries(folder.as_fd(), OsStr::new("dcim"), false, &list_here),
             ["DCIM"]
         );
+    }
+
+    #[test]
+    fn a_listing_that_fails_holds_no_entry() {
+        fn name<'a>(entry: &'a &[u8]) -> &'a [u8] {
+            entry
+        }
+        let listing = |items: Vec<Result<&'static [u8], Errno>>| items;
+        assert!(!lists_an_entry(listing(vec![Err(Errno::IO)]), name));
+        assert!(!lists_an_entry(
+            listing(vec![Ok(b"."), Err(Errno::IO), Ok(b"..")]),
+            name
+        ));
+        assert!(!lists_an_entry(listing(vec![Ok(b"."), Ok(b"..")]), name));
+        assert!(lists_an_entry(
+            listing(vec![Err(Errno::IO), Ok(b"a")]),
+            name
+        ));
     }
 
     /// A made-up folder, for [`simulate`]: the entries a component names

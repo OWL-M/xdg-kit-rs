@@ -318,6 +318,49 @@ enum Lang {
 /// reported once, at it, with a diagnostic of its own, besides those where
 /// its entities are used.
 ///
+/// The internal subset's literal and `#FIXED` defaults apply to tags that
+/// omit `xmlns`, prefixed `xmlns:` declarations, or `xml:lang` (XML 1.0,
+/// 3.3.2; [`Scopes::apply_defaults`]). libxml2 applies namespace defaults,
+/// but requires `XML_PARSE_DTDATTR` (`xmllint --dtdattr`) for `xml:lang`.
+/// The first declaration of an attribute binds (3.3). Unless the document
+/// is standalone, declarations after an unread parameter-entity reference
+/// are not processed (5.1); libxml2 processes them. Element names match
+/// exactly as written: `<!ATTLIST p:x …>` applies only to `<p:x>`.
+///
+/// Entities in defaults are replaced as in written values. For namespace
+/// defaults, libxml2 requires `XML_PARSE_NOENT` (`xmllint --noent`) to do
+/// this. In an open document, an entity not declared at the default's
+/// position makes the value unknown (4.1); the reported reference is the
+/// one in the default that reaches that entity. In included parameter-entity
+/// text, each line-end character came from a character reference and becomes
+/// a separate space. Thus `&#13;&#10;` in a parameter entity's literal gives
+/// two spaces (2.11, 3.3.3); libxml2 gives one.
+///
+/// Defaulted namespace declarations undergo the same checks as written ones
+/// and count toward [`crate::Limits::max_namespace_bindings`]. Reserved
+/// namespaces and, in XML 1.0, empty namespaces are reported as they would
+/// be in written declarations (Namespaces in XML 1.0, 3 and 5); libxml2
+/// accepts these defaults. A default that gives the root the spec's namespace
+/// makes the file a per-type file even without a written declaration.
+/// A defaulted language applies to its field or is
+/// inherited from the root. As with a written language, it makes an acronym
+/// or expanded acronym translated and therefore omitted. `GLib` does not
+/// read the document type, so it can assign a different language to a comment
+/// and keep such an acronym.
+///
+/// Each application of a default charges its name and literal to the
+/// namespace expansion budget ([`Scopes::default_value`]). The first tag
+/// whose defaults exceed it skips the rest of the file with a diagnostic,
+/// as when [`crate::Limits::max_namespace_bindings`] is exceeded. No further
+/// defaults on that tag are processed. If a default's entity expansion
+/// exceeds the budget, only that value is unreadable, as for a written
+/// declaration. Defaults for other attributes are neither applied nor
+/// checked; libxml2 reports unbound prefixes and repeated expanded names in
+/// them. For written or defaulted `xmlns`, `xmlns:` or `xml:lang` values
+/// declared with a type other than `CDATA`, leading and trailing spaces are
+/// removed and runs of spaces collapse to one (3.3.3, [`collapsed`]), as in
+/// libxml2.
+///
 /// A processing instruction libxml2 refuses ([`instruction_problem`]) is
 /// reported as an XML declaration out of place is, at the start too, and so
 /// is a comment or processing instruction holding a character the version
@@ -1032,6 +1075,75 @@ fn namespace_value<'a>(
     attribute_value(&attribute, version, entities)
 }
 
+/// The problem with a namespace declaration past the document's budget
+/// ([`Entities::budget`]).
+const TOO_LONG: &str = "the document's entity expansions together pass its length";
+
+/// Normalises `value` for an attribute declared with a type other than
+/// `CDATA` (XML 1.0, 3.3.3), as libxml2 does. Removes leading and trailing
+/// spaces and collapses runs to one. This applies to U+0020 whether it comes
+/// from written white space, a reference, or an entity.
+fn collapsed(value: Cow<'_, str>) -> Cow<'_, str> {
+    // Each byte looked at.
+    crate::work::count(1 + value.len());
+    if !(value.starts_with(' ') || value.ends_with(' ') || value.contains("  ")) {
+        return value;
+    }
+    // Each byte moved. Owned values, including expansions, collapse
+    // in place without allocating because the result cannot grow. Borrowed
+    // values are either file text, whose copy is bounded by the input size,
+    // or stored namespace bindings already collapsed by
+    // [`Scopes::declared_value`] and returned above.
+    crate::work::count(value.len());
+    let mut collapsed = value.into_owned();
+    // Spaces dropped at the start and after a space; then one left at the
+    // end.
+    let mut after_space = true;
+    collapsed.retain(|c| {
+        let kept = c != ' ' || !after_space;
+        after_space = c == ' ';
+        kept
+    });
+    if collapsed.ends_with(' ') {
+        collapsed.pop();
+    }
+    Cow::Owned(collapsed)
+}
+
+/// The value of `literal`, a default in included parameter-entity text in a
+/// document of XML `version` whose references are character references and
+/// XML's own entities only, normalised as an attribute value (XML 1.0,
+/// 3.3.3): references replaced, and each tab, line feed or carriage return
+/// a space. Its line ends were normalised as the entity's literal was read,
+/// so each such character came from a character reference and stands
+/// alone: CR LF is two spaces, and in XML 1.1 NEL and LS stay as they are.
+fn included_value(literal: &str, version: XmlVersion) -> String {
+    let space = |c: char| {
+        if matches!(c, '\t' | '\n' | '\r') {
+            ' '
+        } else {
+            c
+        }
+    };
+    // Each byte looked at, and copied.
+    crate::work::count(1 + 2 * literal.len());
+    let mut parts = literal.split('&');
+    let mut value: String = parts
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .map(space)
+        .collect();
+    for part in parts {
+        let (name, after) = part.split_once(';').unwrap_or((part, ""));
+        if let Some(c) = replacement(&BytesRef::new(name), version) {
+            value.push(c);
+        }
+        value.extend(after.chars().map(space));
+    }
+    value
+}
+
 /// The namespace `xml` is bound to by definition (Namespaces in XML 1.0,
 /// 3rd ed., 3; 1.1 has the same).
 const XML_NAMESPACE: &str = "http://www.w3.org/XML/1998/namespace";
@@ -1075,6 +1187,9 @@ struct Scopes {
     /// entities, by attribute name, with their values as bound
     /// ([`Scopes::declared_value`]).
     tag: HashMap<String, Binding>,
+    /// The defaults the tag last opened was given ([`Scopes::push`]), by
+    /// attribute name: a namespace or language, or why it cannot be read.
+    defaulted: Vec<(String, Binding)>,
     /// Whether the XML declaration says `standalone="yes"`.
     standalone: bool,
     /// Whether a document type, or the root, was read: entities are
@@ -1102,6 +1217,7 @@ impl Scopes {
             ids: HashMap::new(),
             entities: Entities::default(),
             tag: HashMap::new(),
+            defaulted: Vec::new(),
             standalone: false,
             typed: false,
             declared: Vec::new(),
@@ -1126,31 +1242,80 @@ impl Scopes {
 
     /// Opens the scope of `start`, a tag in a document of XML `version`,
     /// with its declarations, read in order up to an attribute that cannot
-    /// be read (those after it are not looked at). Gives the first problem:
-    /// a binding Namespaces in XML forbids ([`forbidden`]), or one more
-    /// than the limit. Bindings are compared after references are replaced.
+    /// be read (those after it are not looked at), then, if all could be,
+    /// those its element's defaults give that it does not write
+    /// ([`Scopes::apply_defaults`]). Gives the first problem: a binding
+    /// Namespaces in XML forbids ([`forbidden`]), or one more than the
+    /// limit. Bindings are compared after references are replaced, and, for
+    /// an attribute declared of a type other than `CDATA`, spaces collapsed
+    /// ([`collapsed`]).
     fn push(&mut self, start: &BytesStart<'_>, version: XmlVersion) -> Result<(), String> {
-        use crate::work::count;
         self.depth += 1;
         self.typed = true;
         self.new_tag();
+        // Taken out while the tag is read, so its element is looked up once.
+        let attributes = std::mem::take(&mut self.entities.attributes);
+        let pushed = self.push_declared(start, version, &attributes);
+        self.entities.attributes = attributes;
+        pushed
+    }
+
+    /// The attributes read here that `attributes` declares for `element`
+    /// ([`Entities::attributes`]), if any.
+    fn declared<'a>(
+        attributes: &'a HashMap<String, Attributes>,
+        element: &str,
+    ) -> Option<&'a Attributes> {
+        if attributes.is_empty() {
+            return None;
+        }
+        // Hashed and compared.
+        crate::work::count(1 + 2 * element.len());
+        attributes.get(element)
+    }
+
+    /// [`Scopes::push`], the declarations in the document type
+    /// `attributes`.
+    fn push_declared(
+        &mut self,
+        start: &BytesStart<'_>,
+        version: XmlVersion,
+        attributes: &HashMap<String, Attributes>,
+    ) -> Result<(), String> {
+        use crate::work::count;
         // The tag scanned for its declarations.
         count(1 + start.len());
+        let declared = Self::declared(attributes, start.name().into_inner());
+        let defaults = declared.filter(|declared| !declared.defaulted.is_empty());
+        // The attributes the tag writes that a default may be given for.
+        let mut written = HashSet::new();
         for attribute in start.attributes().with_checks(false) {
             let Ok(attribute) = attribute else {
-                break;
+                return Ok(());
             };
-            let Some(declared) = attribute.key.as_namespace_binding() else {
+            let name = attribute.key.into_inner();
+            let binding = attribute.key.as_namespace_binding();
+            if defaults.is_some() && (binding.is_some() || name == "xml:lang") {
+                // Hashed and compared.
+                count(1 + 2 * name.len());
+                written.insert(name);
+            }
+            let Some(binding) = binding else {
                 continue;
             };
+            let tokens = declared.is_some_and(|declared| declared.tokens(name));
             // The value scanned to be checked, then to be normalised.
             count(2 * attribute.value.len());
             // Entities are replaced; a value still unknown is kept as one
             // that cannot be read: an error only where a name uses it.
             let value = match attribute_value(&attribute, version, &self.entities) {
+                Ok(Value::Known(value)) if tokens => Ok(collapsed(value)),
                 Ok(Value::Known(value)) => Ok(value),
                 Ok(Value::Unknown(why)) => {
-                    let mut value = match self.entities.expand(&attribute.value, version) {
+                    let mut value = match self.entities.expand(&attribute.value, version, true) {
+                        Ok(Some(expanded)) if tokens => {
+                            Ok(collapsed(Cow::Owned(expanded)).into_owned())
+                        }
                         Ok(Some(expanded)) => Ok(expanded),
                         Ok(None) => Err(why),
                         Err(why) => Err(why),
@@ -1161,7 +1326,6 @@ impl Scopes {
                     // binding cannot be read, as a refused expansion's.
                     // Counted in tests only, so that the sum cannot
                     // overflow elsewhere.
-                    let name = attribute.key.into_inner();
                     crate::work::count_by(|| {
                         let length = value.as_ref().map_or_else(String::len, String::len);
                         name.len()
@@ -1183,54 +1347,184 @@ impl Scopes {
                 }
                 Err(why) => Err(why),
             };
-            let prefix = match declared {
-                PrefixDeclaration::Default => None,
-                PrefixDeclaration::Named(prefix) => {
-                    if let Some(problem) =
-                        forbidden(prefix, &attribute.value, value.as_deref().ok())
-                    {
-                        return Err(problem);
-                    }
-                    // Bound so by definition.
-                    if prefix == "xml" {
-                        continue;
-                    }
-                    Some(prefix)
-                }
-            };
-            if let Some(max) = self.max
-                && self.declared.len() >= max
-            {
-                return Err(format!(
-                    "more than {max} namespace declarations on the open elements"
-                ));
-            }
-            let mut value = value.map(Cow::into_owned);
-            // Copied: the namespace, or a message quoting it.
-            crate::work::count_by(|| value.as_ref().map_or_else(String::len, String::len));
-            match prefix {
-                None => self.default.push(value),
-                Some(prefix) => {
-                    // Hashed and copied (three), and copied again.
-                    count(1 + 4 * prefix.len());
-                    // A namespace whose copy for its ID is refused cannot
-                    // be read, as one whose expansion is; such a binding
-                    // has the ID of an empty one, as any binding that
-                    // cannot be read.
-                    let id = if let Some(id) = self.id(value.as_deref().unwrap_or_default()) {
-                        id
-                    } else {
-                        value = Err(too_large());
-                        self.id("").unwrap_or(usize::MAX)
-                    };
-                    self.prefixed
-                        .entry(prefix.to_owned())
-                        .or_default()
-                        .push((id, value));
-                }
-            }
-            self.declared.push((self.depth, prefix.map(str::to_owned)));
+            self.bind(binding, &attribute.value, value)?;
         }
+        match defaults {
+            Some(defaults) => self.apply_defaults(defaults, &written, version),
+            None => Ok(()),
+        }
+    }
+
+    /// Applies `declared` defaults to attributes absent from `written` on
+    /// the opening tag, using XML `version` (XML 1.0, 3.3.2). Binds namespace
+    /// declarations as written ones ([`Scopes::bind`]) and keeps them and
+    /// the language for attribute checks ([`Scopes::defaulted`]). Charges
+    /// each default to the budget ([`Scopes::default_value`]) and stops at
+    /// the first that exceeds it.
+    fn apply_defaults(
+        &mut self,
+        declared: &Attributes,
+        written: &HashSet<&str>,
+        version: XmlVersion,
+    ) -> Result<(), String> {
+        for &at in &declared.defaulted {
+            let Declared {
+                name,
+                tokens,
+                default: Some(fallback),
+            } = &declared.list[at]
+            else {
+                continue;
+            };
+            // Hashed and compared.
+            crate::work::count(1 + 2 * name.len());
+            if written.contains(name.as_str()) {
+                continue;
+            }
+            let value = self.default_value(name, fallback, *tokens, version)?;
+            // The name copied, and the value.
+            crate::work::count(name.len());
+            crate::work::count_by(|| value.as_ref().map_or_else(String::len, String::len));
+            let Some(binding) = QName(name).as_namespace_binding() else {
+                self.defaulted.push((name.clone(), value));
+                continue;
+            };
+            let kept = match &value {
+                Ok(namespace) => try_copy(namespace).ok_or_else(too_large),
+                Err(why) => Err(why.clone()),
+            };
+            let value = match kept {
+                Ok(_) => value,
+                Err(ref why) => Err(why.clone()),
+            };
+            self.defaulted.push((name.clone(), kept));
+            self.bind(binding, &fallback.literal, value.map(Cow::Owned))?;
+        }
+        Ok(())
+    }
+
+    /// Reads attribute `name`'s default `fallback` under XML `version`,
+    /// using the same rules as a written value ([`attribute_value`]).
+    /// Expands document-defined entities in namespace declarations
+    /// ([`Entities::expand`]). References to those entities in an `xml:lang`
+    /// default make its value unknown. Character references and predefined
+    /// XML entities are decoded in both cases. Collapses spaces
+    /// when `tokens` is true ([`collapsed`]). Returns the value or the reason
+    /// it cannot be read. A reference to an entity not declared at the
+    /// default's position makes the value unknown and identifies the
+    /// reference ([`Fallback::unknown`]).
+    ///
+    /// In included parameter-entity text, line-end characters came from
+    /// character references. Each becomes a space, so CR LF gives two
+    /// (XML 1.0, 2.11 and 3.3.3); libxml2 joins them. Each application charges
+    /// the name and literal, as if written, to the document's shared
+    /// namespace budget ([`Entities::budget`]). This bounds repeated use of
+    /// long defaults. Exceeding the budget makes the tag unreadable and
+    /// returns the outer `Err`.
+    fn default_value(
+        &mut self,
+        name: &str,
+        fallback: &Fallback,
+        tokens: bool,
+        version: XmlVersion,
+    ) -> Result<Binding, String> {
+        let literal = fallback.literal.as_str();
+        let cost = name.len().saturating_add(literal.len()).saturating_add(1);
+        if cost > self.entities.budget {
+            return Err(TOO_LONG.to_owned());
+        }
+        self.entities.budget -= cost;
+        // The literal scanned to be checked, then to be normalised.
+        crate::work::count(1 + 2 * literal.len());
+        if let Some(unknown) = fallback.unknown {
+            let unknown = literal
+                .split('&')
+                .skip(1)
+                .filter_map(|part| part.split_once(';'))
+                .map(|(name, _)| name)
+                .filter(|name| replacement(&BytesRef::new(*name), version).is_none())
+                .nth(unknown);
+            return Ok(Err(not_replaced(unknown.unwrap_or_default())));
+        }
+        let attribute = Attribute {
+            key: QName(name),
+            value: literal.into(),
+        };
+        let value = match attribute_value(&attribute, version, &self.entities) {
+            Ok(Value::Known(_)) if fallback.included => included_value(literal, version),
+            Ok(Value::Known(value)) => value.into_owned(),
+            Ok(Value::Unknown(why)) if name != "xml:lang" => {
+                match self.entities.expand(literal, version, !fallback.included) {
+                    Ok(Some(expanded)) => expanded,
+                    Ok(None) => return Ok(Err(why)),
+                    Err(why) => return Ok(Err(why)),
+                }
+            }
+            Ok(Value::Unknown(why)) | Err(why) => return Ok(Err(why)),
+        };
+        Ok(Ok(if tokens {
+            collapsed(Cow::Owned(value)).into_owned()
+        } else {
+            value
+        }))
+    }
+
+    /// Binds the namespace declaration `binding`, written `written`, to
+    /// `value` (or why it cannot be read), in the tag being opened. Gives
+    /// the problem if Namespaces in XML forbids it ([`forbidden`]), or it
+    /// is one more than the limit.
+    fn bind(
+        &mut self,
+        binding: PrefixDeclaration<'_>,
+        written: &str,
+        value: Result<Cow<'_, str>, String>,
+    ) -> Result<(), String> {
+        use crate::work::count;
+        let prefix = match binding {
+            PrefixDeclaration::Default => None,
+            PrefixDeclaration::Named(prefix) => {
+                if let Some(problem) = forbidden(prefix, written, value.as_deref().ok()) {
+                    return Err(problem);
+                }
+                // Bound so by definition.
+                if prefix == "xml" {
+                    return Ok(());
+                }
+                Some(prefix)
+            }
+        };
+        if let Some(max) = self.max
+            && self.declared.len() >= max
+        {
+            return Err(format!(
+                "more than {max} namespace declarations on the open elements"
+            ));
+        }
+        let mut value = value.map(Cow::into_owned);
+        // Copied: the namespace, or a message quoting it.
+        crate::work::count_by(|| value.as_ref().map_or_else(String::len, String::len));
+        match prefix {
+            None => self.default.push(value),
+            Some(prefix) => {
+                // Hashed and copied (three), and copied again.
+                count(1 + 4 * prefix.len());
+                // A namespace whose copy for its ID is refused cannot
+                // be read, as one whose expansion is; such a binding
+                // has the ID of an empty one, as any binding that
+                // cannot be read.
+                let id = if let Some(id) = self.id(value.as_deref().unwrap_or_default()) {
+                    id
+                } else {
+                    value = Err(too_large());
+                    self.id("").unwrap_or(usize::MAX)
+                };
+                self.prefixed
+                    .entry(prefix.to_owned())
+                    .or_default()
+                    .push((id, value));
+            }
+        }
+        self.declared.push((self.depth, prefix.map(str::to_owned)));
         Ok(())
     }
 
@@ -1286,6 +1580,9 @@ impl Scopes {
     /// with a new map, not a cleared one: clearing walks every slot of a
     /// map once grown large, on every tag.
     fn new_tag(&mut self) {
+        // Each dropped.
+        crate::work::count(self.defaulted.len());
+        self.defaulted.clear();
         if !self.tag.is_empty() {
             // Each slot dropped.
             crate::work::count(self.tag.capacity());
@@ -1588,6 +1885,7 @@ impl Field {
         // declaration further up at the tag.
         let lang = language(start, version, scopes, true).and_then(|lang| {
             namespace.map(|()| lang).map_err(|message| TagProblem {
+                lang: false,
                 at: None,
                 name: None,
                 message,
@@ -1605,6 +1903,8 @@ struct TagProblem {
     /// Where the name of the attribute it is in starts, as `at`, if it is
     /// in one.
     name: Option<usize>,
+    /// Whether it is in `xml:lang`, written or given by a default.
+    lang: bool,
     message: String,
 }
 
@@ -1633,6 +1933,7 @@ fn declaration_problem(
     scopes: &Scopes,
 ) -> Option<TagProblem> {
     let mut seen = HashSet::new();
+    let declared = Scopes::declared(&scopes.entities.attributes, start.name().into_inner());
     start
         .attributes()
         .with_checks(false)
@@ -1652,15 +1953,41 @@ fn declaration_problem(
                         Cow::Borrowed(scopes.declared_value(name)?.as_deref().ok()?)
                     }
                 };
+                let value = if declared.is_some_and(|declared| declared.tokens(name)) {
+                    collapsed(value)
+                } else {
+                    value
+                };
                 empty_prefix(name, &value, version).or_else(|| reserved_default(name, &value))?
             };
             let at = offset_in(start, name);
             Some(TagProblem {
+                lang: false,
                 at,
                 name: at,
                 message,
             })
         })
+        .or_else(|| defaulted_problem(scopes, version))
+}
+
+/// The first problem with the namespace declarations defaults gave the tag
+/// last opened ([`Scopes::defaulted`]), as with written ones: in XML 1.0 a
+/// prefix's namespace empty ([`empty_prefix`]), or a reserved namespace the
+/// default ([`reserved_default`]). It is at the tag's `<`.
+fn defaulted_problem(scopes: &Scopes, version: XmlVersion) -> Option<TagProblem> {
+    scopes.defaulted.iter().find_map(|(name, value)| {
+        crate::work::count(1);
+        let value = value.as_deref().ok()?;
+        let message =
+            empty_prefix(name, value, version).or_else(|| reserved_default(name, value))?;
+        Some(TagProblem {
+            at: None,
+            name: None,
+            lang: false,
+            message,
+        })
+    })
 }
 
 /// The problem with an attribute `name` that declares a prefix's namespace
@@ -1693,6 +2020,7 @@ fn language(
 ) -> Result<Option<String>, TagProblem> {
     let mut lang = None;
     let mut expanded = Expanded::default();
+    let declared = Scopes::declared(&scopes.entities.attributes, start.name().into_inner());
     // Where the attribute being read starts, at the earliest: after the
     // element's name, then after each value's closing quote.
     let mut after = start.name().as_ref().len();
@@ -1700,6 +2028,7 @@ fn language(
         let attribute = attribute.map_err(|err| attribute_error(start, &err, after))?;
         let name = attribute.key.into_inner();
         let problem = |message| TagProblem {
+            lang: false,
             at: offset_in(start, name),
             name: offset_in(start, name),
             message,
@@ -1731,6 +2060,12 @@ fn language(
             },
             Err(why) => return Err(problem(why)),
         };
+        let value = match value {
+            Some(value) if declared.is_some_and(|declared| declared.tokens(name)) => {
+                Some(collapsed(value))
+            }
+            value => value,
+        };
         if let Some(message) = value
             .as_ref()
             .and_then(|value| {
@@ -1748,6 +2083,31 @@ fn language(
         after =
             offset_in(start, &attribute.value).map_or(after, |at| at + attribute.value.len() + 1);
     }
+    if let Some(problem) = defaulted_problem(scopes, version) {
+        return Err(problem);
+    }
+    // A default the tag does not write.
+    let default = scopes.defaulted.iter().find(|(name, _)| {
+        crate::work::count(1);
+        name == "xml:lang"
+    });
+    match default.map(|(_, value)| value) {
+        Some(Ok(value)) => {
+            copied_language();
+            // Copied.
+            crate::work::count(value.len());
+            lang = Some(value.clone());
+        }
+        Some(Err(why)) if lang_needed => {
+            return Err(TagProblem {
+                at: None,
+                name: None,
+                lang: true,
+                message: why.clone(),
+            });
+        }
+        _ => {}
+    }
     Ok(lang)
 }
 
@@ -1764,6 +2124,7 @@ fn field_language(
         (Some(own), _) => Ok(Lang::Own(own)),
         (None, Ok(id)) => Ok(Lang::Id(*id)),
         (None, Err(problem)) => Err(TagProblem {
+            lang: false,
             at: None,
             name: None,
             message: problem.clone(),
@@ -1787,7 +2148,7 @@ fn root_language(
             .and_then(|at| root.get(at..))
             .and_then(|rest| rest.strip_prefix("xml:lang"))
             .is_some_and(|rest| rest.is_empty() || rest.starts_with(['=', ' ', '\t', '\r', '\n']));
-        if at_lang {
+        if at_lang || problem.lang {
             format!(
                 "the root element's `xml:lang` cannot be read: {}",
                 problem.message
@@ -1842,6 +2203,7 @@ fn attribute_error(start: &BytesStart<'_>, err: &AttrError, after: usize) -> Tag
                 .and_then(|key| key.split(['=', ' ', '\t', '\r', '\n']).next())
                 .unwrap_or_default();
             return TagProblem {
+                lang: false,
                 at: Some(at),
                 name: Some(at),
                 message: twice(name),
@@ -1849,6 +2211,7 @@ fn attribute_error(start: &BytesStart<'_>, err: &AttrError, after: usize) -> Tag
         }
     };
     TagProblem {
+        lang: false,
         at: Some(at),
         name,
         message: format!("{UNREADABLE}{what}"),
@@ -1921,6 +2284,7 @@ fn name_problem(start: &BytesStart<'_>) -> Option<TagProblem> {
         return None;
     };
     Some(TagProblem {
+        lang: false,
         at: Some(0),
         name: None,
         message: message.to_owned(),
@@ -1943,6 +2307,7 @@ fn inner_tag(
     // At the name: its prefix not bound, or its namespace not readable
     // (after the tag's attributes, which may be why).
     let at_name = |message| TagProblem {
+        lang: false,
         at: Some(0),
         name: None,
         message,
@@ -2056,6 +2421,60 @@ struct Entities {
     /// counts as undeclared, XML 1.0, 4.1), and the entities declared
     /// before the default ([`Entities::a_default_is_an_error`]).
     defaults: Vec<(Option<usize>, usize)>,
+    /// The processed declarations of the attributes read here (`xmlns`,
+    /// `xmlns:` and a prefix, `xml:lang`), by the element's name as written
+    /// (a document type is not namespace-aware): the first declaration of
+    /// each binds (XML 1.0, 3.3).
+    attributes: HashMap<String, Attributes>,
+}
+
+/// The attributes read here that an `ATTLIST` declares for one element
+/// ([`Entities::attributes`]).
+#[derive(Default)]
+struct Attributes {
+    /// Each one's place in `list`, by name.
+    index: HashMap<String, usize>,
+    list: Vec<Declared>,
+    /// The places of those with a default, in order.
+    defaulted: Vec<usize>,
+}
+
+impl Attributes {
+    /// Whether attribute `name` is declared of a type other than `CDATA`,
+    /// so that its value is normalised further (XML 1.0, 3.3.3).
+    fn tokens(&self, name: &str) -> bool {
+        // Hashed and compared.
+        crate::work::count(1 + 2 * name.len());
+        self.index.get(name).is_some_and(|&at| self.list[at].tokens)
+    }
+}
+
+/// An attribute's declaration in an `ATTLIST` ([`Attributes`]).
+struct Declared {
+    name: String,
+    /// Of a type other than `CDATA` ([`Attributes::tokens`]).
+    tokens: bool,
+    /// Its default, a literal or `#FIXED` one; `None` for `#REQUIRED` or
+    /// `#IMPLIED`.
+    default: Option<Fallback>,
+}
+
+/// An attribute's default (XML 1.0, 3.3.2).
+struct Fallback {
+    /// As written in the subset, or in included parameter-entity text.
+    literal: String,
+    /// Whether it is in included parameter-entity text, whose line ends
+    /// were normalised as the entity's literal was read (XML 1.0, 2.11): a
+    /// line-end character there came from a character reference, so is not
+    /// one ([`Scopes::default_value`]).
+    included: bool,
+    /// Its references' places in [`Entities::defaults`].
+    references: std::ops::Range<usize>,
+    /// Which of its references (other than character references and XML's
+    /// own entities), counted from 0, reaches first, directly or through
+    /// others, an entity not declared where it stands, in an open document
+    /// (4.1): its value is then unknown ([`Entities::a_default_is_an_error`]).
+    unknown: Option<usize>,
 }
 
 /// What a value that refers to an entity is ([`Entities::walk`]).
@@ -2369,7 +2788,7 @@ impl Entities {
             Vec::new()
         };
         let _bad = hold(|| size::<usize>(bad.capacity()));
-        defaults.iter().any(|&(entity, before)| {
+        let error = defaults.iter().any(|&(entity, before)| {
             crate::work::count(1);
             match entity {
                 None => !open,
@@ -2377,7 +2796,33 @@ impl Entities {
                 Some(_) if !open => true,
                 Some(e) => bad[e] <= before,
             }
-        })
+        });
+        if !error {
+            self.mark_unknown_defaults(&defaults, &reach);
+        }
+        error
+    }
+
+    /// Marks defaults of attributes read here as unknown if they reference
+    /// an entity not declared at the default's position. Records the first
+    /// such reference ([`Fallback::unknown`]). `defaults` holds all default
+    /// references; `reach` holds the latest entity each entity reaches
+    /// ([`Entities::a_default_is_an_error`]). Such references can occur
+    /// without a default error only in an open document.
+    fn mark_unknown_defaults(&mut self, defaults: &[(Option<usize>, usize)], reach: &[usize]) {
+        let unknown = |&(entity, before): &(Option<usize>, usize)| {
+            crate::work::count(1);
+            entity.is_none_or(|e| reach[e] >= before)
+        };
+        for attributes in self.attributes.values_mut() {
+            for declared in &mut attributes.list {
+                crate::work::count(1);
+                if let Some(fallback) = &mut declared.default {
+                    let references = &defaults[fallback.references.clone()];
+                    fallback.unknown = references.iter().position(unknown);
+                }
+            }
+        }
     }
 
     /// Starts the walk's result for entity `at` from its own text.
@@ -2415,8 +2860,12 @@ impl Entities {
     /// they are read too, so it holds whatever the sizes say. An error too
     /// if what it expands to is too large to hold (its size past `usize`, or
     /// memory refused): with no budget, the only bound.
-    fn expand(&mut self, written: &str, version: XmlVersion) -> Result<Option<String>, String> {
-        const TOO_LONG: &str = "the document's entity expansions together pass its length";
+    fn expand(
+        &mut self,
+        written: &str,
+        version: XmlVersion,
+        lines: bool,
+    ) -> Result<Option<String>, String> {
         let mut size = written.len();
         // What the value's length adds for the entities it refers to.
         let mut referred = 0usize;
@@ -2441,8 +2890,13 @@ impl Entities {
         if size > self.budget {
             return Err(TOO_LONG.to_owned());
         }
-        // Line ends first (2.11), as in a value without entities.
-        let written = line_ends(written, version);
+        // Line ends first (2.11), as in a value without entities, if not
+        // already done.
+        let written = if lines {
+            line_ends(written, version)
+        } else {
+            Cow::Borrowed(written)
+        };
         // What it expands to is held at once, its length asked for (not
         // the bytes read, references included, which the budget is charged
         // with): one too large to hold (its length or size saturated, or
@@ -3209,15 +3663,10 @@ impl<'a> Reader<'a> {
             // With standalone, an entity a default outside parameter-entity
             // text refers to needs a declaration outside such text, anywhere.
             let outside = self.standalone && !included;
-            let entities = &mut self.entities;
-            let noted = default_references(
-                list,
-                self.version,
-                &entities.index,
-                &mut entities.defaults,
-                outside.then_some(&mut entities.list),
-            );
-            if !noted {
+            if !self
+                .entities
+                .attribute_list(list, self.version, outside, included)
+            {
                 return Err(());
             }
         }
@@ -3432,56 +3881,169 @@ fn has_parameter_reference(declaration: &str) -> bool {
     false
 }
 
-/// Notes in `found` the entities the defaults of `list`, an `ATTLIST`
-/// declaration after `ATTLIST`, refer to in a document of XML `version`:
-/// references other than character references and XML's own (their
-/// well-formedness was checked before, [`has_bad_literal`]). One not in
-/// `declared` yet, in parameter-entity text or not, is noted as `None`: an
-/// entity must be declared before a default refers to it (XML 1.0, 4.1). Each
-/// is noted with the number of entities declared so far, where the default
-/// stands; and, if `outside` is given (a default outside parameter-entity
-/// text, with standalone), each declared one is marked in it as needing a
-/// declaration outside such text, anywhere ([`Entity::outside_needed`]).
-/// False if memory for one more is refused: they grow with what parameter
-/// entities include, which no budget may bound.
-fn default_references(
-    list: &str,
-    version: XmlVersion,
-    declared: &HashMap<String, usize>,
-    found: &mut Vec<(Option<usize>, usize)>,
-    mut outside: Option<&mut Vec<Entity>>,
-) -> bool {
-    let end = declaration_end(list).unwrap_or(list.len());
-    let mut rest = &list[..end];
-    while let Some(at) = rest.find(['"', '\'']) {
-        crate::work::count(1 + at);
-        let quote = &rest[at..=at];
-        let Some((default, after)) = rest[at + 1..].split_once(quote) else {
-            // Each byte looked at, to the end.
-            crate::work::count(rest.len() - at);
-            return true;
-        };
-        for part in default.split('&').skip(1) {
+impl Entities {
+    /// Notes what `list`, an `ATTLIST` declaration after `ATTLIST` read
+    /// whole by XML's grammar ([`grammatical_end`]), declares in a document
+    /// of XML `version`: the entities its defaults refer to
+    /// ([`Entities::default_references`]), and the declarations of the
+    /// attributes read here ([`Entities::attributes`]). `outside`: a default
+    /// outside parameter-entity text, with standalone; `included`: in such
+    /// text ([`Fallback::included`]). False if memory for
+    /// them is refused: they grow with what parameter entities include,
+    /// which no budget may bound.
+    fn attribute_list(
+        &mut self,
+        list: &str,
+        version: XmlVersion,
+        outside: bool,
+        included: bool,
+    ) -> bool {
+        let mut grammar = Grammar { text: list, at: 0 };
+        grammar.blank();
+        let from = grammar.at;
+        grammar.name();
+        let element = &list[from..grammar.at];
+        loop {
+            grammar.blank();
+            let from = grammar.at;
+            // At the declaration's `>`.
+            if !grammar.name() {
+                break;
+            }
+            let name = &list[from..grammar.at];
+            grammar.blank();
+            let from = grammar.at;
+            grammar.attribute_type();
+            let tokens = &list[from..grammar.at] != "CDATA";
+            grammar.blank();
+            let literal = if grammar.eat("#REQUIRED") || grammar.eat("#IMPLIED") {
+                None
+            } else {
+                grammar.eat("#FIXED");
+                grammar.blank();
+                grammar.literal()
+            };
+            let first = self.defaults.len();
+            if let Some(literal) = literal
+                && !self.default_references(literal, version, outside)
+            {
+                return false;
+            }
+            let read = name == "xmlns" || name == "xml:lang" || name.starts_with("xmlns:");
+            let default = literal.map(|literal| (literal, included, first..self.defaults.len()));
+            if read && is_qname(name) && !self.declare_attribute(element, name, tokens, default) {
+                return false;
+            }
+        }
+        // Each byte looked at, about once.
+        crate::work::count(1 + grammar.at);
+        true
+    }
+
+    /// Notes in [`Entities::defaults`] the entities the default `literal`
+    /// refers to in a document of XML `version`: references other than
+    /// character references and XML's own (their well-formedness was checked
+    /// before, [`has_bad_literal`]). One not declared yet, in parameter-entity
+    /// text or not, is noted as `None`: an entity must be declared before a
+    /// default refers to it (XML 1.0, 4.1). Each is noted with the number of
+    /// entities declared so far, where the default stands; and if `outside`
+    /// (a default outside parameter-entity text, with standalone), each
+    /// declared one is marked as needing a declaration outside such text,
+    /// anywhere ([`Entity::outside_needed`]). False if memory for one more is
+    /// refused.
+    fn default_references(&mut self, literal: &str, version: XmlVersion, outside: bool) -> bool {
+        for part in literal.split('&').skip(1) {
             if let Some((name, _)) = part.split_once(';')
                 && replacement(&BytesRef::new(name), version).is_none()
             {
                 // Hashed and compared.
                 crate::work::count(1 + 2 * name.len());
-                let at = declared.get(name).copied();
-                if found.try_reserve(1).is_err() {
+                let at = self.index.get(name).copied();
+                if self.defaults.try_reserve(1).is_err() {
                     return false;
                 }
-                found.push((at, declared.len()));
-                if let (Some(at), Some(list)) = (at, outside.as_deref_mut()) {
-                    list[at].outside_needed = true;
+                self.defaults.push((at, self.index.len()));
+                if let (Some(at), true) = (at, outside) {
+                    self.list[at].outside_needed = true;
                 }
             }
         }
         // Each byte of the default looked at.
-        crate::work::count(1 + default.len());
-        rest = after;
+        crate::work::count(1 + literal.len());
+        true
     }
-    true
+
+    /// Notes the declaration of attribute `name` of `element`, of a type
+    /// other than `CDATA` if `tokens`, with its default's literal, whether it
+    /// is in included text, and its references, if any, unless one came
+    /// before ([`Entities::attributes`]).
+    /// False if memory for it is refused.
+    fn declare_attribute(
+        &mut self,
+        element: &str,
+        name: &str,
+        tokens: bool,
+        default: Option<(&str, bool, std::ops::Range<usize>)>,
+    ) -> bool {
+        let copy = |text: &str| {
+            let mut copy = String::new();
+            copy.try_reserve_exact(text.len()).ok()?;
+            copy.push_str(text);
+            Some(copy)
+        };
+        // Both names hashed, compared and copied.
+        crate::work::count(2 + 3 * (element.len() + name.len()));
+        if !self.attributes.contains_key(element) {
+            let Some(element) = copy(element) else {
+                return false;
+            };
+            if self.attributes.try_reserve(1).is_err() {
+                return false;
+            }
+            self.attributes.insert(element, Attributes::default());
+        }
+        let Some(attributes) = self.attributes.get_mut(element) else {
+            return false;
+        };
+        if attributes.index.contains_key(name) {
+            return true;
+        }
+        let default = match default {
+            Some((literal, included, references)) => {
+                // Copied.
+                crate::work::count(literal.len());
+                let Some(literal) = copy(literal) else {
+                    return false;
+                };
+                Some(Fallback {
+                    literal,
+                    included,
+                    references,
+                    unknown: None,
+                })
+            }
+            None => None,
+        };
+        let (Some(key), Some(kept)) = (copy(name), copy(name)) else {
+            return false;
+        };
+        if attributes.index.try_reserve(1).is_err()
+            || attributes.list.try_reserve(1).is_err()
+            || attributes.defaulted.try_reserve(1).is_err()
+        {
+            return false;
+        }
+        if default.is_some() {
+            attributes.defaulted.push(attributes.list.len());
+        }
+        attributes.index.insert(key, attributes.list.len());
+        attributes.list.push(Declared {
+            name: kept,
+            tokens,
+            default,
+        });
+        true
+    }
 }
 
 /// Whether `literal`, in a document of XML `version`, holds a reference
@@ -4350,6 +4912,12 @@ pub(crate) fn root_element(bytes: &[u8]) -> Option<(String, String)> {
 /// declarations than `limits` allow
 /// ([`crate::Limits::max_namespace_bindings`]). Reserved namespaces are
 /// compared after references are replaced.
+///
+/// Namespace defaults from the internal subset (XML 1.0, 3.3.2) apply to
+/// the root and undergo the same checks as written declarations. Written
+/// and defaulted values declared with a type other than `CDATA` have their
+/// spaces collapsed (3.3.3), as in per-type files ([`TypeInfo`]). Returns no
+/// root element if its defaults exceed the budget ([`Scopes::default_value`]).
 pub(crate) fn root_element_within(
     bytes: &[u8],
     limits: &crate::Limits,
@@ -4657,6 +5225,16 @@ impl MimeDatabase {
     /// unknown. An end tag that then does not match its start tag skips the
     /// rest of the file. The same happens in XML 1.0, where such a tag is
     /// not well-formed.
+    ///
+    /// Defaults in the file's internal subset apply when a tag omits
+    /// `xml:lang` or a namespace declaration (XML 1.0, 3.3.2; libxml2 requires
+    /// `XML_PARSE_DTDATTR` for a defaulted `xml:lang`). A default that gives
+    /// the root the spec's namespace makes the file a per-type file even
+    /// without a written declaration. Written and defaulted values declared
+    /// with a type other than `CDATA` have their spaces collapsed (3.3.3).
+    /// `GLib` does not read the document type, so it can assign a different
+    /// language to a description and keep an acronym that
+    /// [`MimeDatabase::acronym`] omits.
     #[must_use]
     pub fn description(&self, mime: &MimeType, locales: &Locales) -> Option<String> {
         self.type_info(mime).comment.pick(locales)
@@ -4665,16 +5243,20 @@ impl MimeDatabase {
     /// The type's acronym ("PNG"), from its XML files like
     /// [`MimeDatabase::description`]. Not translated: spec 0.22 dropped
     /// translated acronyms, and any an older database has are ignored.
-    /// One without its own `xml:lang` takes the root's, so under a root
-    /// `xml:lang` it is translated and ignored too. Has the same XML 1.1
-    /// limit as [`MimeDatabase::description`].
+    /// An acronym with its own `xml:lang` or one inherited from the root is
+    /// treated as translated and ignored. This also applies when the
+    /// internal subset supplies the language as a default (XML 1.0, 3.3.2).
+    /// Without either attribute, the acronym is kept as untranslated.
+    /// `GLib` does not read those defaults. The same XML 1.1 limit as
+    /// [`MimeDatabase::description`] applies.
     #[must_use]
     pub fn acronym(&self, mime: &MimeType) -> Option<String> {
         self.type_info(mime).acronym.clone()
     }
 
-    /// The expanded acronym ("Portable Network Graphics"); not translated,
-    /// and with the same XML 1.1 limit, as [`MimeDatabase::acronym`].
+    /// The expanded acronym ("Portable Network Graphics"). As with
+    /// [`MimeDatabase::acronym`], a written or defaulted `xml:lang` causes it
+    /// to be omitted, and the same XML 1.1 limit applies.
     #[must_use]
     pub fn expanded_acronym(&self, mime: &MimeType) -> Option<String> {
         self.type_info(mime).expanded_acronym.clone()
@@ -10213,7 +10795,7 @@ mod tests {
                 entities.budget = 4 * n;
                 let ((), steps) = crate::work::steps(|| {
                     for _ in 0..n {
-                        let _ = entities.expand("&a;", XmlVersion::Implicit1_0);
+                        let _ = entities.expand("&a;", XmlVersion::Implicit1_0, true);
                     }
                 });
                 (steps, n)
@@ -12070,5 +12652,609 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `root`'s root element after a document type whose internal subset
+    /// is `subset`.
+    fn root_in(subset: &str, root: &str) -> Option<(String, String)> {
+        root_element(format!("<!DOCTYPE doc [{subset}]>{root}").as_bytes())
+    }
+
+    /// A namespace and a local name, as [`root_element`] gives them.
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "compared with what root detection gives"
+    )]
+    fn named(namespace: &str, local: &str) -> Option<(String, String)> {
+        Some((namespace.to_owned(), local.to_owned()))
+    }
+
+    #[test]
+    fn a_namespace_default_from_the_internal_subset_declares_the_roots_namespace() {
+        // XML 1.0, 3.3.2: a declared default, literal or `#FIXED`, is the
+        // value of an attribute the tag does not give; libxml2 applies it to
+        // namespace declarations too.
+        let test = named("urn:test", "doc");
+        assert_eq!(
+            root_in(r#"<!ATTLIST doc xmlns CDATA "urn:test">"#, "<doc/>"),
+            test
+        );
+        assert_eq!(
+            root_in(r#"<!ATTLIST doc xmlns CDATA #FIXED "urn:test">"#, "<doc/>"),
+            test
+        );
+        assert_eq!(
+            root_in(r#"<!ATTLIST p:doc xmlns:p CDATA "urn:p">"#, "<p:doc/>"),
+            named("urn:p", "doc")
+        );
+        // The tag's own value wins, `#FIXED` or not (a validity error only).
+        assert_eq!(
+            root_in(
+                r#"<!ATTLIST doc xmlns CDATA #FIXED "urn:test">"#,
+                r#"<doc xmlns="urn:other"/>"#
+            ),
+            named("urn:other", "doc")
+        );
+        assert_eq!(
+            root_in(
+                r#"<!ATTLIST doc xmlns:p CDATA "urn:a">"#,
+                r#"<p:doc xmlns:p="urn:b"/>"#
+            ),
+            named("urn:b", "doc")
+        );
+        // No default, and the first declaration of an attribute binds
+        // (3.3), in one list or another, its type too.
+        assert_eq!(
+            root_in("<!ATTLIST doc xmlns CDATA #IMPLIED>", "<doc/>"),
+            named("", "doc")
+        );
+        assert_eq!(
+            root_in("<!ATTLIST doc xmlns CDATA #REQUIRED>", "<doc/>"),
+            named("", "doc")
+        );
+        assert_eq!(
+            root_in(
+                r#"<!ATTLIST doc xmlns CDATA "urn:a" xmlns CDATA "urn:b">"#,
+                "<doc/>"
+            ),
+            named("urn:a", "doc")
+        );
+        assert_eq!(
+            root_in(
+                r#"<!ATTLIST doc xmlns CDATA "urn:a"><!ATTLIST doc xmlns CDATA "urn:b">"#,
+                "<doc/>"
+            ),
+            named("urn:a", "doc")
+        );
+        assert_eq!(
+            root_in(
+                r#"<!ATTLIST doc xmlns CDATA #IMPLIED><!ATTLIST doc xmlns NMTOKEN " urn:test ">"#,
+                "<doc/>"
+            ),
+            named("", "doc")
+        );
+        // A document type is not namespace-aware: a list applies to the
+        // element whose name is written as its own.
+        assert_eq!(
+            root_in(r#"<!ATTLIST doc xmlns:p CDATA "urn:p">"#, "<p:doc/>"),
+            None
+        );
+        assert_eq!(
+            root_in(r#"<!ATTLIST p:doc xmlns CDATA "urn:p">"#, "<doc/>"),
+            named("", "doc")
+        );
+        assert_eq!(
+            root_in(r#"<!ATTLIST other xmlns CDATA "urn:test">"#, "<doc/>"),
+            named("", "doc")
+        );
+        // A default in included parameter-entity text applies as one
+        // written in the subset.
+        assert_eq!(
+            root_in(
+                r#"<!ENTITY % p "<!ATTLIST doc xmlns CDATA 'urn:test'>"> %p;"#,
+                "<doc/>"
+            ),
+            test
+        );
+    }
+
+    #[test]
+    fn a_default_after_an_unread_parameter_entity_reference_is_not_applied() {
+        // XML 1.0, 5.1: past a reference to a parameter entity not read,
+        // declarations are not processed, unless the document is
+        // standalone. libxml2 applies such a default.
+        let unread = r#"<!ENTITY % e SYSTEM "e.ent">%e;<!ATTLIST doc xmlns CDATA "urn:test">"#;
+        assert_eq!(root_in(unread, "<doc/>"), named("", "doc"));
+        let undeclared = r#"%e;<!ATTLIST doc xmlns CDATA "urn:test">"#;
+        assert_eq!(root_in(undeclared, "<doc/>"), named("", "doc"));
+        let standalone =
+            format!("<?xml version=\"1.0\" standalone=\"yes\"?><!DOCTYPE doc [{unread}]><doc/>");
+        assert_eq!(
+            root_element(standalone.as_bytes()),
+            named("urn:test", "doc")
+        );
+        // Before the reference it is processed.
+        let before = r#"<!ATTLIST doc xmlns CDATA "urn:test"><!ENTITY % e SYSTEM "e.ent">%e;"#;
+        assert_eq!(root_in(before, "<doc/>"), named("urn:test", "doc"));
+        // A refused document type declares no default.
+        let refused = r#"<!ATTLIST doc xmlns CDATA "urn:test"><!ENTITY a "&#0;">"#;
+        assert_eq!(root_in(refused, "<doc/>"), named("", "doc"));
+    }
+
+    #[test]
+    fn a_declared_type_other_than_cdata_collapses_spaces_written_or_defaulted() {
+        // XML 1.0, 3.3.3, as libxml2 does: spaces at either end dropped and
+        // runs of them made one, after the value is normalised as any;
+        // a space from a reference too, but not a tab from one.
+        let token = "<!ATTLIST doc xmlns NMTOKEN #IMPLIED>";
+        assert_eq!(
+            root_in(token, r#"<doc xmlns="  urn:test  "/>"#),
+            named("urn:test", "doc")
+        );
+        assert_eq!(
+            root_in(token, "<doc xmlns=\"\nurn:test\"/>"),
+            named("urn:test", "doc")
+        );
+        assert_eq!(
+            root_in(token, r#"<doc xmlns="&#32;urn:test&#32;"/>"#),
+            named("urn:test", "doc")
+        );
+        assert_eq!(
+            root_in(token, r#"<doc xmlns="&#9;urn:test"/>"#),
+            named("\turn:test", "doc")
+        );
+        assert_eq!(
+            root_in(
+                r#"<!ENTITY s " "><!ATTLIST doc xmlns NMTOKEN #IMPLIED>"#,
+                r#"<doc xmlns="&s;urn:test&s;&s;x"/>"#
+            ),
+            named("urn:test x", "doc")
+        );
+        assert_eq!(
+            root_in(
+                "<!ATTLIST doc xmlns NMTOKENS #IMPLIED>",
+                r#"<doc xmlns="  urn:a   urn:b "/>"#
+            ),
+            named("urn:a urn:b", "doc")
+        );
+        assert_eq!(
+            root_in(
+                "<!ATTLIST p:doc xmlns:p (urn:p) #IMPLIED>",
+                r#"<p:doc xmlns:p=" urn:p"/>"#
+            ),
+            named("urn:p", "doc")
+        );
+        assert_eq!(
+            root_in(r#"<!ATTLIST doc xmlns NMTOKEN "  urn:test  ">"#, "<doc/>"),
+            named("urn:test", "doc")
+        );
+        // `CDATA`, or no declaration: kept as they are.
+        for subset in ["<!ATTLIST doc xmlns CDATA #IMPLIED>", ""] {
+            assert_eq!(
+                root_in(subset, r#"<doc xmlns="  urn:test  "/>"#),
+                named("  urn:test  ", "doc")
+            );
+        }
+        // A language too, written or defaulted.
+        let text = format!(
+            "<!DOCTYPE mime-type [<!ATTLIST comment xml:lang NMTOKEN #IMPLIED><!ATTLIST acronym xml:lang NMTOKEN \"  \">]>{OPEN}<comment xml:lang=\"  de  \">Deutsch</comment><acronym>A</acronym></mime-type>"
+        );
+        let info = parse(&text);
+        assert!(info.diagnostics.is_empty(), "{:?}", info.diagnostics);
+        assert_eq!(comments(&info), [(Some("de"), "Deutsch")]);
+        assert_eq!(info.acronym.as_deref(), Some("A"));
+    }
+
+    #[test]
+    fn collapsing_spaces_keeps_an_owned_values_buffer() {
+        // An owned value may be an expansion as long as the document's
+        // budget; collapsing it must not copy it by an allocation that
+        // cannot fail.
+        for (value, expected) in [
+            ("  a  b  ", "a b"),
+            ("   ", ""),
+            (" ", ""),
+            ("a  b", "a b"),
+            (" a", "a"),
+            ("a ", "a"),
+            ("ab", "ab"),
+            ("", ""),
+            ("\ta \t b\t", "\ta \t b\t"),
+            ("  \t  a", "\t a"),
+            ("  é  ü ", "é ü"),
+        ] {
+            let owned = String::from(value);
+            let buffer = owned.as_ptr();
+            let collapsed = collapsed(Cow::Owned(owned));
+            assert_eq!(collapsed, expected, "{value:?}");
+            assert!(matches!(collapsed, Cow::Owned(_)), "{value:?}");
+            assert_eq!(collapsed.as_ptr(), buffer, "{value:?}");
+        }
+        // A borrowed value with nothing to collapse stays borrowed.
+        assert!(matches!(collapsed(Cow::Borrowed("a b")), Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn a_defaulted_namespace_declaration_passes_the_checks_a_written_one_does() {
+        // Namespaces in XML 1.0, 3 and 5; libxml2 checks none of these on a
+        // default.
+        for (subset, root) in [
+            (
+                r#"<!ATTLIST doc xmlns CDATA "http://www.w3.org/XML/1998/namespace">"#,
+                "<doc/>",
+            ),
+            (
+                r#"<!ATTLIST doc xmlns:p CDATA "http://www.w3.org/2000/xmlns/">"#,
+                "<doc/>",
+            ),
+            (r#"<!ATTLIST doc xmlns:xml CDATA "urn:a">"#, "<doc/>"),
+            (r#"<!ATTLIST doc xmlns:xmlns CDATA "urn:a">"#, "<doc/>"),
+            (r#"<!ATTLIST doc xmlns:p CDATA "">"#, "<doc/>"),
+        ] {
+            assert_eq!(root_in(subset, root), None, "{subset}");
+        }
+        // An empty prefix declaration is allowed in XML 1.1.
+        let text = r#"<?xml version="1.1"?><!DOCTYPE doc [<!ATTLIST doc xmlns:p CDATA "">]><doc/>"#;
+        assert_eq!(root_element(text.as_bytes()), named("", "doc"));
+        // In a per-type file: on a field it drops the field, as written; a
+        // binding Namespaces in XML forbids skips the rest.
+        let text = format!(
+            "<!DOCTYPE mime-type [<!ATTLIST comment xmlns CDATA \"http://www.w3.org/2000/xmlns/\">]>{OPEN}<comment>a</comment><acronym>A</acronym></mime-type>"
+        );
+        check_dropped(
+            &text,
+            &[],
+            "<comment>",
+            "bad XML (an attribute cannot be read: the default namespace cannot be `http://www.w3.org/2000/xmlns/`); the value is left out",
+        );
+        let text = format!(
+            "<!DOCTYPE mime-type [<!ATTLIST x xmlns:xml CDATA \"urn:a\">]>{OPEN}<acronym>A</acronym><x/><comment>a</comment></mime-type>"
+        );
+        let info = parse(&text);
+        assert_eq!(
+            info.diagnostics,
+            [Diagnostic::new(
+                "t.xml",
+                text.find("<x/>").map(crate::Location::Offset),
+                "bad XML (the namespace prefix 'xml' cannot be bound to 'urn:a'); the rest is skipped"
+            )]
+        );
+        assert_eq!(comments(&info), []);
+    }
+
+    #[test]
+    fn defaulted_namespace_declarations_count_toward_the_limit() {
+        let two = crate::Limits {
+            max_namespace_bindings: Some(2),
+            ..crate::Limits::default()
+        };
+        let subset =
+            r#"<!DOCTYPE doc [<!ATTLIST doc xmlns:p CDATA "urn:p" xmlns:q CDATA "urn:q">]>"#;
+        let found = |root: &str| root_element_within(format!("{subset}{root}").as_bytes(), &two);
+        assert_eq!(found("<doc/>"), named("", "doc"));
+        assert_eq!(found(r#"<doc xmlns:p="urn:p"/>"#), named("", "doc"));
+        assert_eq!(found(r#"<doc xmlns="urn:d"/>"#), None);
+        let text = format!(
+            "<!DOCTYPE mime-type [<!ATTLIST mime-type xmlns:p CDATA \"urn:p\" xmlns:q CDATA \"urn:q\">]>{OPEN}<comment>a</comment></mime-type>"
+        );
+        assert_eq!(
+            messages(&parse_with(&text, &two)),
+            [
+                "bad XML (more than 2 namespace declarations on the open elements); the rest is skipped"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_defaulted_language_applies_to_fields_and_through_the_root() {
+        // The language GLib, which does not read the document type, would
+        // not give.
+        let text = format!(
+            "<!DOCTYPE mime-type [<!ATTLIST comment xml:lang CDATA \"de\">]>{OPEN}<comment>Deutsch</comment><comment xml:lang=\"\">English</comment></mime-type>"
+        );
+        let info = parse(&text);
+        assert!(info.diagnostics.is_empty(), "{:?}", info.diagnostics);
+        assert_eq!(
+            comments(&info),
+            [(None, "English"), (Some("de"), "Deutsch")]
+        );
+        // The root's, which a field without one takes (XML 1.0, 2.12).
+        let text = format!(
+            "<!DOCTYPE mime-type [<!ATTLIST mime-type xml:lang CDATA #FIXED \"fr\">]>{OPEN}<comment>Français</comment><comment xml:lang=\"de\">Deutsch</comment></mime-type>"
+        );
+        let info = parse(&text);
+        assert!(info.diagnostics.is_empty(), "{:?}", info.diagnostics);
+        assert_eq!(
+            comments(&info),
+            [(Some("de"), "Deutsch"), (Some("fr"), "Français")]
+        );
+        // A written one on the root wins over its default.
+        let text = format!(
+            "<!DOCTYPE mime-type [<!ATTLIST mime-type xml:lang CDATA \"fr\">]><mime-type xmlns=\"{NAMESPACE}\" xml:lang=\"\"><comment>a</comment></mime-type>"
+        );
+        assert_eq!(comments(&parse(&text)), [(None, "a")]);
+    }
+
+    #[test]
+    fn a_default_refers_to_entities_as_a_written_value_does() {
+        // Replaced in a namespace declaration, as libxml2 does with
+        // `XML_PARSE_NOENT` (`xmllint --noent`).
+        assert_eq!(
+            root_in(
+                r#"<!ENTITY ns "urn:test"><!ATTLIST doc xmlns CDATA "&ns;">"#,
+                "<doc/>"
+            ),
+            named("urn:test", "doc")
+        );
+        // An entity declared after the default is not declared where it
+        // stands (XML 1.0, 4.1): in an open document the value is unknown,
+        // so a root named in it gives none; in a closed one the document
+        // type declares nothing.
+        let forward = r#"<!ATTLIST doc xmlns CDATA "&ns;"><!ENTITY ns "urn:test">"#;
+        let open = format!("<!DOCTYPE doc SYSTEM \"d.dtd\" [{forward}]>");
+        assert_eq!(root_after(&open, "<doc/>"), None);
+        assert_eq!(
+            root_after(&open, r#"<doc xmlns="urn:x"/>"#),
+            named("urn:x", "doc")
+        );
+        assert_eq!(root_in(forward, "<doc/>"), named("", "doc"));
+        let through =
+            r#"<!ENTITY a "&ns;"><!ATTLIST doc xmlns CDATA "&a;"><!ENTITY ns "urn:test">"#;
+        let open = format!("<!DOCTYPE doc SYSTEM \"d.dtd\" [{through}]>");
+        assert_eq!(root_after(&open, "<doc/>"), None);
+        // A language with a reference is unknown, as a written one: the
+        // field is dropped.
+        let text = format!(
+            "<!DOCTYPE mime-type [<!ENTITY l \"de\"><!ATTLIST comment xml:lang CDATA \"&l;\">]>{OPEN}<comment>a</comment><acronym>A</acronym></mime-type>"
+        );
+        check_dropped(
+            &text,
+            &[],
+            "<comment>",
+            "bad XML (the reference `&l;` cannot be replaced); the value is left out",
+        );
+        // On the root, the language its fields take is unknown.
+        let text = format!(
+            "<!DOCTYPE mime-type [<!ENTITY l \"de\"><!ATTLIST mime-type xml:lang CDATA \"&l;\">]>{OPEN}<comment>a</comment><acronym>A</acronym></mime-type>"
+        );
+        let info = parse(&text);
+        assert_eq!(comments(&info), []);
+        assert_eq!(info.acronym, None);
+        let unknown = "bad XML (the root element's `xml:lang` cannot be read: the reference `&l;` cannot be replaced); the value is left out";
+        assert_eq!(
+            info.diagnostics,
+            ["<comment>", "<acronym>"].map(|tag| Diagnostic::new(
+                "t.xml",
+                text.find(tag).map(crate::Location::Offset),
+                unknown
+            ))
+        );
+    }
+
+    #[test]
+    fn a_defaulted_prefix_binds_a_written_attributes_prefix() {
+        // Two written attributes whose prefixes a default binds to one
+        // namespace repeat an expanded name, as libxml2 reports.
+        let subset = r#"<!ATTLIST doc xmlns:p CDATA "urn:x">"#;
+        assert_eq!(
+            root_in(subset, r#"<doc xmlns:q="urn:x" p:a="1" q:a="2"/>"#),
+            None
+        );
+        assert_eq!(root_in(subset, r#"<doc p:a="1"/>"#), named("", "doc"));
+        assert_eq!(root_in("", r#"<doc p:a="1"/>"#), None);
+        // Defaults of attributes not read here are not applied, so not
+        // checked; libxml2 reports these two.
+        assert_eq!(
+            root_in(
+                r#"<!ATTLIST doc q:a CDATA "x">"#,
+                r#"<doc xmlns:p="urn:p" xmlns:q="urn:p" p:a="y"/>"#
+            ),
+            named("", "doc")
+        );
+        assert_eq!(
+            root_in(r#"<!ATTLIST doc z:a CDATA "x">"#, "<doc/>"),
+            named("", "doc")
+        );
+    }
+
+    #[test]
+    fn applied_defaults_are_charged_to_the_expansion_budget() {
+        // Each element given a default is charged its name and literal, as
+        // if written: the first tag whose defaults pass the budget cannot be
+        // read, and the rest is skipped, as past the limit on namespace
+        // declarations.
+        let limits = crate::Limits {
+            entity_expansion_extra: 0,
+            ..crate::Limits::default()
+        };
+        let long = "x".repeat(100);
+        let text = |elements: usize| {
+            format!(
+                "<!DOCTYPE mime-type [<!ATTLIST x xmlns CDATA \"urn:{long}\">]>{OPEN}{}<comment>a</comment></mime-type>",
+                "<x/>".repeat(elements)
+            )
+        };
+        let few = text(2);
+        let info = parse_with(&few, &limits);
+        assert!(info.diagnostics.is_empty(), "{:?}", info.diagnostics);
+        let many = text(20);
+        let info = parse_with(&many, &limits);
+        let [diagnostic] = &info.diagnostics[..] else {
+            panic!("{:?}", info.diagnostics);
+        };
+        assert_eq!(
+            diagnostic.message,
+            "bad XML (the document's entity expansions together pass its length); the rest is skipped"
+        );
+        let Some(crate::Location::Offset(at)) = diagnostic.location else {
+            panic!("{diagnostic:?}");
+        };
+        assert!(many[at..].starts_with("<x/>"), "{diagnostic:?}");
+        assert_eq!(comments(&info), []);
+        // In root detection, a root whose defaults pass it gives none.
+        let root = format!(
+            "<!DOCTYPE doc [<!ENTITY a \"{long}\"><!ATTLIST doc xmlns:p CDATA \"urn:p\">]><doc xmlns=\"urn:&a;&a;\"/>"
+        );
+        assert_eq!(root_element_within(root.as_bytes(), &limits), None);
+        let root = root.replace("&a;&a;", "&a;");
+        assert_eq!(
+            root_element_within(root.as_bytes(), &limits),
+            named(&format!("urn:{long}"), "doc")
+        );
+    }
+
+    #[test]
+    fn many_defaults_on_many_elements_take_linear_work() {
+        // n elements whose list gives each n namespace declarations, with no
+        // limit on them: past the budget a tag's defaults cost no more.
+        use std::fmt::Write as _;
+        let limits = crate::Limits {
+            max_namespace_bindings: None,
+            ..crate::Limits::default()
+        };
+        let run = |n: usize| {
+            let mut text = String::from("<!DOCTYPE mime-type [<!ATTLIST x");
+            for at in 0..n {
+                let _ = write!(text, " xmlns:p{at} CDATA \"u\"");
+            }
+            let _ = write!(
+                text,
+                ">]>{OPEN}<comment>a</comment>{}</mime-type>",
+                "<x/>".repeat(n)
+            );
+            let (info, steps) = crate::work::steps(|| parse_with(&text, &limits));
+            assert_eq!(comments(&info), [(None, "a")]);
+            (steps, text.len())
+        };
+        crate::work::assert_linear(4_000, run, |items, bytes| {
+            40 * (items + bytes) + 40 * 65_536
+        });
+    }
+
+    #[test]
+    fn defaults_applied_to_many_elements_take_linear_work() {
+        // n elements, each given a default of n bytes, a namespace and a
+        // language: without the budget this would be quadratic.
+        for attribute in ["xmlns", "xmlns:p", "xml:lang"] {
+            let run = |n: usize| {
+                let text = format!(
+                    "<!DOCTYPE mime-type [<!ATTLIST x {attribute} CDATA \"urn:{}\"><!ATTLIST comment {attribute} CDATA \"urn:{}\">]>{OPEN}{}{}</mime-type>",
+                    "x".repeat(n),
+                    "y".repeat(n),
+                    "<x/>".repeat(n),
+                    "<comment>a</comment>".repeat(n),
+                );
+                let (_, steps) = crate::work::steps(|| parse(&text));
+                (steps, text.len())
+            };
+            crate::work::assert_linear(2_000, run, |items, bytes| {
+                40 * (items + bytes) + 40 * 65_536
+            });
+        }
+    }
+
+    #[test]
+    fn an_unknown_default_names_the_reference_not_declared_where_it_stands() {
+        // In an open document; the reference named is the default's own,
+        // directly to the entity declared after it or through another.
+        let field = |subset: &str| {
+            let text = format!(
+                "<!DOCTYPE mime-type SYSTEM \"m.dtd\" [{subset}]>{OPEN}<comment>a</comment><acronym>A</acronym></mime-type>"
+            );
+            (text, "<comment>")
+        };
+        for (subset, named) in [
+            (
+                r#"<!ENTITY ns "urn:a"><!ATTLIST comment xmlns CDATA "&ns;&fwd;"><!ENTITY fwd "">"#,
+                "&fwd;",
+            ),
+            (
+                r#"<!ENTITY ns "urn:a"><!ENTITY wrap "&fwd;"><!ATTLIST comment xmlns CDATA "&ns;&#65;&amp;&wrap;"><!ENTITY fwd "">"#,
+                "&wrap;",
+            ),
+        ] {
+            let (text, mark) = field(subset);
+            check_dropped(
+                &text,
+                &[],
+                mark,
+                &format!(
+                    "bad XML (the reference `{named}` cannot be replaced); the value is left out"
+                ),
+            );
+        }
+    }
+
+    #[test]
+    fn line_ends_by_reference_in_parameter_entity_text_are_each_a_space() {
+        // A character reference in a parameter entity's literal gives the
+        // character in its replacement text, which line-end handling (XML
+        // 1.0, 2.11) does not see; so in a default each is a space (3.3.3,
+        // as its example `&#xD;&#xA;` shows). libxml2 gives one space.
+        let pe =
+            |default: &str| format!("<!ENTITY % p \"<!ATTLIST doc xmlns CDATA '{default}'>\"> %p;");
+        for (default, namespace) in [
+            ("urn:a&#13;&#10;b", "urn:a  b"),
+            ("urn:a&#13;&#13;&#10;b", "urn:a   b"),
+            ("urn:a&#13;b", "urn:a b"),
+            // Written as it is, a line end is one on input.
+            ("urn:a\r\nb", "urn:a b"),
+        ] {
+            assert_eq!(
+                root_in(&pe(default), "<doc/>"),
+                named(namespace, "doc"),
+                "{default:?}"
+            );
+        }
+        // With an entity replaced too.
+        assert_eq!(
+            root_in(
+                &format!("<!ENTITY ns \"urn:x\">{}", pe("&#38;ns;&#13;&#10;b")),
+                "<doc/>"
+            ),
+            named("urn:x  b", "doc")
+        );
+        // In the subset itself a written line end is one space, and a
+        // character reference in the default stands for its character.
+        assert_eq!(
+            root_in("<!ATTLIST doc xmlns CDATA 'urn:a\r\nb'>", "<doc/>"),
+            named("urn:a b", "doc")
+        );
+        assert_eq!(
+            root_in("<!ATTLIST doc xmlns CDATA 'urn:a&#13;&#10;b'>", "<doc/>"),
+            named("urn:a\r\nb", "doc")
+        );
+        // In XML 1.1, NEL by reference is no line end there either.
+        let text = format!(
+            "<?xml version=\"1.1\"?><!DOCTYPE doc [{}]><doc/>",
+            pe("urn:a&#13;&#x85;b")
+        );
+        assert_eq!(root_element(text.as_bytes()), named("urn:a \u{85}b", "doc"));
+    }
+
+    #[test]
+    fn a_defaulted_language_makes_acronyms_translated() {
+        // An acronym is untranslated only (spec 0.22): one that takes a
+        // language from a default is left out, as with a written one.
+        for subset in [
+            r#"<!ATTLIST acronym xml:lang CDATA "de"><!ATTLIST expanded-acronym xml:lang NMTOKEN "de">"#,
+            r#"<!ATTLIST mime-type xml:lang CDATA "de">"#,
+        ] {
+            let text = format!(
+                "<!DOCTYPE mime-type [{subset}]>{OPEN}<acronym>A</acronym><expanded-acronym>E</expanded-acronym></mime-type>"
+            );
+            let info = parse(&text);
+            assert!(info.diagnostics.is_empty(), "{:?}", info.diagnostics);
+            assert_eq!(info.acronym, None, "{subset}");
+            assert_eq!(info.expanded_acronym, None, "{subset}");
+        }
+        // A defaulted root namespace makes a file with none written a
+        // per-type file.
+        let text = format!(
+            "<!DOCTYPE mime-type [<!ATTLIST mime-type xmlns CDATA \"{NAMESPACE}\">]><mime-type><comment>a</comment></mime-type>"
+        );
+        let info = parse(&text);
+        assert!(info.diagnostics.is_empty(), "{:?}", info.diagnostics);
+        assert_eq!(comments(&info), [(None, "a")]);
     }
 }

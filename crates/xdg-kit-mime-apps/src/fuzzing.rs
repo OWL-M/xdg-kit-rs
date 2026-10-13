@@ -1,31 +1,39 @@
 //! Entry points for the fuzz targets in `fuzz/`. Built only with
 //! `--cfg fuzzing`, which `cargo fuzz` sets; not part of the API.
 
+use std::collections::HashSet;
+
 use crate::{Group, MimeAppsList, TypePattern};
 
 const GROUPS: [Group; 3] = [Group::Defaults, Group::Added, Group::Removed];
 
 /// Parses `bytes` as both a plain and a desktop-specific `mimeapps.list`
-/// and checks that each writes back unchanged. Edits the first types and
-/// `*/*`, checking that each edit behaves as documented, refused edits
-/// change nothing, and after each edit the IDs of those types in each
-/// group (found through the list's index of keys) are those a fresh parse
-/// of the text finds. Checks that a fresh parse of the edited text gives
-/// the same list.
+/// and checks that each writes back unchanged. Edits the first three
+/// types and `*/*`, checking that each edit behaves as documented, refused
+/// edits change nothing, and after each edit the IDs of those types in
+/// each group (found through the list's index of keys) are those a fresh
+/// parse of the text finds. Checks that a fresh parse of the edited text
+/// gives the same list.
 pub fn mime_apps_list(bytes: &[u8]) {
     for desktop_specific in [false, true] {
         let list = MimeAppsList::parse(bytes, desktop_specific);
         assert_eq!(list.to_bytes(), bytes, "a list must round-trip");
         let mut patterns: Vec<TypePattern> = Vec::new();
         for group in GROUPS {
+            // Once per type: case variants of one type share its keys, so
+            // looking up each entry would be quadratic in them.
+            let mut looked_up = HashSet::new();
             for (pattern, _) in list.entries(group) {
-                let _ = list.ids(group, &pattern);
-                if !patterns.contains(&pattern) {
+                if looked_up.insert(pattern.clone()) {
+                    let _ = list.ids(group, &pattern);
+                }
+                // At most three kept, so looking through them stays
+                // constant work per entry.
+                if patterns.len() < 3 && !patterns.contains(&pattern) {
                     patterns.push(pattern);
                 }
             }
         }
-        patterns.truncate(3);
         patterns.push(TypePattern::Any);
         let mut edited = list.clone();
         for pattern in &patterns {
