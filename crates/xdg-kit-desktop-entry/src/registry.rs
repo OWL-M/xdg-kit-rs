@@ -2,7 +2,10 @@
 //! `menu/menu-spec.xml`): categories ("Registered Categories") and desktop
 //! names ("Registered `OnlyShowIn` Environments"), used by `validate`. A test
 //! checks these tables against the pinned spec, allowing one correction
-//! (`Qt` for the spec's `QT`, see [`ADDITIONAL_CATEGORIES`]).
+//! (`Qt` for the spec's `QT`, see [`ADDITIONAL_CATEGORIES`]). Names used by
+//! desktops and compositors in `XDG_CURRENT_DESKTOP` but absent from the spec
+//! are listed separately in [`KNOWN_DESKTOPS`]. The test checks that the spec
+//! registers none of them.
 
 /// Main categories, each with the category it requires besides itself
 /// ("Desktop entry must include ... as well").
@@ -213,6 +216,30 @@ pub(crate) const DESKTOPS: &[&str] = &[
     "Old",
 ];
 
+/// Desktop names absent from the menu spec but used by desktops and
+/// compositors in `XDG_CURRENT_DESKTOP`, either set in code or supplied by
+/// `DesktopNames` in their session files. Validation accepts these names in
+/// desktop entries. `Budgie` and `Enlightenment` also appear in
+/// `desktop-file-validate`'s list. The values used by sway, Wayfire, labwc
+/// and mango share the `wlroots` component. Wayfire's session file supplies
+/// `Wayfire`; Wayfire itself sets `wayfire` when the variable is unset.
+pub(crate) const KNOWN_DESKTOPS: &[&str] = &[
+    "Budgie",
+    "Enlightenment",
+    "Hyprland",
+    "sway",
+    "niri",
+    "Wayfire",
+    "wayfire",
+    "labwc",
+    "gamescope",
+    "jay",
+    "mango",
+    "pinnacle",
+    "Miriway",
+    "wlroots",
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,6 +342,23 @@ mod tests {
             .into_iter()
             .map(|row| row[0].clone())
             .collect();
+        let registered: Vec<&&str> = KNOWN_DESKTOPS
+            .iter()
+            .filter(|name| desktops.iter().any(|desktop| desktop == **name))
+            .collect();
+        assert!(
+            registered.is_empty(),
+            "registered by the menu spec, so not for KNOWN_DESKTOPS: {registered:?}"
+        );
         assert_eq!(DESKTOPS, desktops);
+    }
+
+    #[test]
+    fn known_desktops_are_distinct_and_not_extensions() {
+        let mut seen = std::collections::HashSet::new();
+        for name in KNOWN_DESKTOPS {
+            assert!(seen.insert(name), "{name} twice");
+            assert!(!name.starts_with("X-"), "{name} is valid as an extension");
+        }
     }
 }

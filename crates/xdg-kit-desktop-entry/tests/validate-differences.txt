@@ -25,7 +25,7 @@ list-invalid-escape.desktop	invalid	valid	the spec: the escapes of a list are th
 locale-empty-country.desktop	invalid	valid	the spec: a locale is lang_COUNTRY.ENCODING@MODIFIER with optional parts; an empty COUNTRY after "_" is not that form; the tool checks only the characters
 old-version-comma-lists.desktop	valid	invalid	the spec (Deprecated Items): when reading a pre-1.0 desktop entry, comma-separated lists should be supported; the tool reads GNOME,KDE as one name
 showin-both.desktop	valid	invalid	the spec forbids only the same desktop name in both OnlyShowIn and NotShowIn; the tool forbids having both keys
-showin-budgie.desktop	invalid	valid	Budgie is not a registered desktop in the menu spec 1.1; the tool's own list has it
+showin-compositors.desktop	valid	invalid	the menu spec 1.1 does not register Hyprland, sway or wlroots, but Hyprland, sway and other wlroots-based compositors set them in XDG_CURRENT_DESKTOP themselves; the tool accepts only its own list
 string-escaped-semicolon.desktop	invalid	valid	the spec: \; is an escape only in lists, and Comment is not a list; the tool checks no string escapes
 string-invalid-escape.desktop	invalid	valid	the spec: the escapes of a string are \s, \n, \t, \r and \\, and \q is none of them; the tool checks no string escapes
 string-not-ascii.desktop	invalid	valid	the spec: string values are ASCII; the tool accepts non-ASCII in StartupWMClass

@@ -2,6 +2,12 @@
 //! Desktop Menu spec's registries, at the level of checking
 //! `desktop-file-validate` does: an [`Issue`] of level [`Level::Error`]
 //! makes a file invalid; the other levels do not.
+//!
+//! `OnlyShowIn` and `NotShowIn` accept registered desktop names and names
+//! starting with `X-`. They also accept known names used by desktops and
+//! compositors in `XDG_CURRENT_DESKTOP` but absent from the menu spec, such
+//! as `Hyprland`, `sway` and `wlroots`. The pinned `desktop-file-validate`
+//! reports all these known names except `Budgie` and `Enlightenment` as errors.
 
 use std::fmt;
 
@@ -13,7 +19,9 @@ use crate::error::quoted;
 use crate::exec::{CommandLine, ExecError, ExecProblem};
 use crate::key_file::{Group, KeyFile, KeyNames, valid_group_name, valid_key_name, work};
 use crate::keys::{self, ACTION_KEYS, Applies, DESKTOP_KEYS, KeyDef, Status, ValueType};
-use crate::registry::{ADDITIONAL_CATEGORIES, DESKTOPS, MAIN_CATEGORIES, RESERVED_CATEGORIES};
+use crate::registry::{
+    ADDITIONAL_CATEGORIES, DESKTOPS, KNOWN_DESKTOPS, MAIN_CATEGORIES, RESERVED_CATEGORIES,
+};
 
 /// How bad an [`Issue`] is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -766,7 +774,8 @@ fn looks_like_mime_type(value: &str) -> bool {
         .is_some_and(|(media, subtype)| part(media) && (subtype == "*" || part(subtype)))
 }
 
-/// `OnlyShowIn` and `NotShowIn`: registered desktops, and none in both.
+/// `OnlyShowIn` and `NotShowIn`: registered or known desktops, and none
+/// in both.
 fn check_show_in(
     v: &mut Validator<'_>,
     line: Option<usize>,
@@ -802,11 +811,12 @@ fn check_show_in(
     }
     for desktop in main.items(raw) {
         work::count(1);
-        if !DESKTOPS.contains(&desktop.as_str()) && !desktop.starts_with("X-") {
+        let name = desktop.as_str();
+        if !DESKTOPS.contains(&name) && !KNOWN_DESKTOPS.contains(&name) && !name.starts_with("X-") {
             v.error(
                 line,
                 format!(
-                    "{key}: \"{}\" is not a registered desktop; others start with \"X-\"",
+                    "{key}: \"{}\" is not a registered or known desktop; others start with \"X-\"",
                     quoted(&desktop)
                 ),
             );
@@ -1353,8 +1363,29 @@ mod tests {
             "no name in both"
         );
         assert!(with("OnlyShowIn=GNOME;KDE;\nNotShowIn=KDE;")[0].contains("KDE is in both"));
-        assert!(with("OnlyShowIn=Weird;")[0].contains("not a registered desktop"));
+        assert!(with("OnlyShowIn=Weird;")[0].contains("not a registered or known desktop"));
         assert!(with("OnlyShowIn=X-Weird;").is_empty());
+        assert!(
+            with("OnlyShowIn=Hyprland;sway;wlroots;").is_empty(),
+            "names compositors set themselves"
+        );
+        assert!(with("NotShowIn=Budgie;Enlightenment;niri;").is_empty());
+        assert!(
+            with(
+                "OnlyShowIn=Budgie;Enlightenment;Hyprland;sway;niri;Wayfire;wayfire;labwc;\
+                 gamescope;jay;mango;pinnacle;Miriway;wlroots;"
+            )
+            .is_empty(),
+            "every known desktop"
+        );
+        assert!(
+            with("OnlyShowIn=i3;")[0].contains("not a registered or known desktop"),
+            "X11 window managers are not on the list"
+        );
+        assert!(
+            with("OnlyShowIn=hyprland;")[0].contains("not a registered or known desktop"),
+            "names compare exactly"
+        );
         assert!(with("Keywords=a;;b;")[0].contains("empty keyword"));
         assert!(with("Implements=org.freedesktop.Foo;").is_empty());
         assert!(with("Implements=nodots;")[0].contains("D-Bus interface"));
