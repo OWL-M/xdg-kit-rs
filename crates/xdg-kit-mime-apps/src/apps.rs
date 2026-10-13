@@ -561,13 +561,10 @@ impl MimeApps {
         // the rest.
         work::count(1);
         let media = TypePattern::Media(MediaType::new(canonical.media()).expect("a type's media"));
-        // As `ancestors` names it: the database may make it an alias. Three
-        // calls (the fixed type made, its alias looked up, the ancestors
-        // found), a step each.
-        work::count(3);
-        let any_data = self
-            .mime
-            .canonical(&MimeType::new("application/octet-stream").expect("a valid type"));
+        // As `ancestors` names it: the database may make it an alias. Two
+        // calls (its alias looked up, the ancestors found), a step each.
+        work::count(2);
+        let any_data = self.mime.canonical(&MimeType::APPLICATION_OCTET_STREAM);
         let ancestors = self.mime.ancestors(&canonical);
         for ancestor in ancestors.iter().filter(|ancestor| {
             // Compared with `application/octet-stream`.

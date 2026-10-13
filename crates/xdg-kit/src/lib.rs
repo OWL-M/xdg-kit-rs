@@ -7,9 +7,7 @@
 //! The exception is `locale`: `desktop-entry` and `mime` use only `Locales`
 //! from that crate and re-export it.
 //!
-//! `mime-crate-conversions` adds conversions between `xdg_kit::mime::MimeType`
-//! and the `mime` crate's `mime::Mime`. `desktop-entry-dbus` adds D-Bus
-//! activation when launching.
+//! `desktop-entry-dbus` adds D-Bus activation when launching.
 
 #[cfg(feature = "basedir")]
 pub use xdg_kit_basedir as basedir;

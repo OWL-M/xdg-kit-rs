@@ -29,8 +29,6 @@ mime = ["dep:xdg-kit-mime", "basedir"]
 ## Applications for MIME types: defaults, associations, `mimeapps.list`,
 ## opening files and URIs.
 mime-apps = ["dep:xdg-kit-mime-apps", "desktop-entry", "mime", "basedir"]
-## Conversions between `xdg_kit::mime::MimeType` and `mime::Mime`.
-mime-crate-conversions = ["mime", "xdg-kit-mime/mime"]
 
 [dependencies]
 xdg-kit-basedir = { workspace = true, optional = true }

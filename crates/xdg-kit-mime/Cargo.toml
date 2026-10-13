@@ -11,12 +11,7 @@ documentation = "https://docs.rs/xdg-kit-mime"
 keywords = ["xdg", "freedesktop", "mime", "shared-mime-info", "file-type"]
 categories = ["os::unix-apis", "filesystem", "parser-implementations"]
 
-[features]
-## Conversions to and from `mime::Mime`.
-mime = ["dep:mime"]
-
 [dependencies]
-mime = { workspace = true, optional = true }
 quick-xml.workspace = true
 rustix = { workspace = true, features = ["fs"] }
 xdg-kit-basedir.workspace = true

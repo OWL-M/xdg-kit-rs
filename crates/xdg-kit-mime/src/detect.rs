@@ -164,10 +164,6 @@ impl Default for PathOptions {
 /// order").
 pub(crate) const FALLBACK_LEN: usize = 128;
 
-fn known(text: &'static str) -> MimeType {
-    MimeType::known(text)
-}
-
 /// Text unless the first 128 bytes hold a control character other than tab,
 /// line feed or carriage return.
 fn text_or_binary(data: &[u8]) -> MimeType {
@@ -176,9 +172,9 @@ fn text_or_binary(data: &[u8]) -> MimeType {
         .take(FALLBACK_LEN)
         .any(|&byte| byte < 32 && !matches!(byte, b'\t' | b'\n' | b'\r'));
     if binary {
-        known("application/octet-stream")
+        MimeType::APPLICATION_OCTET_STREAM
     } else {
-        known("text/plain")
+        MimeType::TEXT_PLAIN
     }
 }
 
@@ -336,7 +332,7 @@ impl MimeDatabase {
                 .any(|matchlet| matchlet_matches(matchlet, data))
         })?;
         let mime = self.canonical(&rule.mime);
-        if self.is_a(&mime, &known("application/xml"))
+        if self.is_a(&mime, &MimeType::APPLICATION_XML)
             && let Some(refined) = self.xml_root_type(data)
         {
             return Some(Detection::new(
@@ -371,8 +367,8 @@ impl MimeDatabase {
     /// Resolves a built-in type such as `text/plain` or `inode/directory`
     /// through the database. The database may define it as an alias;
     /// detection results use the canonical type.
-    fn fixed(&self, text: &'static str) -> MimeType {
-        self.canonical(&known(text))
+    fn fixed(&self, mime: &MimeType) -> MimeType {
+        self.canonical(mime)
     }
 
     /// The type of content: magic, then (for XML) the root element, then
@@ -407,7 +403,7 @@ impl MimeDatabase {
     pub fn type_for_data(&self, data: &[u8]) -> Detection {
         if data.is_empty() {
             return Detection::new(
-                self.fixed("application/x-zerosize"),
+                self.fixed(&MimeType::APPLICATION_X_ZEROSIZE),
                 Certainty::Certain,
                 DecidedBy::Content,
             );
@@ -460,7 +456,7 @@ impl MimeDatabase {
         }
         if data.is_empty() {
             return Detection::new(
-                self.fixed("application/x-zerosize"),
+                self.fixed(&MimeType::APPLICATION_X_ZEROSIZE),
                 Certainty::Certain,
                 DecidedBy::Content,
             );
@@ -540,9 +536,9 @@ impl MimeDatabase {
         options: PathOptions,
         attribute: impl FnOnce() -> Option<MimeType>,
     ) -> io::Result<Detection> {
-        let kind = |text| {
+        let kind = |mime: &MimeType| {
             Ok(Detection::new(
-                self.fixed(text),
+                self.fixed(mime),
                 Certainty::Certain,
                 DecidedBy::FileKind,
             ))
@@ -550,13 +546,13 @@ impl MimeDatabase {
         let mut metadata = rustix::fs::statat(dir, path, AtFlags::SYMLINK_NOFOLLOW)?;
         if FileType::from_raw_mode(metadata.st_mode) == FileType::Symlink {
             if !options.follow_links {
-                return kind("inode/symlink");
+                return kind(&MimeType::INODE_SYMLINK);
             }
             match rustix::fs::statat(dir, path, AtFlags::empty()) {
                 Ok(target) => metadata = target,
                 // The target cannot be reached through this path at all.
                 Err(Errno::NOENT | Errno::NOTDIR | Errno::LOOP | Errno::NAMETOOLONG) => {
-                    return kind("inode/symlink");
+                    return kind(&MimeType::INODE_SYMLINK);
                 }
                 Err(err) => return Err(err.into()),
             }
@@ -564,21 +560,21 @@ impl MimeDatabase {
         let file_type = FileType::from_raw_mode(metadata.st_mode);
         if file_type == FileType::Directory {
             if options.mount_points && is_mount_point(dir, path, &metadata) {
-                return kind("inode/mount-point");
+                return kind(&MimeType::INODE_MOUNT_POINT);
             }
-            return kind("inode/directory");
+            return kind(&MimeType::INODE_DIRECTORY);
         }
         if file_type == FileType::BlockDevice {
-            return kind("inode/blockdevice");
+            return kind(&MimeType::INODE_BLOCKDEVICE);
         }
         if file_type == FileType::CharacterDevice {
-            return kind("inode/chardevice");
+            return kind(&MimeType::INODE_CHARDEVICE);
         }
         if file_type == FileType::Fifo {
-            return kind("inode/fifo");
+            return kind(&MimeType::INODE_FIFO);
         }
         if file_type == FileType::Socket {
-            return kind("inode/socket");
+            return kind(&MimeType::INODE_SOCKET);
         }
 
         if options.extended_attribute
@@ -599,7 +595,7 @@ impl MimeDatabase {
         }
         if metadata.st_size == 0 {
             return Ok(Detection::new(
-                self.fixed("application/x-zerosize"),
+                self.fixed(&MimeType::APPLICATION_X_ZEROSIZE),
                 Certainty::Certain,
                 DecidedBy::Content,
             ));

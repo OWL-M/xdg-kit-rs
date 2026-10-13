@@ -140,7 +140,7 @@ fn file(
     // Detection gives canonical types: the database may make this an alias.
     let desktop_entry = apps
         .mime_database()
-        .canonical(&MimeType::new("application/x-desktop").expect("a valid type"));
+        .canonical(&MimeType::APPLICATION_X_DESKTOP);
     if follow_links
         && mime == desktop_entry
         && let Ok(entry) = DesktopEntry::read_with_limits(path, &apps.limits().for_entries())

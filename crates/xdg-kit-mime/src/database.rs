@@ -707,7 +707,7 @@ impl MimeDatabase {
         let mut found = Vec::new();
         // Resolve the implicit types through the database, which may
         // define them as aliases of other types.
-        let any_data = self.canonical(&MimeType::known("application/octet-stream"));
+        let any_data = self.canonical(&MimeType::APPLICATION_OCTET_STREAM);
         let mut any_data_met = self.add_ancestors(&start, Some(&any_data), &mut seen, &mut found);
         // Each type visited; `is_media` counts its own scan.
         let media = |mime: &MimeType, media: &str| {
@@ -717,7 +717,7 @@ impl MimeDatabase {
         // Subclassing is transitive: a type with a `text/*` ancestor is
         // `text/plain` too, and so whatever `text/plain` is.
         if start.is_media("text") || found.iter().any(|mime| media(mime, "text")) {
-            let text = self.canonical(&MimeType::known("text/plain"));
+            let text = self.canonical(&MimeType::TEXT_PLAIN);
             if text == any_data {
                 any_data_met = true;
             } else if seen.insert(text.clone()) {

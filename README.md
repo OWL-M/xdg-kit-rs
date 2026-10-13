@@ -52,10 +52,9 @@ re-export it.
 | `mime` | yes | `xdg_kit::mime`: the Shared MIME-info database | `basedir` |
 | `mime-apps` | yes | `xdg_kit::mime_apps`: applications for MIME types: defaults, associations, `mimeapps.list`, opening files and URIs | `desktop-entry`, `mime`, `basedir` |
 | `desktop-entry-dbus` | no | D-Bus activation when launching `DBusActivatable` applications | `desktop-entry` |
-| `mime-crate-conversions` | no | Conversions between `xdg_kit::mime::MimeType` and the `mime` crate's `mime::Mime` | `mime` |
 
 When using the crates directly, enable `dbus` on `xdg-kit-desktop-entry`
-or `mime` on `xdg-kit-mime` for these two additions.
+for this addition.
 
 ## Examples
 

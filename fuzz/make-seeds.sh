@@ -118,5 +118,14 @@ printf '# user\n[Default Applications]\ntext/plain=a.desktop;b.desktop;\nimage/*
 printf '[Default Applications]\r\ntext/html=w.desktop\r\n[Added Associations]\r\ntext/html=w.desktop;\r\n' > "$out/mime_apps_list/crlf"
 printf '[Default Applications]\nnot a type=x.desktop;\n*/*=all.desktop;\na/b[de]=l.desktop;\n[X-Other]\nkeep=1' > "$out/mime_apps_list/odd"
 printf 'text/x=early.desktop\n[Added Associations]\ntext/plain=a.desktop;\n[Added Associations]\ntext/plain=b.desktop;\ntext/plain=c\\;d.desktop;\\se.desktop;\nimage/png=caf\351.desktop;\n[Removed Associations\n' > "$out/mime_apps_list/repeated"
+# Content-Type values: parameters with tokens, quoted strings and escapes,
+# whitespace, empty and repeated parameters, and ones that are refused.
+mkdir -p "$out/media_type"
+printf 'text/html; charset=utf-8' > "$out/media_type/plain"
+printf ' \tText/HTML ;Charset="utf-8";; q="a\\"b\\\\c" \t' > "$out/media_type/quoted"
+printf 'a/b; c=d; C=e;' > "$out/media_type/repeated"
+printf 'a/b; q="caf\303\251"' > "$out/media_type/obs-text"
+printf 'text/plain; a = b' > "$out/media_type/spaced"
+printf 'text/plain; a="b' > "$out/media_type/unclosed"
 rm -rf seeds
 mv "$out" seeds

@@ -102,3 +102,10 @@ path = "fuzz_targets/mime_database.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "media_type"
+path = "fuzz_targets/media_type.rs"
+test = false
+doc = false
+bench = false
