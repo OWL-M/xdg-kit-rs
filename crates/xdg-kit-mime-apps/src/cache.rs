@@ -1112,7 +1112,7 @@ mod tests {
         let mut reader = Drip::new(DRIPPED, Some(io::ErrorKind::PermissionDenied));
         let err = read_rest(&mut reader, &mut bytes, checked_grow).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
-        assert!(bytes.is_empty());
+        assert_eq!(bytes, []);
     }
 
     #[test]

@@ -942,7 +942,7 @@ mod tests {
             ["--icon", "foo", "Foo"],
             "no location: %k dropped"
         );
-        assert!(command.env_remove.is_empty());
+        assert_eq!(command.env_remove, Vec::<OsString>::new());
         let plain = plan("Exec=foo", &[]).unwrap();
         let Launch::Commands(commands) = &plain.launch else {
             panic!()

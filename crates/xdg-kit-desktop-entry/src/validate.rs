@@ -1145,7 +1145,7 @@ mod tests {
         let mut desktop = errors_of(&KeyFile::parse(text.as_bytes()));
         any.sort();
         desktop.sort();
-        assert!(!any.is_empty());
+        assert_ne!(any, Vec::<String>::new());
         assert_eq!(any, desktop, "the same error either way");
     }
 
@@ -1204,11 +1204,9 @@ mod tests {
             "{issues:?}"
         );
         // From 1.0 on, a comma is part of the item.
-        assert!(
-            !errors(
-                "[Desktop Entry]\nType=Application\nName=Foo\nExec=foo\nOnlyShowIn=GNOME,KDE\n"
-            )
-            .is_empty()
+        assert_ne!(
+            errors("[Desktop Entry]\nType=Application\nName=Foo\nExec=foo\nOnlyShowIn=GNOME,KDE\n"),
+            Vec::<String>::new()
         );
     }
 
@@ -1271,9 +1269,9 @@ mod tests {
                 .iter()
                 .any(|e| e.contains("needs Exec"))
         );
-        assert!(
-            errors("[Desktop Entry]\nType=Application\nName=Foo\nDBusActivatable=true\n")
-                .is_empty()
+        assert_eq!(
+            errors("[Desktop Entry]\nType=Application\nName=Foo\nDBusActivatable=true\n"),
+            Vec::<String>::new()
         );
         assert!(
             errors("[Desktop Entry]\nType=Link\nName=Foo\n")
@@ -1291,12 +1289,12 @@ mod tests {
     fn keys_values_and_types() {
         let with = |extra: &str| errors(&format!("{GOOD}{extra}\n"));
         assert!(with("Unknown=1")[0].contains("not a key of the spec"));
-        assert!(with("X-Mine=1").is_empty());
+        assert_eq!(with("X-Mine=1"), Vec::<String>::new());
         assert!(with("Terminal=yes")[0].contains("not a boolean"));
         assert!(with("Exec[de]=x")[0].contains("not a localized key"));
         assert!(with("Comment[de]=x")[0].contains("no untranslated"));
         assert!(with("Version=2.0")[0].contains("not a known version"));
-        assert!(with("Version=0.9.4").is_empty());
+        assert_eq!(with("Version=0.9.4"), Vec::<String>::new());
         assert!(
             with("Version=0.9.4\nTerminal=1").is_empty(),
             "0 and 1 before 1.0"
@@ -1322,7 +1320,10 @@ mod tests {
         assert!(
             errors("[Desktop Entry]\nType=Thing\nName=a\n")[0].contains("not a registered type")
         );
-        assert!(errors("[Desktop Entry]\nType=Service\nName=a\n").is_empty());
+        assert_eq!(
+            errors("[Desktop Entry]\nType=Service\nName=a\n"),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
@@ -1336,7 +1337,7 @@ mod tests {
         assert!(exec("foo %x")[0].contains("%x"));
         assert!(exec("foo ~/x")[0].contains("reserved"));
         assert!(exec("foo %f %u")[0].contains("at most one"));
-        assert!(exec(r#"foo "a\\$b""#).is_empty());
+        assert_eq!(exec(r#"foo "a\\$b""#), Vec::<String>::new());
         assert_eq!(
             exec(r#"foo "%z""#),
             ["Exec: %z is not a field code the spec lists"]
@@ -1345,7 +1346,7 @@ mod tests {
             exec(r#"foo "% x""#),
             ["Exec: % before ' ' is not a field code the spec lists"]
         );
-        assert!(exec(r#"foo "%%z""#).is_empty());
+        assert_eq!(exec(r#"foo "%%z""#), Vec::<String>::new());
         assert_eq!(
             exec(r#"foo "%d""#),
             ["Exec: field codes may not be used inside quotes"]
@@ -1364,12 +1365,15 @@ mod tests {
         );
         assert!(with("OnlyShowIn=GNOME;KDE;\nNotShowIn=KDE;")[0].contains("KDE is in both"));
         assert!(with("OnlyShowIn=Weird;")[0].contains("not a registered or known desktop"));
-        assert!(with("OnlyShowIn=X-Weird;").is_empty());
+        assert_eq!(with("OnlyShowIn=X-Weird;"), Vec::<String>::new());
         assert!(
             with("OnlyShowIn=Hyprland;sway;wlroots;").is_empty(),
             "names compositors set themselves"
         );
-        assert!(with("NotShowIn=Budgie;Enlightenment;niri;").is_empty());
+        assert_eq!(
+            with("NotShowIn=Budgie;Enlightenment;niri;"),
+            Vec::<String>::new()
+        );
         assert!(
             with(
                 "OnlyShowIn=Budgie;Enlightenment;Hyprland;sway;niri;Wayfire;wayfire;labwc;\
@@ -1387,7 +1391,10 @@ mod tests {
             "names compare exactly"
         );
         assert!(with("Keywords=a;;b;")[0].contains("empty keyword"));
-        assert!(with("Implements=org.freedesktop.Foo;").is_empty());
+        assert_eq!(
+            with("Implements=org.freedesktop.Foo;"),
+            Vec::<String>::new()
+        );
         assert!(with("Implements=nodots;")[0].contains("D-Bus interface"));
         assert!(with("Implements=org.exa-mple.Iface;")[0].contains("D-Bus interface"));
         assert!(
@@ -1406,7 +1413,7 @@ mod tests {
         };
         assert_eq!(exec(r#""""#), ["Exec: the command line has no program"]);
         assert_eq!(exec(r#""" foo"#), ["Exec: the command line has no program"]);
-        assert!(exec(r#"foo """#).is_empty());
+        assert_eq!(exec(r#"foo """#), Vec::<String>::new());
     }
 
     #[test]
@@ -1470,12 +1477,12 @@ mod tests {
             one("Comment=a\\\u{200b}b").starts_with(r"Comment: a backslash before '\u{200b}' "),
             "an invisible character is shown escaped"
         );
-        assert!(issues(r"Comment=\s\n\t\r\\").is_empty());
-        assert!(issues(r"Keywords=a\;b;\s\n\t\r\\;").is_empty());
-        assert!(issues("Keywords=a;\nKeywords[de]=a\\;b;").is_empty());
+        assert_eq!(issues(r"Comment=\s\n\t\r\\"), []);
+        assert_eq!(issues(r"Keywords=a\;b;\s\n\t\r\\;"), []);
+        assert_eq!(issues("Keywords=a;\nKeywords[de]=a\\;b;"), []);
         // Booleans and keys outside the spec are not checked for escapes.
         assert!(!one(r"Terminal=a\qb").contains("backslash"));
-        assert!(issues(r"X-Foo=a\qb").is_empty());
+        assert_eq!(issues(r"X-Foo=a\qb"), []);
         // In a quoted argument, `\\q` in the file is `\q` once unescaped.
         assert_eq!(
             one(r#"Exec=echo "abc\\q""#),
@@ -1547,8 +1554,8 @@ mod tests {
                 r"Comment: a backslash at the end is not an escape in a string; use \\ for a backslash"
             ]
         );
-        assert!(with(r"Comment=abc\\").is_empty());
-        assert!(with(r"Comment=abc\\\\").is_empty());
+        assert_eq!(with(r"Comment=abc\\"), Vec::<String>::new());
+        assert_eq!(with(r"Comment=abc\\\\"), Vec::<String>::new());
         assert_eq!(
             with(r"Keywords=a;b\"),
             [
@@ -1655,12 +1662,12 @@ mod tests {
                 "[Desktop Entry]\nType=Application\nName=a\nExec=a\nCategories={value}\n"
             ))
         };
-        assert!(categories("AudioVideo;Audio;").is_empty());
+        assert_eq!(categories("AudioVideo;Audio;"), Vec::<String>::new());
         assert!(categories("Audio;")[0].contains("needs AudioVideo"));
         assert!(categories("Made-Up;")[0].contains("not registered"));
-        assert!(categories("X-Made-Up;").is_empty());
+        assert_eq!(categories("X-Made-Up;"), Vec::<String>::new());
         assert!(categories("TrayIcon;")[0].contains("needs OnlyShowIn"));
-        assert!(categories("Utility;Calculator;").is_empty());
+        assert_eq!(categories("Utility;Calculator;"), Vec::<String>::new());
     }
 
     #[test]
@@ -1871,11 +1878,11 @@ mod tests {
     #[test]
     fn actions_must_match_their_groups() {
         let base = "[Desktop Entry]\nType=Application\nName=a\nExec=a\n";
-        assert!(
+        assert_eq!(
             errors(&format!(
                 "{base}Actions=New;\n[Desktop Action New]\nName=New\nExec=a --new\n"
-            ))
-            .is_empty()
+            )),
+            Vec::<String>::new()
         );
         assert!(errors(&format!("{base}Actions=New;\n"))[0].contains("no [Desktop Action New]"));
         assert!(
@@ -1925,14 +1932,14 @@ mod tests {
                 .map(|issue| issue.message)
                 .collect::<Vec<_>>()
         };
-        assert!(named("foo.desktop", GOOD).is_empty());
+        assert_eq!(named("foo.desktop", GOOD), Vec::<String>::new());
         assert!(named("foo.txt", GOOD)[0].contains(".desktop"));
         assert!(
             named("foo.desktop", "[Desktop Entry]\nType=Directory\nName=a\n")[0]
                 .contains(".directory")
         );
         let dbus = "[Desktop Entry]\nType=Application\nName=a\nDBusActivatable=true\n";
-        assert!(named("org.example.Foo.desktop", dbus).is_empty());
+        assert_eq!(named("org.example.Foo.desktop", dbus), Vec::<String>::new());
         assert!(named("foo.desktop", dbus)[0].contains("D-Bus name"));
     }
 }

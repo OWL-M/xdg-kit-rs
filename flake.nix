@@ -32,8 +32,11 @@
       url = "git+https://gitlab.freedesktop.org/xdg/desktop-file-utils.git";
       flake = false;
     };
-    # A nightly Rust for fuzzing only (cargo-fuzz needs -Z flags and the
-    # AddressSanitizer runtime, which nixpkgs' stable rustc lacks).
+    # A nightly Rust for fuzzing (cargo-fuzz needs -Z flags and the
+    # AddressSanitizer runtime, which nixpkgs' stable rustc lacks), and a
+    # stable one with the standard library of other targets, for linting
+    # the crates as built there. Updating fenix moves that stable Rust and
+    # its Clippy, whose new lints can fail `ci/clippy-target.sh`.
     fenix = {
       url = "github:nix-community/fenix";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -61,6 +64,42 @@
           "rustc"
           "rust-std"
         ];
+      # Targets whose standard library fenix ships, and those that build it
+      # from source (`-Zbuild-std`): the systems the crates' `cfg` choices
+      # cover, linted from the dev shell `cross`.
+      crossTargets = [
+        "x86_64-unknown-linux-gnu"
+        "x86_64-unknown-linux-musl"
+        "i686-unknown-linux-gnu"
+        "s390x-unknown-linux-gnu"
+        "aarch64-linux-android"
+        "armv7-linux-androideabi"
+        "x86_64-unknown-freebsd"
+        "x86_64-unknown-netbsd"
+        "x86_64-unknown-illumos"
+        "aarch64-apple-darwin"
+      ];
+      crossSourceTargets = [
+        "x86_64-unknown-openbsd"
+        "x86_64-unknown-dragonfly"
+      ];
+      # The latest stable Rust at the locked fenix commit, with clippy, the
+      # standard library of each of `crossTargets` and the source for
+      # `crossSourceTargets`.
+      crossRust =
+        system:
+        let
+          fx = fenix.packages.${system};
+        in
+        fx.combine (
+          [
+            fx.stable.cargo
+            fx.stable.rustc
+            fx.stable.clippy
+            fx.stable.rust-src
+          ]
+          ++ map (target: fx.targets.${target}.stable.rust-std) crossTargets
+        );
       # Seconds each fuzz target runs in `checks.fuzz`.
       fuzzSeconds = 15;
       # libFuzzer's defaults allow 20 minutes and 2 GB per input.
@@ -143,6 +182,37 @@
             # Fuzz targets link the C++ runtime of libFuzzer dynamically.
             LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [ pkgs.stdenv.cc.cc.lib ];
           };
+
+          # `nix develop .#cross`: clippy for other targets, e.g.
+          # `cargo clippy --target x86_64-unknown-freebsd -p xdg-kit-mime`;
+          # for `XDG_KIT_CROSS_SOURCE_TARGETS` add
+          # `-Zbuild-std=std` with `RUSTC_BOOTSTRAP=1`.
+          cross = pkgs.mkShell {
+            name = "xdg-kit-rs-cross";
+            packages = [ (crossRust system) ];
+            XDG_KIT_CROSS_TARGETS = toString crossTargets;
+            XDG_KIT_CROSS_SOURCE_TARGETS = toString crossSourceTargets;
+          };
+        }
+        # `nix develop .#i686`: the tests built for 32-bit x86 with the
+        # locked nixpkgs' Rust, run with the reference tools of the default
+        # shell.
+        // nixpkgs.lib.optionalAttrs (system == "x86_64-linux") {
+          i686 =
+            let
+              pkgs32 = pkgs.pkgsi686Linux;
+            in
+            pkgs32.mkShell (
+              {
+                name = "xdg-kit-rs-i686";
+                packages = [
+                  pkgs32.cargo
+                  pkgs32.rustc
+                ]
+                ++ testTools pkgs;
+              }
+              // sourceVars
+            );
         }
       );
 

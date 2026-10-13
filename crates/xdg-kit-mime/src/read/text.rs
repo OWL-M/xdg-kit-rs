@@ -1249,7 +1249,7 @@ mod tests {
         assert_eq!(folder.magic[0].matchlets[0].value, b"B");
         assert_eq!(diagnostics.len(), 3, "{diagnostics:?}");
         let (folder, diagnostics) = folder_from("magic", b"not magic");
-        assert!(folder.magic.is_empty());
+        assert_eq!(folder.magic, []);
         assert_eq!(diagnostics.len(), 1);
     }
 
@@ -1404,7 +1404,7 @@ mod tests {
             &mut Vec::new(),
             &Limits::default(),
         );
-        assert!(folder.globs.is_empty());
+        assert_eq!(folder.globs, []);
         assert!(folder.types.is_some());
     }
 }

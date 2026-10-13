@@ -156,7 +156,7 @@ impl Locales {
     /// `LANGUAGE` says. Otherwise `LANGUAGE`, a colon-separated list, gives
     /// the languages when it is non-empty, and the locale itself when it is
     /// not. An entry `C`, `C.<encoding>` or `POSIX` ends the list, as in
-    /// gettext; untranslated text comes next. Unparseable names are skipped.
+    /// gettext; untranslated text comes next. Unparsable names are skipped.
     /// A locale variable that is set but not UTF-8 still counts as set, so
     /// nothing is translated.
     #[must_use]

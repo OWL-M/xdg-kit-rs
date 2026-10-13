@@ -1185,7 +1185,7 @@ mod tests {
         let fresh = db.type_info(&plain);
         assert!(fresh.diagnostics().is_empty(), "{:?}", fresh.diagnostics());
         assert!(Arc::ptr_eq(&fresh, &db.type_info(&plain)));
-        assert!(db.type_diagnostics(&png).is_empty());
+        assert_eq!(db.type_diagnostics(&png), []);
     }
 
     /// A per-type file whose comment is `comment`.
@@ -1542,7 +1542,7 @@ mod tests {
         let plain = m("text/plain");
         let un = crate::Locales::untranslated();
         assert_eq!(db.description(&plain, &un).as_deref(), Some("Low"));
-        assert!(db.type_diagnostics(&plain).is_empty());
+        assert_eq!(db.type_diagnostics(&plain), []);
         assert!(db.descriptions.lock().unwrap().contains_key(&plain));
     }
 

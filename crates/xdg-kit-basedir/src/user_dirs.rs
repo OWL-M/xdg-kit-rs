@@ -509,7 +509,7 @@ mod tests {
         let base = BaseDirs::from_vars(vars).unwrap();
         let missing = UserDirs::load(&base);
         assert_eq!(missing.iter().count(), 0);
-        assert!(missing.diagnostics().is_empty());
+        assert_eq!(missing.diagnostics(), []);
 
         fs::create_dir(&config).unwrap();
         fs::write(

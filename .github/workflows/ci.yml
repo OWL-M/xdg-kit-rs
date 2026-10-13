@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to a pull request cancels its older run; every push to
+# master is checked to the end.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # The flake's own checks: fmt, clippy (also under `--cfg fuzzing`), the
+  # tests, docs, and each fuzz target for a short run.
+  flake-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@v31
+      - run: nix flake check -L
+
+  # What the build sandbox of `nix flake check` cannot do or does not cover,
+  # in the dev shell.
+  dev-shell:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@v31
+      - name: The extended attribute test (the sandbox cannot hold one)
+        run: >
+          nix develop -c cargo test -p xdg-kit-mime --test database --locked
+          -- --exact the_extended_attribute_is_used_only_when_asked
+      - name: The MIME crate's tests with quick-xml's encoding feature
+        run: nix develop -c cargo test -p xdg-kit-mime --features quick-xml/encoding --locked
+      - name: The MIME crate's tests with quick-xml's escape-html feature
+        run: nix develop -c cargo test -p xdg-kit-mime --features quick-xml/escape-html --locked
+      - name: Each crate with its default features and with none
+        run: nix develop -c ci/build-features.sh
+
+  # The targets of the dev shell `cross`, read from the flake.
+  cross-targets:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      targets: ${{ steps.targets.outputs.targets }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@v31
+      - id: targets
+        run: >
+          echo "targets=$(nix eval --json .#devShells.x86_64-linux.cross
+          --apply 'shell: builtins.filter builtins.isString (builtins.split " +"
+          (shell.XDG_KIT_CROSS_TARGETS + " " + shell.XDG_KIT_CROSS_SOURCE_TARGETS))')"
+          >> "$GITHUB_OUTPUT"
+
+  # Clippy for the other systems the crates' `cfg` choices cover.
+  cross-clippy:
+    needs: cross-targets
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.cross-targets.outputs.targets) }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@v31
+      - run: nix develop .#cross -c ci/clippy-target.sh ${{ matrix.target }}
+
+  # The whole test suite built for 32-bit x86.
+  i686:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@v31
+      - run: nix develop .#i686 -c cargo test --workspace --all-features --locked

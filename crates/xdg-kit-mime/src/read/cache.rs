@@ -734,7 +734,7 @@ mod tests {
         // The alias list's count at 59 of 60 bytes.
         let (result, folder, diagnostics) = decode(&header_only(60, 0, 59, 40));
         assert!(result.is_ok());
-        assert!(folder.aliases.is_empty());
+        assert_eq!(folder.aliases, []);
         assert_eq!(
             diagnostics,
             [Diagnostic::new(
@@ -751,7 +751,7 @@ mod tests {
         bytes[52..58].copy_from_slice(b"text/a");
         let (result, folder, diagnostics) = decode(&bytes);
         assert!(result.is_ok());
-        assert!(folder.parents.is_empty());
+        assert_eq!(folder.parents, []);
         assert_eq!(
             diagnostics,
             [Diagnostic::new(
@@ -829,7 +829,7 @@ mod tests {
             "{} diagnostics",
             diagnostics.len()
         );
-        assert!(!diagnostics.is_empty());
+        assert_ne!(diagnostics, []);
     }
 
     #[test]
@@ -874,7 +874,7 @@ mod tests {
         bytes[first + 8..first + 12].copy_from_slice(&u32::try_from(first).unwrap().to_be_bytes());
         let (result, _, diagnostics) = decode(&bytes);
         assert!(result.is_ok());
-        assert!(!diagnostics.is_empty());
+        assert_ne!(diagnostics, []);
     }
 
     #[test]

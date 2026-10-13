@@ -190,7 +190,7 @@ fn the_rule_depth_can_be_lowered() {
     let low = MimeDatabase::from_dirs_with(folders, &limits);
     assert_eq!(low.type_for_data(b"A").mime, m("text/plain"));
     assert_eq!(low.type_for_data(b"B").mime, m("text/plain"));
-    assert!(tree(&low).is_empty());
+    assert_eq!(tree(&low), []);
     let messages: Vec<&str> = low
         .diagnostics()
         .iter()
@@ -447,7 +447,7 @@ fn a_cache_larger_than_the_limit_gives_way_to_the_text_files() {
         "{:?}",
         db.diagnostics()
     );
-    assert!(MimeDatabase::from_dirs([&mime]).diagnostics().is_empty());
+    assert_eq!(MimeDatabase::from_dirs([&mime]).diagnostics(), []);
 }
 
 /// A database whose `mime.cache` holds a literal pattern of `len` bytes.
@@ -466,7 +466,7 @@ fn the_longest_cache_string_can_be_set_or_unlimited() {
     let (mime, pattern) = long_literal(dir.path(), 5_000);
     let long = m("text/x-long");
     let default = MimeDatabase::from_dirs([&mime]);
-    assert!(default.patterns_for(&long).is_empty());
+    assert_eq!(default.patterns_for(&long), Vec::<String>::new());
     assert!(
         default
             .diagnostics()
@@ -482,7 +482,7 @@ fn the_longest_cache_string_can_be_set_or_unlimited() {
     assert!(db.diagnostics().is_empty(), "{:?}", db.diagnostics());
     limits.max_cache_string = Some(4_999);
     let db = MimeDatabase::from_dirs_with([&mime], &limits);
-    assert!(db.patterns_for(&long).is_empty());
+    assert_eq!(db.patterns_for(&long), Vec::<String>::new());
     limits.max_cache_string = None;
     let db = MimeDatabase::from_dirs_with([&mime], &limits);
     assert_eq!(db.patterns_for(&long), [pattern]);
@@ -543,7 +543,7 @@ fn the_cache_copy_budget_can_be_set_or_lifted() {
     limits.cache_copy_extra = 0;
     let none = MimeDatabase::from_dirs_with([&mime], &limits);
     assert!(exhausted(&none));
-    assert!(none.patterns_for(&m("text/x-a")).is_empty());
+    assert_eq!(none.patterns_for(&m("text/x-a")), Vec::<String>::new());
     // Per byte: a budget of 8 per byte plus 64 KiB is the default's.
     limits.cache_copy_per_byte = Some(1_000);
     assert!(!exhausted(&MimeDatabase::from_dirs_with([&mime], &limits)));

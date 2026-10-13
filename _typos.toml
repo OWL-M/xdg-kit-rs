@@ -1,0 +1,32 @@
+# Settings for typos (https://github.com/crate-ci/typos), which the dev
+# shell provides: run `typos` from the repository root.
+
+[files]
+extend-exclude = [
+    # glibc's character classes as hexadecimal code point ranges.
+    "crates/xdg-kit-mime/tests/classes/glibc-c-utf8.txt",
+    # Desktop entries that are not UTF-8 on purpose (Latin-1 text).
+    "crates/xdg-kit-desktop-entry/tests/corpus/*not-utf8.desktop",
+]
+
+[default]
+extend-ignore-re = [
+    # Code points in Rust escapes, such as `\u{ba3}`.
+    '\\u\{[0-9a-fA-F]+\}',
+    # "café" as test data, through escapes or an octal byte.
+    'caf(\\{1,2}[ux]|\\[0-7]{3})',
+    'afe\\{1,2}u\{',
+    # Markup left malformed on purpose in tests.
+    '</commen>',
+    '<!ENTITYf',
+    # Unicode's general category for decimal digits.
+    '\bNd\b',
+    # German, in a test's translated comment.
+    'Ein PNG-Bild',
+]
+
+[default.extend-identifiers]
+# A desktop name the Desktop Menu spec registers.
+EDE = "EDE"
+# The open flag `O_WRONLY`.
+WRONLY = "WRONLY"

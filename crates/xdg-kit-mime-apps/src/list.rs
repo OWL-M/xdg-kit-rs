@@ -858,7 +858,10 @@ mod tests {
             list.ids(Group::Added, &p("text/plain")),
             ["c.desktop", "b.desktop"]
         );
-        assert!(list.ids(Group::Removed, &p("text/plain")).is_empty());
+        assert_eq!(
+            list.ids(Group::Removed, &p("text/plain")),
+            Vec::<String>::new()
+        );
         let text = String::from_utf8(list.to_bytes()).unwrap();
         assert!(text.starts_with("# mine\n"), "{text}");
         assert!(text.contains("[X-Other]\nkeep=1\n"), "{text}");
@@ -873,7 +876,10 @@ mod tests {
         let mut list = MimeAppsList::parse(SAMPLE.as_bytes(), false);
         list.remove_association(&p("text/plain"), "b.desktop")
             .unwrap();
-        assert!(list.ids(Group::Added, &p("text/plain")).is_empty());
+        assert_eq!(
+            list.ids(Group::Added, &p("text/plain")),
+            Vec::<String>::new()
+        );
         assert_eq!(list.ids(Group::Defaults, &p("text/plain")), ["a.desktop"]);
         assert_eq!(
             list.ids(Group::Removed, &p("text/plain")),
@@ -887,7 +893,7 @@ mod tests {
         assert!(list.forget(&p("text/plain")));
         assert!(!list.forget(&p("text/plain")));
         for group in [Group::Defaults, Group::Added, Group::Removed] {
-            assert!(list.ids(group, &p("text/plain")).is_empty());
+            assert_eq!(list.ids(group, &p("text/plain")), Vec::<String>::new());
         }
     }
 
@@ -910,7 +916,10 @@ mod tests {
             ["b.desktop", "c.desktop"]
         );
         assert!(list.forget(&p("text/plain")));
-        assert!(list.ids(Group::Added, &p("text/plain")).is_empty());
+        assert_eq!(
+            list.ids(Group::Added, &p("text/plain")),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
@@ -1271,7 +1280,10 @@ mod tests {
         );
         list.remove_association(&p("image/png"), "kde/a.desktop")
             .unwrap();
-        assert!(list.ids(Group::Removed, &p("image/png")).is_empty());
+        assert_eq!(
+            list.ids(Group::Removed, &p("image/png")),
+            Vec::<String>::new()
+        );
         assert!(!list.to_bytes().windows(3).any(|w| w == b"kde"), "gone");
         // Not listed for that type, or not an ID for another reason: refused.
         for (pattern, bad) in [

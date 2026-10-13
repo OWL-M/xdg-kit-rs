@@ -7416,11 +7416,11 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("text")).unwrap();
         std::fs::write(dir.path().join("text/a.xml"), "").unwrap();
         let mut diagnostics = Vec::new();
-        assert!(types_in(&dir.path().join("missing"), &mut diagnostics).is_empty());
+        assert_eq!(types_in(&dir.path().join("missing"), &mut diagnostics), []);
         // A media folder gone once the top was listed.
         let fault = (dir.path().join("text"), None, std::io::ErrorKind::NotFound);
         LISTING_FAULT.set(Some(fault));
-        assert!(types_in(dir.path(), &mut diagnostics).is_empty());
+        assert_eq!(types_in(dir.path(), &mut diagnostics), []);
         assert!(LISTING_FAULT.with_borrow(Option::is_none));
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
@@ -10955,7 +10955,7 @@ mod tests {
                 }
                 text.push_str("</mime-type>");
                 let (info, steps) = crate::work::steps(|| parse(&text));
-                assert!(info.diagnostics.is_empty());
+                assert_eq!(info.diagnostics, []);
                 (steps, text.len())
             },
             |items, bytes| 2 * (3 * bytes + 10 * items),
@@ -11945,7 +11945,7 @@ mod tests {
             ))
         };
         let malformed = per_type(&format!("<!ENTITY ns \"{NAMESPACE}\" junk>"));
-        assert!(!malformed.diagnostics.is_empty());
+        assert_ne!(malformed.diagnostics, []);
         for instruction in refused {
             let info = per_type(&format!("{instruction}<!ENTITY ns \"{NAMESPACE}\">"));
             assert_eq!(messages(&info), messages(&malformed), "{instruction:?}");

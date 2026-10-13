@@ -274,7 +274,7 @@ impl Counts {
 /// A step per level of a set of `len` items walked: the steps of finding,
 /// adding or removing one.
 fn depth(len: usize) -> usize {
-    usize::try_from(usize::BITS - len.leading_zeros()).unwrap_or(usize::MAX)
+    usize::try_from(len.bit_width()).unwrap_or(usize::MAX)
 }
 
 /// Borrowed parts of an index key: a number (the group number for a group's
@@ -594,6 +594,10 @@ struct Cached(u64);
 #[cfg(test)]
 thread_local! {
     /// The bytes written to [`Cached`] hashers on this thread, in tests.
+    #[allow(
+        clippy::missing_const_for_thread_local,
+        reason = "already const; clippy flags it on targets without native thread locals (Android, OpenBSD, illumos)"
+    )]
     static FED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -2925,7 +2929,7 @@ mod tests {
         // A line that is not UTF-8 and not a comment is still reported.
         let file = KeyFile::parse(b"[A]\nk=caf\xe9\n");
         assert_eq!(file.diagnostics().len(), 1, "{:?}", file.diagnostics());
-        assert!(file.comments_not_utf8().is_empty());
+        assert_eq!(file.comments_not_utf8(), []);
     }
 
     #[test]
@@ -3206,11 +3210,7 @@ mod tests {
             );
         }
         // Desktop entries keep their own rule.
-        assert!(
-            !KeyFile::parse(b"[A]\nimage/png=x\n")
-                .diagnostics()
-                .is_empty()
-        );
+        assert_ne!(KeyFile::parse(b"[A]\nimage/png=x\n").diagnostics(), []);
         assert_eq!(
             KeyFile::new().set_raw("A", "image/png", None, "x"),
             Err(EditError::KeyName("image/png".into()))
@@ -3651,7 +3651,7 @@ mod tests {
                         assert!(file.remove_group(&group));
                     }
                 });
-                assert!(file.groups().is_empty());
+                assert_eq!(file.groups(), Vec::<&str>::new());
                 assert_eq!(file.to_bytes(), b"# head\n");
                 (steps, bytes)
             },
@@ -3729,7 +3729,7 @@ mod tests {
                             bytes += previous.len();
                             assert!(file.remove_group(&previous));
                         }
-                        assert!(file.diagnostics().is_empty());
+                        assert_eq!(file.diagnostics(), []);
                         assert_eq!(
                             file.to_bytes().len(),
                             "[Keep]\nk=v\n\n[]\n".len() + group.len()

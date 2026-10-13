@@ -1469,8 +1469,9 @@ fn a_tree_matchlet_whose_only_child_is_damaged_is_dropped() {
             "{child}"
         );
     }
-    assert!(
-        custom_tree_types(">\"a\"=directory\nx>\"a\"=directory\n>\"a/b\"=directory\n").is_empty()
+    assert_eq!(
+        custom_tree_types(">\"a\"=directory\nx>\"a\"=directory\n>\"a/b\"=directory\n"),
+        Vec::<String>::new()
     );
 }
 
@@ -1480,8 +1481,9 @@ fn a_tree_matchlet_that_keeps_one_child_still_matches_through_it() {
         custom_tree_types(">\"a\"=directory\n1>\"a/b\"=directory\n1>\"a/c\"=socket\n"),
         ["x-content/x-custom"]
     );
-    assert!(
-        custom_tree_types(">\"a\"=directory\n1>\"a/c\"=directory\n1>\"a/b\"=socket\n").is_empty()
+    assert_eq!(
+        custom_tree_types(">\"a\"=directory\n1>\"a/c\"=directory\n1>\"a/b\"=socket\n"),
+        Vec::<String>::new()
     );
 }
 
@@ -1491,12 +1493,18 @@ fn a_well_formed_last_tree_line_without_a_newline_is_read() {
         custom_tree_types(">\"a\"=directory\n1>\"a/b\"=directory"),
         ["x-content/x-custom"]
     );
-    assert!(custom_tree_types(">\"a\"=directory\n1>\"a/c\"=directory").is_empty());
+    assert_eq!(
+        custom_tree_types(">\"a\"=directory\n1>\"a/c\"=directory"),
+        Vec::<String>::new()
+    );
 }
 
 #[test]
 fn non_empty_asks_for_an_entry_besides_dot_and_dot_dot() {
-    assert!(custom_tree_types(">\"a/b\"=directory,non-empty\n").is_empty());
+    assert_eq!(
+        custom_tree_types(">\"a/b\"=directory,non-empty\n"),
+        Vec::<String>::new()
+    );
     assert_eq!(
         custom_tree_types(">\"a\"=directory,non-empty\n"),
         ["x-content/x-custom"]
@@ -1792,7 +1800,7 @@ fn an_inode_type_under_a_data_type_is_any_data_too() {
             m("application/octet-stream"),
         ]
     );
-    assert!(db.ancestors(&m("inode/directory")).is_empty());
+    assert_eq!(db.ancestors(&m("inode/directory")), []);
 }
 
 #[test]

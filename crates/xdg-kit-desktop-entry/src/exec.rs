@@ -966,7 +966,7 @@ mod tests {
         assert_eq!(problems("a=b %f"), [ExecProblem::EqualsInProgram]);
         assert_eq!(problems("app pre\"q\""), [ExecProblem::PartlyQuoted]);
         assert_eq!(problems("app %m"), [ExecProblem::Deprecated('m')]);
-        assert!(problems("env A=b app --x=%c %U").is_empty());
+        assert_eq!(problems("env A=b app --x=%c %U"), []);
     }
 
     #[test]
@@ -1041,11 +1041,11 @@ mod tests {
                 .starts_with(r"a backslash before '\u{200b}' ")
         );
         assert_eq!(expand(r#"echo "abc\q""#, &[]), ["echo", "abc\\q"]);
-        assert!(
+        assert_eq!(
             CommandLine::parse(r#"echo "\" \` \$ \\""#)
                 .unwrap()
-                .problems()
-                .is_empty()
+                .problems(),
+            []
         );
     }
 
@@ -1065,7 +1065,7 @@ mod tests {
             Err(ExecError::UnclosedQuote)
         );
         let line = CommandLine::parse(r#"app "%%z""#).unwrap();
-        assert!(line.problems().is_empty());
+        assert_eq!(line.problems(), []);
         assert_eq!(expand(r#"app "%%z""#, &[]), ["app", "%z"]);
         let line = CommandLine::parse(r#"app "%f""#).unwrap();
         assert_eq!(line.problems(), [ExecProblem::FieldCodeInQuotes]);

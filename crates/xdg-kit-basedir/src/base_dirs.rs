@@ -558,7 +558,7 @@ mod tests {
         assert_eq!(dirs.data_dirs(), paths(&["/usr/local/share", "/usr/share"]));
         assert_eq!(dirs.config_dirs(), paths(&["/etc/xdg"]));
         assert_eq!(dirs.runtime_dir(), Err(RuntimeDirProblem::Unset));
-        assert!(dirs.diagnostics().is_empty());
+        assert_eq!(dirs.diagnostics(), []);
     }
 
     #[test]
@@ -573,7 +573,7 @@ mod tests {
         assert_eq!(dirs.data_home(), Path::new("/home/u/.local/share"));
         assert_eq!(dirs.data_dirs(), paths(&["/usr/local/share", "/usr/share"]));
         assert_eq!(dirs.config_dirs(), paths(&["/etc/xdg"]));
-        assert!(dirs.diagnostics().is_empty());
+        assert_eq!(dirs.diagnostics(), []);
     }
 
     #[test]
@@ -655,7 +655,7 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(dirs.data_dirs(), paths(&["/b", "/a", "/usr/share"]));
-        assert!(dirs.diagnostics().is_empty());
+        assert_eq!(dirs.diagnostics(), []);
     }
 
     /// The bound for reading `HOME` and an `XDG_DATA_DIRS` of `items`

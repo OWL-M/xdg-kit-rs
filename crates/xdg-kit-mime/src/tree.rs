@@ -1016,14 +1016,14 @@ mod tests {
             paths(root.path(), "dcim/photos", false),
             entries(&[&root.path().join("DCIM/Photos")])
         );
-        assert!(paths(root.path(), "dcim", true).is_empty());
+        assert_eq!(paths(root.path(), "dcim", true), []);
         assert_eq!(
             paths(root.path(), "DCIM", true),
             entries(&[&root.path().join("DCIM")])
         );
-        assert!(paths(root.path(), "../etc", false).is_empty());
-        assert!(paths(root.path(), "/etc", false).is_empty());
-        assert!(paths(root.path(), "missing", false).is_empty());
+        assert_eq!(paths(root.path(), "../etc", false), []);
+        assert_eq!(paths(root.path(), "/etc", false), []);
+        assert_eq!(paths(root.path(), "missing", false), []);
     }
 
     #[test]
@@ -1035,7 +1035,7 @@ mod tests {
             paths(root.path(), "ασ", false),
             entries(&[&root.path().join("ΑΣ")])
         );
-        assert!(paths(root.path(), "ας", false).is_empty());
+        assert_eq!(paths(root.path(), "ας", false), []);
     }
 
     #[test]

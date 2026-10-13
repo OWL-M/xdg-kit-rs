@@ -202,6 +202,25 @@ checks (`checks.workspace`) and a short run of each fuzz target
 need nightly Rust and cargo-fuzz, provided by `nix develop .#fuzz`.
 Generate their seeds first with `nix develop -c fuzz/make-seeds.sh`.
 
+Two more dev shells cover other systems:
+
+- `nix develop .#cross -c ci/clippy-target.sh <target>` runs Clippy on each
+  crate's library and tests for another target, with default and with all
+  features. It uses the latest stable Rust at the fenix commit in
+  `flake.lock`, which can be newer than the default shell's, with the
+  standard library of the targets in `XDG_KIT_CROSS_TARGETS`; those in
+  `XDG_KIT_CROSS_SOURCE_TARGETS` build it from source.
+- `nix develop .#i686 -c cargo test --workspace --all-features` runs the
+  tests built for 32-bit x86 (on x86-64 Linux only).
+
+The GitHub Actions workflow (`.github/workflows/ci.yml`) runs on pushes to
+`master`, on pull requests and when started by hand: `nix flake check`; in
+the dev shell the extended attribute test, the MIME crate's tests with
+quick-xml's `encoding` and `escape-html` features, and each crate built
+with default and with no features (`ci/build-features.sh`);
+`ci/clippy-target.sh` for every target of the dev shell `cross`; and the
+i686 tests.
+
 ## License
 
 Apache-2.0 (`LICENSE`), except `xdg-kit-mime`, which is
