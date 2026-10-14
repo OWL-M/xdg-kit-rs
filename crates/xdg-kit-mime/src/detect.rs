@@ -235,8 +235,9 @@ impl MimeDatabase {
 
         let mut found: Vec<usize> = Vec::new();
         for key in [name, lower.as_slice()] {
-            // Checked as UTF-8, then hashed and compared.
-            count(3 * key.len());
+            // Checked as UTF-8; the map counts each byte hashed, and
+            // compared on a match.
+            count(key.len());
             let Ok(key) = std::str::from_utf8(key) else {
                 continue;
             };
@@ -262,8 +263,9 @@ impl MimeDatabase {
                     if !utf8 && !tail.is_ascii() {
                         continue;
                     }
-                    // Checked as ASCII, then hashed and compared.
-                    count(3 * len);
+                    // Checked as ASCII; the map counts each byte hashed, and
+                    // compared on a match.
+                    count(len);
                     for &at in globs.suffix.get(tail).into_iter().flatten() {
                         let glob = &globs.all[at];
                         count(1 + len);
@@ -352,13 +354,13 @@ impl MimeDatabase {
         let namespaces = &self.merged.namespaces;
         // The key changed in place, not copied: the namespace may be as
         // large as memory allows.
-        let mut found = namespaces.get(&key);
+        let mut found = namespaces.get((&key.0, &key.1));
         if found.is_none() {
             let local = std::mem::take(&mut key.1);
-            found = namespaces.get(&key);
+            found = namespaces.get((&key.0, ""));
             if found.is_none() {
                 key = (String::new(), local);
-                found = namespaces.get(&key);
+                found = namespaces.get(("", &key.1));
             }
         }
         found.map(|mime| self.canonical(mime))

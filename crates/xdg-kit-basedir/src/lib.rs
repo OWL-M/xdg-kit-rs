@@ -23,6 +23,10 @@
 #[cfg(not(unix))]
 compile_error!("xdg-kit-basedir supports Unix systems only");
 
+// Not public API (see the module's docs).
+#[doc(hidden)]
+#[path = "hashed.rs"]
+pub mod __hashed;
 mod base_dirs;
 mod error;
 mod paths;

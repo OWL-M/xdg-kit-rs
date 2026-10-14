@@ -2,7 +2,7 @@
 //! files"), and the root element of XML documents for `XMLnamespaces`.
 
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -14,11 +14,13 @@ use quick_xml::name::{PrefixDeclaration, QName};
 
 /// The namespace of the database's XML files.
 const NAMESPACE: &str = "http://www.freedesktop.org/standards/shared-mime-info";
+use xdg_kit_basedir::__hashed::{Map, Numbered, Set};
 use xdg_kit_basedir::FileStamp;
 use xdg_kit_locale::Locales;
 
 use crate::error::quoted;
 use crate::read::Problems;
+use crate::work::{Borrowed, Text as TextKey};
 use crate::{Diagnostic, MimeDatabase, MimeType};
 
 /// Values by language (`None` for the untranslated one), a later value
@@ -28,7 +30,7 @@ use crate::{Diagnostic, MimeDatabase, MimeType};
 #[derive(Debug, Default)]
 struct Localized {
     /// Each language's ID, by name.
-    ids: HashMap<String, usize>,
+    ids: Map<TextKey, usize>,
     /// The values, by language ID.
     values: HashMap<Option<usize>, String>,
 }
@@ -37,16 +39,17 @@ impl Localized {
     /// The ID of `lang`, a new one if it has none yet.
     fn intern(&mut self, lang: &str) -> usize {
         looked_up_language();
-        // Hashed and compared.
-        crate::work::count(1 + 2 * lang.len());
-        if let Some(&id) = self.ids.get(lang) {
+        // The lookup; the map counts each byte hashed, and compared on a
+        // match.
+        crate::work::count(1);
+        let lookup = self.ids.lookup(lang);
+        if let Some(&id) = self.ids.get_at(&lookup) {
             return id;
         }
-        // Copied.
-        crate::work::count(lang.len());
+        // Copied (counted by the map).
         copied_language();
         let id = self.ids.len();
-        self.ids.insert(lang.to_owned(), id);
+        self.ids.insert_at(&lookup, id);
         id
     }
 
@@ -1174,19 +1177,19 @@ struct Scopes {
     default: Vec<Binding>,
     /// Each prefix's, as `default`, each with its namespace's ID (`ids`).
     /// A prefix leaves the map when its last binding goes out of scope.
-    prefixed: HashMap<String, Vec<(usize, Binding)>>,
+    prefixed: Map<TextKey, Vec<(usize, Binding)>>,
     /// An ID for each namespace a prefix was bound to, given when first
     /// declared, so namespaces are compared without reading them again.
     /// Kept until the file is read, under any limit: it grows with the
     /// distinct namespaces bound in the file, so with its size.
-    ids: HashMap<String, usize>,
+    ids: Map<TextKey, usize>,
     /// The general entities the document's internal subset declares
     /// ([`Scopes::declare_entities`]).
     entities: Entities,
     /// The namespace declarations of the tag last opened that use
     /// entities, by attribute name, with their values as bound
     /// ([`Scopes::declared_value`]).
-    tag: HashMap<String, Binding>,
+    tag: Map<TextKey, Binding>,
     /// The defaults the tag last opened was given ([`Scopes::push`]), by
     /// attribute name: a namespace or language, or why it cannot be read.
     defaulted: Vec<(String, Binding)>,
@@ -1213,10 +1216,10 @@ impl Scopes {
     fn new(limits: &crate::Limits) -> Self {
         Self {
             default: Vec::new(),
-            prefixed: HashMap::new(),
-            ids: HashMap::new(),
+            prefixed: Map::new(),
+            ids: Map::new(),
             entities: Entities::default(),
-            tag: HashMap::new(),
+            tag: Map::new(),
             defaulted: Vec::new(),
             standalone: false,
             typed: false,
@@ -1263,14 +1266,15 @@ impl Scopes {
     /// The attributes read here that `attributes` declares for `element`
     /// ([`Entities::attributes`]), if any.
     fn declared<'a>(
-        attributes: &'a HashMap<String, Attributes>,
+        attributes: &'a Map<TextKey, Attributes>,
         element: &str,
     ) -> Option<&'a Attributes> {
         if attributes.is_empty() {
             return None;
         }
-        // Hashed and compared.
-        crate::work::count(1 + 2 * element.len());
+        // The lookup; the map counts each byte hashed, and compared on a
+        // match.
+        crate::work::count(1);
         attributes.get(element)
     }
 
@@ -1280,7 +1284,7 @@ impl Scopes {
         &mut self,
         start: &BytesStart<'_>,
         version: XmlVersion,
-        attributes: &HashMap<String, Attributes>,
+        attributes: &Map<TextKey, Attributes>,
     ) -> Result<(), String> {
         use crate::work::count;
         // The tag scanned for its declarations.
@@ -1288,7 +1292,7 @@ impl Scopes {
         let declared = Self::declared(attributes, start.name().into_inner());
         let defaults = declared.filter(|declared| !declared.defaulted.is_empty());
         // The attributes the tag writes that a default may be given for.
-        let mut written = HashSet::new();
+        let mut written = Set::<Borrowed<'_>>::new();
         for attribute in start.attributes().with_checks(false) {
             let Ok(attribute) = attribute else {
                 return Ok(());
@@ -1296,9 +1300,10 @@ impl Scopes {
             let name = attribute.key.into_inner();
             let binding = attribute.key.as_namespace_binding();
             if defaults.is_some() && (binding.is_some() || name == "xml:lang") {
-                // Hashed and compared.
-                count(1 + 2 * name.len());
-                written.insert(name);
+                // The insertion; the set counts each byte hashed, and
+                // compared on a match.
+                count(1);
+                written.insert_owned(name);
             }
             let Some(binding) = binding else {
                 continue;
@@ -1326,14 +1331,13 @@ impl Scopes {
                     // binding cannot be read, as a refused expansion's.
                     // Counted in tests only, so that the sum cannot
                     // overflow elsewhere.
+                    // The name's bytes are counted by the map.
                     crate::work::count_by(|| {
                         let length = value.as_ref().map_or_else(String::len, String::len);
-                        name.len()
-                            .saturating_mul(3)
-                            .saturating_add(length)
-                            .saturating_add(1)
+                        length.saturating_add(1)
                     });
-                    if !self.tag.contains_key(name) {
+                    let lookup = self.tag.lookup(name);
+                    if !self.tag.contains_at(&lookup) {
                         let kept = match &value {
                             Ok(expanded) => try_copy(expanded).ok_or_else(too_large),
                             Err(why) => Err(why.clone()),
@@ -1341,7 +1345,7 @@ impl Scopes {
                         if let Err(why) = &kept {
                             value = Err(why.clone());
                         }
-                        self.tag.insert(name.to_owned(), kept);
+                        self.tag.insert_at(&lookup, kept);
                     }
                     value.map(Cow::Owned)
                 }
@@ -1364,7 +1368,7 @@ impl Scopes {
     fn apply_defaults(
         &mut self,
         declared: &Attributes,
-        written: &HashSet<&str>,
+        written: &Set<Borrowed<'_>>,
         version: XmlVersion,
     ) -> Result<(), String> {
         for &at in &declared.defaulted {
@@ -1376,8 +1380,9 @@ impl Scopes {
             else {
                 continue;
             };
-            // Hashed and compared.
-            crate::work::count(1 + 2 * name.len());
+            // The lookup; the set counts each byte hashed, and compared on
+            // a match.
+            crate::work::count(1);
             if written.contains(name.as_str()) {
                 continue;
             }
@@ -1506,8 +1511,9 @@ impl Scopes {
         match prefix {
             None => self.default.push(value),
             Some(prefix) => {
-                // Hashed and copied (three), and copied again.
-                count(1 + 4 * prefix.len());
+                // Copied again below; the map counts each byte hashed,
+                // compared on a match and copied if new.
+                count(1 + prefix.len());
                 // A namespace whose copy for its ID is refused cannot
                 // be read, as one whose expansion is; such a binding
                 // has the ID of an empty one, as any binding that
@@ -1519,8 +1525,7 @@ impl Scopes {
                     self.id("").unwrap_or(usize::MAX)
                 };
                 self.prefixed
-                    .entry(prefix.to_owned())
-                    .or_default()
+                    .get_or_insert_with(prefix, Vec::new)
                     .push((id, value));
             }
         }
@@ -1586,7 +1591,7 @@ impl Scopes {
         if !self.tag.is_empty() {
             // Each slot dropped.
             crate::work::count(self.tag.capacity());
-            self.tag = HashMap::new();
+            self.tag = Map::new();
         }
     }
 
@@ -1594,22 +1599,28 @@ impl Scopes {
     /// attribute `name` (`xmlns` or `xmlns:` and a prefix), if it uses
     /// entities, as bound: entities replaced, or why it cannot be read.
     fn declared_value(&self, name: &str) -> Option<&Binding> {
-        // Hashed and compared.
-        crate::work::count(1 + 2 * name.len());
+        // The lookup; the map counts each byte hashed, and compared on a
+        // match.
+        crate::work::count(1);
         self.tag.get(name)
     }
 
     /// The ID of `namespace`, a new one if it has none yet; `None` if
     /// memory to copy it is refused ([`try_copy`]).
     fn id(&mut self, namespace: &str) -> Option<usize> {
-        // Hashed and compared, and copied if new; counted in tests only, so
-        // that it cannot overflow elsewhere (an expansion may be large).
-        crate::work::count_by(|| namespace.len().saturating_mul(3).saturating_add(1));
-        if let Some(&id) = self.ids.get(namespace) {
+        // The lookup; the map counts each byte hashed, and compared on a
+        // match.
+        crate::work::count(1);
+        let lookup = self.ids.lookup(namespace);
+        if let Some(&id) = self.ids.get_at(&lookup) {
             return Some(id);
         }
         let next = self.ids.len();
-        self.ids.insert(try_copy(namespace)?, next);
+        // Copied if new, its memory asked for first; counted in tests only,
+        // so that it cannot overflow elsewhere (an expansion may be large).
+        crate::work::count_by(|| namespace.len());
+        let copy = try_copy(namespace)?;
+        self.ids.insert_owned_at(&lookup, copy, next);
         Some(next)
     }
 
@@ -1620,12 +1631,14 @@ impl Scopes {
         {
             match self.declared.pop() {
                 Some((_, Some(prefix))) => {
-                    // Hashed and compared, and again to be removed.
-                    crate::work::count(2 + 4 * prefix.len());
-                    if let Some(bound) = self.prefixed.get_mut(&prefix) {
+                    // Looked up, and again to be removed; the map counts
+                    // each byte hashed once, and compared on a match.
+                    crate::work::count(2);
+                    let lookup = self.prefixed.lookup(&prefix);
+                    if let Some(bound) = self.prefixed.get_mut_at(&lookup) {
                         bound.pop();
                         if bound.is_empty() {
-                            self.prefixed.remove(&prefix);
+                            self.prefixed.remove_at(&lookup);
                         }
                     }
                 }
@@ -1675,8 +1688,9 @@ impl Scopes {
     /// is bound to one that can be read; `None` for `xmlns`, which
     /// declares. `xml`'s is `usize::MAX`.
     fn namespace_of(&self, prefix: &str) -> Option<usize> {
-        // Hashed and compared.
-        crate::work::count(1 + 2 * prefix.len());
+        // The lookup; the map counts each byte hashed, and compared on a
+        // match.
+        crate::work::count(1);
         match prefix {
             "xml" => Some(usize::MAX),
             "xmlns" => None,
@@ -1748,7 +1762,7 @@ fn tag_problem(
 /// The expanded names (namespace and local part) of a tag's prefixed
 /// attributes read so far, namespace declarations aside.
 #[derive(Default)]
-struct Expanded<'a>(HashSet<(usize, &'a str)>);
+struct Expanded<'a>(Set<Numbered<Borrowed<'a>>>);
 
 impl<'a> Expanded<'a> {
     /// The problem with an attribute `name` if one read before it has the
@@ -1757,9 +1771,10 @@ impl<'a> Expanded<'a> {
     fn repeated(&mut self, name: &'a str, scopes: &Scopes) -> Option<String> {
         let (prefix, local) = name.split_once(':')?;
         let namespace = scopes.namespace_of(prefix)?;
-        // Hashed and compared.
-        crate::work::count(1 + 2 * local.len());
-        (!self.0.insert((namespace, local))).then(|| {
+        // The insertion; the set counts each byte hashed, and compared on
+        // a match.
+        crate::work::count(1);
+        (!self.0.insert_owned((namespace, local))).then(|| {
             format!(
                 "{UNREADABLE}an attribute appears twice in its namespace: {}",
                 quoted(name)
@@ -1932,7 +1947,7 @@ fn declaration_problem(
     version: XmlVersion,
     scopes: &Scopes,
 ) -> Option<TagProblem> {
-    let mut seen = HashSet::new();
+    let mut seen = Set::<Borrowed<'_>>::new();
     let declared = Scopes::declared(&scopes.entities.attributes, start.name().into_inner());
     start
         .attributes()
@@ -1943,7 +1958,7 @@ fn declaration_problem(
         .find_map(|(name, value)| {
             let message = if !is_qname(name) {
                 not_a_name()
-            } else if !seen.insert(name) {
+            } else if !seen.insert_owned(name) {
                 twice(name)
             } else {
                 // Entities replaced, as bound.
@@ -2400,7 +2415,7 @@ enum Value<'a> {
 struct Entities {
     /// Each declared general entity's place in `list`, by name, the first
     /// declaration binding (XML 1.0, 4.2).
-    index: HashMap<String, usize>,
+    index: Map<TextKey, usize>,
     /// The declared entities, in order.
     list: Vec<Entity>,
     /// Whether an entity not declared here may be declared where it is
@@ -2425,7 +2440,7 @@ struct Entities {
     /// `xmlns:` and a prefix, `xml:lang`), by the element's name as written
     /// (a document type is not namespace-aware): the first declaration of
     /// each binds (XML 1.0, 3.3).
-    attributes: HashMap<String, Attributes>,
+    attributes: Map<TextKey, Attributes>,
 }
 
 /// The attributes read here that an `ATTLIST` declares for one element
@@ -2433,7 +2448,7 @@ struct Entities {
 #[derive(Default)]
 struct Attributes {
     /// Each one's place in `list`, by name.
-    index: HashMap<String, usize>,
+    index: Map<TextKey, usize>,
     list: Vec<Declared>,
     /// The places of those with a default, in order.
     defaulted: Vec<usize>,
@@ -2443,8 +2458,9 @@ impl Attributes {
     /// Whether attribute `name` is declared of a type other than `CDATA`,
     /// so that its value is normalised further (XML 1.0, 3.3.3).
     fn tokens(&self, name: &str) -> bool {
-        // Hashed and compared.
-        crate::work::count(1 + 2 * name.len());
+        // The lookup; the map counts each byte hashed, and compared on a
+        // match.
+        crate::work::count(1);
         self.index.get(name).is_some_and(|&at| self.list[at].tokens)
     }
 }
@@ -2533,8 +2549,9 @@ impl Entities {
     /// ([`Entities::open`]), an error otherwise; with standalone, so is
     /// one declared only in parameter-entity text ([`Entities::declared`]).
     fn use_of(&self, name: &str) -> Use {
-        // Hashed and compared.
-        crate::work::count(1 + 2 * name.len());
+        // The lookup; the map counts each byte hashed, and compared on a
+        // match.
+        crate::work::count(1);
         match self.index.get(name) {
             Some(&at) if self.declared(at, false) => self.list[at].use_,
             _ if self.open => Use::Unknown,
@@ -2581,8 +2598,9 @@ impl Entities {
                 if !is_xml_name(name) {
                     return Err(());
                 }
-                // Hashed and compared.
-                crate::work::count(1 + 2 * name.len());
+                // The lookup; the map counts each byte hashed, and compared
+                // on a match.
+                crate::work::count(1);
                 let at = self.index.get(name).copied();
                 found.push(at.filter(|&at| self.declared(at, included)));
             }
@@ -2880,7 +2898,7 @@ impl Entities {
                     Use::Unknown => return Ok(None),
                     Use::Unusable => return Err(not_replaced(name)),
                 }
-                let at = self.index[name];
+                let at = *self.index.get(name).expect("a usable entity is declared");
                 size = size.saturating_add(self.list[at].size);
                 referred = referred.saturating_add(self.list[at].length);
             }
@@ -3698,7 +3716,7 @@ impl Text<'_> {
 struct Parameters {
     /// Each declared parameter entity's place in `list`, by name, the
     /// first declaration binding.
-    index: HashMap<String, usize>,
+    index: Map<TextKey, usize>,
     list: Vec<Parameter>,
     /// Whether each is being read (included, not read to its end): a
     /// reference to it then is a loop.
@@ -3775,14 +3793,16 @@ fn declare(
             return false;
         }
     }
-    // Hashed, compared and copied.
-    crate::work::count(1 + 3 * name.len());
-    if let Some(&at) = entities.index.get(name) {
+    // The lookup; the map counts each byte hashed, compared on a match and
+    // copied if new.
+    crate::work::count(1);
+    let lookup = entities.index.lookup(name);
+    if let Some(&at) = entities.index.get_at(&lookup) {
         entities.list[at].outside |= !included;
         return true;
     }
     let text = literal.and_then(|(literal, _)| replacement_text(literal, version, !included));
-    entities.index.insert(name.to_owned(), entities.list.len());
+    entities.index.insert_at(&lookup, entities.list.len());
     entities.list.push(Entity {
         text,
         outside: !included,
@@ -3956,8 +3976,9 @@ impl Entities {
             if let Some((name, _)) = part.split_once(';')
                 && replacement(&BytesRef::new(name), version).is_none()
             {
-                // Hashed and compared.
-                crate::work::count(1 + 2 * name.len());
+                // The lookup; the map counts each byte hashed, and compared
+                // on a match.
+                crate::work::count(1);
                 let at = self.index.get(name).copied();
                 if self.defaults.try_reserve(1).is_err() {
                     return false;
@@ -3991,21 +4012,25 @@ impl Entities {
             copy.push_str(text);
             Some(copy)
         };
-        // Both names hashed, compared and copied.
-        crate::work::count(2 + 3 * (element.len() + name.len()));
-        if !self.attributes.contains_key(element) {
+        // Both names copied, the attribute's twice; the maps count each
+        // byte hashed, and compared on a match.
+        crate::work::count(2 + element.len() + 2 * name.len());
+        let found = self.attributes.lookup(element);
+        if !self.attributes.contains_at(&found) {
             let Some(element) = copy(element) else {
                 return false;
             };
             if self.attributes.try_reserve(1).is_err() {
                 return false;
             }
-            self.attributes.insert(element, Attributes::default());
+            self.attributes
+                .insert_owned_at(&found, element, Attributes::default());
         }
-        let Some(attributes) = self.attributes.get_mut(element) else {
+        let Some(attributes) = self.attributes.get_mut_at(&found) else {
             return false;
         };
-        if attributes.index.contains_key(name) {
+        let named = attributes.index.lookup(name);
+        if attributes.index.contains_at(&named) {
             return true;
         }
         let default = match default {
@@ -4036,7 +4061,9 @@ impl Entities {
         if default.is_some() {
             attributes.defaulted.push(attributes.list.len());
         }
-        attributes.index.insert(key, attributes.list.len());
+        attributes
+            .index
+            .insert_owned_at(&named, key, attributes.list.len());
         attributes.list.push(Declared {
             name: kept,
             tokens,
@@ -4214,12 +4241,14 @@ fn declare_parameter(
             }
         };
     let rest = after.trim_start_matches(blank);
-    // Each byte looked at, and the name hashed, compared and copied.
-    crate::work::count(1 + after.len() - rest.len() + 3 * name.len());
+    // Each byte looked at; the map counts each byte of the name hashed,
+    // compared on a match and copied if new.
+    crate::work::count(1 + after.len() - rest.len());
     if !rest.starts_with('>') {
         return false;
     }
-    if !parameters.index.contains_key(name) {
+    let lookup = parameters.index.lookup(name);
+    if !parameters.index.contains_at(&lookup) {
         let parameter = match literal.map(|literal| replaced(literal, version, !included)) {
             None => Parameter::External,
             Some(None) => Parameter::Unreadable,
@@ -4229,9 +4258,7 @@ fn declare_parameter(
                 Parameter::Text(Rc::from(text))
             }
         };
-        parameters
-            .index
-            .insert(name.to_owned(), parameters.list.len());
+        parameters.index.insert_at(&lookup, parameters.list.len());
         parameters.list.push(parameter);
         parameters.reading.push(false);
     }
@@ -7431,7 +7458,7 @@ mod tests {
             .comment
             .ids
             .iter()
-            .map(|(name, &id)| (id, name.as_str()))
+            .map(|(name, &id)| (id, &**name))
             .collect();
         let mut comments = info
             .comment
@@ -9188,6 +9215,66 @@ mod tests {
         }
     }
 
+    /// Parses `text`, made of a long name (a namespace or language) then
+    /// `n` short distinct ones, each kept in one of the maps keyed by text:
+    /// the steps counted, the bytes fed to those maps' hashers, and the
+    /// bytes of the text.
+    fn long_name_beside_short_ones(text: &str) -> (usize, usize) {
+        let before = xdg_kit_basedir::__hashed::fed();
+        let (info, steps) = crate::work::steps(|| parse(text));
+        assert!(info.diagnostics.is_empty(), "{:?}", info.diagnostics);
+        (steps, xdg_kit_basedir::__hashed::fed() - before)
+    }
+
+    #[test]
+    fn a_long_namespace_or_language_is_hashed_once_as_more_arrive() {
+        use std::fmt::Write as _;
+        // The outside review's case: one long namespace, then distinct
+        // short ones, each kept until the file is read. A map that hashed
+        // its keys' text again each time it grew would hash the long one
+        // about log2 n times; these hash it once, when it arrives, and feed
+        // their hashers eight bytes per key moved, whatever its length.
+        let long = "u".repeat(1 << 20);
+        let namespaces = |n: usize| {
+            let mut text = format!("{OPEN}<x xmlns:l=\"urn:{long}\"/>");
+            for at in 0..n {
+                let _ = write!(text, "<x xmlns:p=\"urn:{at}\"/>");
+            }
+            text + "</mime-type>"
+        };
+        let languages = |n: usize| {
+            let mut text = format!("{OPEN}<comment xml:lang=\"{long}\">x</comment>");
+            for at in 0..n {
+                let _ = write!(text, "<comment xml:lang=\"l{at}\">x</comment>");
+            }
+            text + "</mime-type>"
+        };
+        let texts: [&dyn Fn(usize) -> String; 2] = [&namespaces, &languages];
+        for text in texts {
+            let (_, fed) = long_name_beside_short_ones(&text(1 << 12));
+            // Each short name went through a map keyed by hashed text (a
+            // plain map feeds that hasher nothing).
+            assert!(fed >= 8 << 12, "{fed} bytes fed for {} names", 1 << 12);
+            assert!(
+                fed < long.len() / 4,
+                "{fed} bytes fed to the hashers beside a name of {} bytes",
+                long.len()
+            );
+            // The work beside the long name grows with the short ones only:
+            // a tag, its name and its value, each byte scanned, checked and
+            // copied a few times. About 40 steps a byte; twice that.
+            crate::work::assert_linear(
+                1 << 10,
+                |n| {
+                    let text = text(n);
+                    let (steps, _) = long_name_beside_short_ones(&text);
+                    (steps, text.len())
+                },
+                |_, bytes| 2 * 40 * bytes,
+            );
+        }
+    }
+
     #[test]
     fn namespace_resolution_takes_linear_time() {
         // B bindings on the root, then E elements named with the first
@@ -10785,7 +10872,7 @@ mod tests {
             1000,
             |n| {
                 let mut entities = Entities::default();
-                entities.index.insert("a".to_owned(), 0);
+                entities.index.insert("a", 0);
                 entities.list.push(Entity {
                     text: Some("x".repeat(n)),
                     use_: Use::Usable,

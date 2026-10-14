@@ -9,9 +9,11 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 
+use xdg_kit_basedir::__hashed::{Map, Measure, Pair, Ref, Set};
+
 use crate::MimeType;
 use crate::model::{Folder, Glob, MagicRule, Matchlet, TreeMatchlet, TreeRule};
-use crate::work;
+use crate::work::{self, Counted, Text};
 
 /// A rule with where it came from.
 #[derive(Debug, Clone)]
@@ -39,7 +41,7 @@ pub(crate) struct Merged {
     pub(crate) icons: HashMap<MimeType, String>,
     pub(crate) generic_icons: HashMap<MimeType, String>,
     /// (namespace URI, local name) → type
-    pub(crate) namespaces: HashMap<(String, String), MimeType>,
+    pub(crate) namespaces: Map<Pair<Text, Text>, MimeType>,
     pub(crate) max_extent: u32,
 }
 
@@ -100,11 +102,10 @@ pub(crate) fn merge<'a>(folders: impl ExactSizeIterator<Item = &'a Folder>) -> M
             merged.generic_icons.insert(mime.clone(), icon.clone());
         }
         for (namespace, local, mime) in &folder.namespaces {
-            // Each byte of the key copied, hashed and compared.
-            work::count(1 + 3 * (namespace.len() + local.len()));
-            merged
-                .namespaces
-                .insert((namespace.clone(), local.clone()), mime.clone());
+            // The map counts each byte of the key hashed, compared on a
+            // match and copied if new.
+            work::count(1);
+            merged.namespaces.insert((namespace, local), mime.clone());
         }
 
         merged.max_extent = merged.max_extent.max(folder.max_extent);
@@ -269,15 +270,16 @@ fn parents(folders: &[&Folder], merged: &Merged) -> HashMap<MimeType, Vec<MimeTy
 /// Drops rules that repeat an earlier one exactly, keeping the first (the
 /// most important): the same package installed in several folders gives
 /// the same patterns and magic again (xdgmime's `filter_out_dupes`).
-fn drop_repeats<T: Eq + Hash + Bytes>(rules: &mut Vec<Ranked<T>>) {
+fn drop_repeats<T: Eq + Hash + Measure>(rules: &mut Vec<Ranked<T>>) {
     let keep: Vec<bool> = {
-        let mut seen = HashSet::new();
+        let mut seen = Set::<Ref<'_, T, Counted>>::new();
         rules
             .iter()
             .map(|ranked| {
-                // The rule hashed and compared.
-                work::count_by(|| 1 + 2 * ranked.rule.bytes());
-                seen.insert(&ranked.rule)
+                // The set counts each byte of the rule hashed, and compared
+                // on a match.
+                work::count(1);
+                seen.insert_owned(&ranked.rule)
             })
             .collect()
     };
@@ -292,6 +294,25 @@ fn drop_repeats<T: Eq + Hash + Bytes>(rules: &mut Vec<Ranked<T>>) {
 /// The bytes of input a rule holds, nested parts included, for counting.
 pub(crate) trait Bytes {
     fn bytes(&self) -> usize;
+}
+
+/// The bytes a rule holds, as hashed or compared in [`drop_repeats`].
+impl Measure for Glob {
+    fn bytes(&self) -> usize {
+        Bytes::bytes(self)
+    }
+}
+
+impl Measure for MagicRule {
+    fn bytes(&self) -> usize {
+        Bytes::bytes(self)
+    }
+}
+
+impl Measure for TreeRule {
+    fn bytes(&self) -> usize {
+        Bytes::bytes(self)
+    }
 }
 
 impl Bytes for Glob {

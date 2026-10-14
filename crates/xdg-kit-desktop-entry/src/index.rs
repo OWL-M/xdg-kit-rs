@@ -12,6 +12,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use xdg_kit_basedir::__hashed::{Map, Set};
 use xdg_kit_basedir::{BaseDirs, FileStamp};
 
 use crate::error::{quoted, shown_path};
@@ -236,7 +237,7 @@ pub struct AppIndex {
     /// The same as `by_id`, for looking an ID up: hashing costs the ID's
     /// length, where the sorted map compares it with several IDs, each
     /// compared up to where they differ.
-    lookup: HashMap<String, Option<usize>>,
+    lookup: Map<work::Text, Option<usize>>,
     /// The IDs each root holds (by index into `roots`), shadowed ones
     /// included; files that could not be read or are ignored for their
     /// encoding or type are not counted, shadowed or not.
@@ -285,16 +286,16 @@ impl AppIndex {
         limits: &Limits,
     ) -> Self {
         let mut roots: Vec<(PathBuf, FileStamp)> = Vec::new();
-        let mut seen = HashSet::new();
+        let mut seen = Set::<work::PathKey>::new();
         for dir in dirs {
             // Absolute now, so that a later change of folder does not move
             // it; as given when it cannot be.
             let dir = dir.into();
             let dir = std::path::absolute(&dir).unwrap_or(dir);
-            // The path made absolute, then the repeat check: a step, and the
-            // path copied, hashed and compared.
-            work::count(1 + 4 * dir.as_os_str().len());
-            if seen.insert(dir.clone()) {
+            // The path made absolute, then the repeat check: a step; the set
+            // counts each byte hashed, compared on a match and copied if new.
+            work::count(1 + dir.as_os_str().len());
+            if seen.insert(&dir) {
                 let stamp = FileStamp::of(&dir);
                 roots.push((dir, stamp));
             }
@@ -320,7 +321,7 @@ impl AppIndex {
             ignored: Vec::new(),
             links: Vec::new(),
             by_id: BTreeMap::new(),
-            lookup: HashMap::new(),
+            lookup: Map::new(),
             held: vec![BTreeSet::new(); roots.len()],
             shadowed: Vec::new(),
             diagnostics: Vec::new(),
@@ -348,13 +349,14 @@ impl AppIndex {
             // Byte order of the relative paths, so `foo-bar.desktop` comes
             // before `foo/bar.desktop`.
             files.sort_by(|a, b| compared(a.0.as_os_str().as_bytes(), b.0.as_os_str().as_bytes()));
-            let mut ids_here: HashMap<String, (PathBuf, (u64, u64))> = HashMap::new();
+            let mut ids_here = Map::<work::Text, (PathBuf, (u64, u64))>::new();
             for (relative, path, file) in files {
                 let Some(id) = index.id_of(&relative, &path) else {
                     continue;
                 };
-                // A step, and the ID hashed and compared.
-                work::count(1 + 2 * id.len());
+                // A step; the map counts each byte hashed, and compared on a
+                // match.
+                work::count(1);
                 if let Some((first, first_file)) = ids_here.get(&id) {
                     // Skipped, but whether it is the first path's file
                     // changes when a link on the way is pointed elsewhere,
@@ -379,14 +381,14 @@ impl AppIndex {
                     ));
                     continue;
                 }
-                // A step, the ID copied, hashed and compared, and the path
-                // copied.
-                work::count(1 + 3 * id.len() + path.as_os_str().len());
-                ids_here.insert(id.clone(), (path.clone(), file));
+                // A step, and the path copied; the map counts each byte of
+                // the ID hashed again and copied.
+                work::count(1 + path.as_os_str().len());
+                ids_here.insert(&id, (path.clone(), file));
                 // A more important folder has this ID: the file is read only
-                // to know whether the folder holds it. A step, and the ID
-                // hashed and compared.
-                work::count(1 + 2 * id.len());
+                // to know whether the folder holds it. A step; the map
+                // counts each byte hashed, and compared on a match.
+                work::count(1);
                 let shadowed = index.lookup.contains_key(&id);
                 let stamp = FileStamp::of(&path);
                 // A step, and the path hashed and compared (counted even when
@@ -492,10 +494,10 @@ impl AppIndex {
             entry,
         });
         self.held[root].insert(SortedId(id.clone()));
-        // The ID put in the lookup map too: a step, and the ID copied,
-        // hashed and compared.
-        work::count(1 + 3 * id.len());
-        self.lookup.insert(id.clone(), at);
+        // The ID put in the lookup map too: a step; the map counts each
+        // byte hashed, compared on a match and copied if new.
+        work::count(1);
+        self.lookup.insert(&id, at);
         self.by_id.insert(SortedId(id), at);
     }
 
@@ -746,8 +748,8 @@ impl AppIndex {
     /// The winning file of `id`, as [`AppIndex::by_id`] has it, looked up
     /// in [`AppIndex::lookup`].
     fn find(&self, id: &str) -> Option<&Option<usize>> {
-        // A step, and the ID hashed and compared.
-        work::count(1 + 2 * id.len());
+        // A step; the map counts each byte hashed, and compared on a match.
+        work::count(1);
         self.lookup.get(id)
     }
 

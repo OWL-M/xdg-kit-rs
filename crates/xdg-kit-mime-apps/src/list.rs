@@ -2,7 +2,7 @@
 //! and location"), read and edited without losing anything: comments, order
 //! and unknown groups stay as written.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt;
 use std::fs::DirBuilder;
 use std::io;
@@ -10,11 +10,13 @@ use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use xdg_kit_basedir::__hashed::{Pair, Set};
 use xdg_kit_basedir::BaseDirs;
 use xdg_kit_desktop_entry::{KeyFile, KeyNames};
 use xdg_kit_mime::MimeDatabase;
 
 use crate::error::{quoted, quoted_pair};
+use crate::work::{Pattern, Text};
 use crate::{Diagnostic, Limits, TypePattern, work};
 
 /// The name of a file that may hold every group; desktop-specific ones
@@ -283,14 +285,15 @@ impl MimeAppsList {
     #[must_use]
     pub fn ids(&self, group: Group, pattern: &TypePattern) -> Vec<String> {
         let mut ids: Vec<String> = Vec::new();
-        let mut seen = HashSet::new();
+        let mut seen = Set::<Text>::new();
         for key in self.keys_for(group, pattern) {
             // A step per key.
             work::count(1);
             for id in self.items(group, key) {
-                // Copied, hashed and compared for the repeat check.
-                work::count(1 + 3 * id.len());
-                if seen.insert(id.clone()) {
+                // The repeat check; the set counts each byte hashed,
+                // compared on a match and copied if new.
+                work::count(1);
+                if seen.insert(&id) {
                     ids.push(id);
                 }
             }
@@ -413,16 +416,16 @@ impl MimeAppsList {
                         ),
                     );
                 } else if read {
-                    let mut seen = HashSet::new();
+                    let mut seen = Set::<Text>::new();
                     for id in self.items(group, key) {
                         // Looked through for a `/`.
                         work::count(1 + id.len());
                         if !id.contains('/') {
                             continue;
                         }
-                        // Copied, hashed and compared for the repeat check.
-                        work::count(3 * id.len());
-                        if seen.insert(id.clone()) {
+                        // The repeat check: the set counts each byte hashed,
+                        // compared on a match and copied if new.
+                        if seen.insert(&id) {
                             // Copied with `-` in place of `/`.
                             work::count(2 * id.len());
                             let dashed = id.replace('/', "-");
@@ -469,17 +472,20 @@ impl MimeAppsList {
     /// however the keys spell it, once per type and ID.
     fn conflicts(&self, report: &mut impl FnMut(Group, &str, Option<&str>, String)) {
         // The removed IDs of each type, however the keys spell it.
-        let mut removed: HashMap<TypePattern, HashSet<String>> = HashMap::new();
+        let mut removed: HashMap<TypePattern, Set<Text>> = HashMap::new();
         for (pattern, ids) in self.entries(Group::Removed) {
             let resolved = self.resolve(&pattern);
-            // The type hashed and compared; each ID hashed and compared
-            // into the set.
+            // The type hashed and compared; a step per ID, whose bytes the
+            // set counts (hashed, and compared on a match).
             work::count(2 * resolved.text_len());
-            work::count_with(|| ids.iter().map(|id| 1 + 2 * id.len()).sum());
-            removed.entry(resolved).or_default().extend(ids);
+            work::count(ids.len());
+            let set = removed.entry(resolved).or_default();
+            for id in ids {
+                set.insert_owned(id);
+            }
         }
         // Once per type and ID, however many spellings the key has.
-        let mut reported = HashSet::new();
+        let mut reported = Set::<Pair<Pattern, Text>>::new();
         for (key, pattern) in self.patterns(Group::Added) {
             let resolved = self.resolve(&pattern);
             // Hashed and compared.
@@ -488,14 +494,15 @@ impl MimeAppsList {
                 continue;
             };
             for id in self.items(Group::Added, key) {
-                // Hashed and compared to look it up.
-                work::count(1 + 2 * id.len());
+                // The lookup; the set counts each byte hashed, and compared
+                // on a match.
+                work::count(1);
                 if !removed.contains(&id) {
                     continue;
                 }
-                // The type and ID copied, hashed and compared.
-                work::count(3 * (resolved.text_len() + id.len()));
-                if !reported.insert((resolved.clone(), id.clone())) {
+                // The set counts the type and ID hashed, compared on a
+                // match and copied if new.
+                if !reported.insert((&resolved, &id)) {
                     continue;
                 }
                 // The type written out to be shown.
@@ -750,6 +757,32 @@ fn check_id(id: &str) -> Result<(), EditError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_long_id_is_hashed_once_as_more_arrive() {
+        use std::fmt::Write as _;
+        // One long ID, then many short distinct ones for one type: the
+        // repeat check of `ids` hashes the long ID's text once, and feeds
+        // its hasher eight bytes per ID moved as it grows.
+        let long = "l".repeat(1 << 20);
+        let n = 1 << 12;
+        let mut text = format!("[Default Applications]\ntext/plain={long}.desktop;");
+        for at in 0..n {
+            let _ = write!(text, "a{at}.desktop;");
+        }
+        text.push('\n');
+        let list = MimeAppsList::parse(text.as_bytes(), false);
+        let before = xdg_kit_basedir::__hashed::fed();
+        let ids = list.ids(Group::Defaults, &p("text/plain"));
+        let fed = xdg_kit_basedir::__hashed::fed() - before;
+        assert_eq!(ids.len(), n + 1);
+        assert!(fed >= 8 * n, "{fed} bytes fed for {n} IDs");
+        assert!(
+            fed < long.len() / 4,
+            "{fed} bytes fed beside an ID of {} bytes",
+            long.len()
+        );
+    }
 
     fn p(text: &str) -> TypePattern {
         TypePattern::parse(text).unwrap()

@@ -1,14 +1,14 @@
-use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::fs::DirBuilder;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 
+use crate::__hashed::{PathKey, Set};
 use crate::error::quoted;
 use crate::paths::{check_relative, normalize};
 use crate::runtime::{self, RuntimeDirProblem};
-use crate::work;
+use crate::work::{self, Counted};
 use crate::{Diagnostic, Error, Limits};
 
 /// What [`BaseDirs::read_config`] and [`BaseDirs::read_data`] found.
@@ -405,7 +405,7 @@ fn list(
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    let mut seen = HashSet::new();
+    let mut seen = Set::<PathKey<Counted>>::new();
     if let Some(value) = vars(name) {
         for item in value.as_bytes().split(|&byte| byte == b':') {
             // The item, and each byte the split went over.
@@ -416,9 +416,10 @@ fn list(
             }
             if item.is_absolute() {
                 let item = normalize(item);
-                // The check, and each byte copied, hashed and compared.
-                work::count(1 + 3 * item.as_os_str().len());
-                if seen.insert(item.clone()) {
+                // The check; the set counts each byte hashed, compared on a
+                // match and copied if new.
+                work::count(1);
+                if seen.insert(&item) {
                     dirs.push(item);
                 }
             } else {

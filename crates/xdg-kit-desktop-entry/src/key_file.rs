@@ -11,11 +11,10 @@
 //! `gkeyfile.c`: a repeated group continues the first one, and a repeated
 //! key's last value counts. Both produce diagnostics.
 
-use std::borrow::Borrow;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::fs::{self, OpenOptions};
-use std::hash::{BuildHasher, Hash, Hasher, RandomState};
+use std::hash::{BuildHasher, Hash};
 use std::io::{self, Write};
 use std::marker::PhantomData;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -23,6 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use xdg_kit_basedir::__hashed as hashed;
 use xdg_kit_locale::Locales;
 
 use crate::error::quoted;
@@ -366,143 +366,75 @@ impl Text for (u64, Box<str>) {
     }
 }
 
-/// An index key's text ([`Text`]) and cached hash. The index's [`Seed`]
-/// computes the hash during lookup, before insertion ([`Lookup::to_owned`]).
-/// Maps hash only this number ([`UseCached`]), so growth and shrinking cost
-/// one step per entry regardless of text length. Cloning copies both the
-/// text and its hash.
-///
-/// [`Lookup`] borrows names without copying them. Both forms expose a
-/// [`View`] with the same hashing and equality rules: hash the cached
-/// number, then compare text when hashes match. Text comparisons count one
-/// step per byte; equal hashes alone do not make keys equal.
-#[derive(Clone)]
-struct Hashed<T> {
-    hash: u64,
-    text: T,
-}
+/// The kind of an index key stored as `T` and looked up by its [`Parts`]:
+/// the index's maps are maps keyed by text of the shared kind
+/// ([`hashed`]), which hash a key's names once, when a lookup is made (a
+/// step per byte), and compare names only on equal hashes (a step per byte
+/// compared). Growing and shrinking take the hashes the keys carry, a step
+/// per entry, whatever their length.
+struct Key<T>(PhantomData<fn() -> T>);
 
-impl<T: Text> Hashed<T> {
-    /// The bytes of its names.
-    fn bytes(&self) -> usize {
-        self.text.parts().bytes()
+impl<T: Text> hashed::Kind for Key<T> {
+    type Owned = T;
+    type View<'a>
+        = Parts<'a>
+    where
+        Self: 'a;
+
+    fn view<'a>(owned: &'a T) -> Parts<'a>
+    where
+        Self: 'a,
+    {
+        owned.parts()
+    }
+
+    fn shorten<'s, 'l: 's>(view: Parts<'l>) -> Parts<'s>
+    where
+        Self: 'l,
+    {
+        view
+    }
+
+    fn same(a: Parts<'_>, b: Parts<'_>) -> bool {
+        a == b
+    }
+
+    fn bytes(view: Parts<'_>) -> usize {
+        view.bytes()
+    }
+
+    fn count(steps: impl FnOnce() -> usize) {
+        work::count_with(steps);
     }
 }
 
-/// Its text only: the hash, random from run to run, is left out.
-impl<T: fmt::Debug> fmt::Debug for Hashed<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.text.fmt(f)
-    }
-}
-
-/// A borrowed lookup in a map keyed by [`Hashed`] text. Holds the names as
-/// [`Parts`] and their hash, computed with the stored key's [`Seed`].
-struct Lookup<'a, T> {
-    hash: u64,
-    parts: Parts<'a>,
-    text: PhantomData<fn() -> T>,
-}
-
-impl<'a, T: Text> Lookup<'a, T> {
-    /// What a map is searched with.
-    fn view(&self) -> &(dyn View<T> + 'a) {
-        self
-    }
-
-    /// Builds a stored key by copying the names (one step per byte) and
-    /// keeping the hash. The parts must match the key type's shape
-    /// ([`Text`]), as [`Seed`]'s lookups do. A key that discards any lookup
-    /// parts would no longer match that lookup.
-    fn to_owned(&self) -> Hashed<T> {
-        work::count(self.parts.bytes());
-        let text = T::from_parts(self.parts);
+/// Builds a stored key from a lookup's parts. They must match the key
+/// type's shape ([`Text`]), as [`Seed`]'s lookups do: a key that discards
+/// any lookup parts would no longer match that lookup.
+impl<T: Text> hashed::Copied for Key<T> {
+    fn to_owned<'a>(view: Parts<'a>) -> T
+    where
+        Self: 'a,
+    {
+        let text = T::from_parts(view);
         debug_assert_eq!(
             text.parts(),
-            self.parts,
+            view,
             "a lookup of a shape its kind of key does not take"
         );
-        Hashed {
-            hash: self.hash,
-            text,
-        }
+        text
     }
 }
 
-/// A key of a map keyed by [`Hashed`] text, stored or looked up: its cached
-/// hash and its text. The two forms hash and compare alike, as their views
-/// do ([`Borrow`]).
-trait View<T> {
-    fn cached(&self) -> u64;
-    fn parts(&self) -> Parts<'_>;
-}
+/// An index key's text ([`Text`]) and cached hash.
+type Hashed<T> = hashed::Hashed<Key<T>>;
 
-impl<T: Text> View<T> for Hashed<T> {
-    fn cached(&self) -> u64 {
-        self.hash
-    }
-
-    fn parts(&self) -> Parts<'_> {
-        self.text.parts()
-    }
-}
-
-impl<T> View<T> for Lookup<'_, T> {
-    fn cached(&self) -> u64 {
-        self.hash
-    }
-
-    fn parts(&self) -> Parts<'_> {
-        self.parts
-    }
-}
-
-impl<T> Hash for dyn View<T> + '_ {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        state.write_u64(self.cached());
-    }
-}
-
-impl<T> PartialEq for dyn View<T> + '_ {
-    fn eq(&self, other: &Self) -> bool {
-        self.cached() == other.cached() && {
-            let (parts, others) = (self.parts(), other.parts());
-            // A step per byte compared.
-            work::count(parts.bytes().min(others.bytes()));
-            parts == others
-        }
-    }
-}
-
-impl<T> Eq for dyn View<T> + '_ {}
-
-/// The stored key lends its view, so that a map keyed by it is searched by
-/// a [`Lookup`], which copies nothing.
-impl<'a, T: Text> Borrow<dyn View<T> + 'a> for Hashed<T> {
-    fn borrow(&self) -> &(dyn View<T> + 'a) {
-        self
-    }
-}
-
-/// As its view hashes.
-impl<T: Text> Hash for Hashed<T> {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        state.write_u64(self.hash);
-    }
-}
-
-/// As its view compares.
-impl<T: Text> PartialEq for Hashed<T> {
-    fn eq(&self, other: &Self) -> bool {
-        let (view, other): (&dyn View<T>, &dyn View<T>) = (self, other);
-        view == other
-    }
-}
-
-impl<T: Text> Eq for Hashed<T> {}
+/// A borrowed lookup in a map keyed by [`Hashed`] text: the names as
+/// [`Parts`] and their hash, computed with the stored key's [`Seed`].
+type Lookup<'a, T> = hashed::Lookup<'a, Key<T>>;
 
 /// A map keyed by [`Hashed`] text.
-type ByText<K, V> = HashMap<Hashed<K>, V, UseCached>;
+type ByText<K, V> = hashed::ByText<Key<K>, V>;
 
 /// Applies `change` to the value of `key` in `map`. If the key is absent,
 /// inserts the default value first. Copies the key's text only on insertion
@@ -524,19 +456,14 @@ fn change_or_add<T: Text, V: Default>(
 /// The index's random hash seed prevents choosing colliding names in
 /// advance. Clones preserve it so lookups agree with the copied keys' hashes.
 #[derive(Debug, Clone, Default)]
-struct Seed(RandomState);
+struct Seed(hashed::Seed);
 
 impl Seed {
     /// A lookup of `parts`, hashed with a step per byte. Stored keys are
     /// made from lookups ([`Lookup::to_owned`]), so that a key and a lookup
     /// of the same text have the same hash.
     fn lookup<'a, T: Text>(&self, parts: Parts<'a>) -> Lookup<'a, T> {
-        work::count(parts.bytes());
-        Lookup {
-            hash: self.0.hash_one(parts),
-            parts,
-            text: PhantomData,
-        }
+        self.0.lookup::<Key<T>>(parts)
     }
 
     fn name<'a>(&self, name: &'a str) -> Lookup<'a, Box<str>> {
@@ -569,69 +496,6 @@ impl Seed {
             first: locale,
             second: None,
         })
-    }
-}
-
-/// Builds hashers for maps keyed by [`Hashed`] text. Each uses the key's
-/// cached hash directly, so hashing a key costs one step.
-#[derive(Debug, Clone, Copy, Default)]
-struct UseCached;
-
-impl BuildHasher for UseCached {
-    type Hasher = Cached;
-
-    fn build_hasher(&self) -> Cached {
-        Cached(0)
-    }
-}
-
-/// Uses the single number written by a [`Hashed`] key's [`View`] as its
-/// hash. Additional writes are a bug, checked by tests, but are still folded
-/// into the hash.
-#[derive(Debug)]
-struct Cached(u64);
-
-#[cfg(test)]
-thread_local! {
-    /// The bytes written to [`Cached`] hashers on this thread, in tests.
-    #[allow(
-        clippy::missing_const_for_thread_local,
-        reason = "already const; clippy flags it on targets without native thread locals (Android, OpenBSD, illumos)"
-    )]
-    static FED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-impl Cached {
-    /// Notes `bytes` bytes written, in tests.
-    fn fed(bytes: usize) {
-        #[cfg(test)]
-        FED.with(|fed| fed.set(fed.get() + bytes));
-        #[cfg(not(test))]
-        let _ = bytes;
-    }
-}
-
-impl Hasher for Cached {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        #[cfg(test)]
-        {
-            let _ = bytes;
-            panic!("only a cached hash is written to the hasher of a map keyed by text");
-        }
-        #[cfg(not(test))]
-        for &byte in bytes {
-            self.0 = self.0.rotate_left(8) ^ u64::from(byte);
-        }
-    }
-
-    fn write_u64(&mut self, hash: u64) {
-        Self::fed(8);
-        // The hash itself when it is the first thing written.
-        self.0 = self.0.rotate_left(32) ^ hash;
     }
 }
 
@@ -782,7 +646,7 @@ impl KeyLines {
 /// tracked by its number, so removing gaps can move items without hashing
 /// them again.
 #[derive(Debug, Clone)]
-struct Listed<T> {
+struct Listed<T: Text> {
     /// The items with their numbers, and gaps.
     items: Vec<Option<(u64, Hashed<T>)>>,
     /// Each item's number.
@@ -795,7 +659,7 @@ struct Listed<T> {
     next: u64,
 }
 
-impl<T> Default for Listed<T> {
+impl<T: Text> Default for Listed<T> {
     fn default() -> Self {
         Self {
             items: Vec::new(),
@@ -862,7 +726,7 @@ impl<T: Text + Clone> Listed<T> {
     /// The items in order, with a step per item or gap.
     fn iter(&self) -> impl Iterator<Item = &T> {
         work::count(self.items.len());
-        self.items.iter().flatten().map(|(_, item)| &item.text)
+        self.items.iter().flatten().map(|(_, item)| item.owned())
     }
 
     fn is_empty(&self) -> bool {
@@ -1428,7 +1292,7 @@ impl KeyFile {
                             group = Some(found[0]);
                             let problem = format!(
                                 "group [{}] appears again; its entries join the first one",
-                                quoted(name.parts.first.unwrap_or_default())
+                                quoted(name.text().first.unwrap_or_default())
                             );
                             work::count(problem.len());
                             problems.push((at, problem));
@@ -2259,7 +2123,7 @@ impl KeyFile {
     /// used or not.
     #[cfg(test)]
     fn room(&self) -> usize {
-        fn listed<T>(listed: &Listed<T>) -> usize {
+        fn listed<T: Text>(listed: &Listed<T>) -> usize {
             listed.items.capacity() + listed.numbers.capacity() + listed.at.capacity()
         }
         let blocks: usize = self
@@ -2652,8 +2516,9 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// is a library call such as `find` or `from_utf8` (counted by the bytes
 /// it may walk). So does each character of input text copied (`to_owned`,
 /// `clone`, `format!`), hashed or compared with other input, and each byte
-/// of a message that input is written into. The index's maps keyed by text
-/// hash a name once, when the key looked up or stored is built (a step per
+/// of a message that input is written into. The index's maps keyed by text,
+/// and this crate's other maps and sets keyed by text
+/// (`xdg_kit_basedir::__hashed`'s, as the index's are), hash a name once, when the key looked up or stored is built (a step per
 /// byte, counted there), and compare its text only with a key of the same
 /// hash (a step per byte compared, counted by the comparison); a map
 /// growing or shrinking takes the hashes its keys carry, a step per entry,
@@ -2685,6 +2550,22 @@ pub(crate) mod work {
         #[cfg(not(any(test, feature = "__count-work")))]
         let _ = steps;
     }
+
+    /// Counts the work of the shared maps keyed by text
+    /// ([`xdg_kit_basedir::__hashed`]) on this crate's counter.
+    pub(crate) struct Counted;
+
+    impl xdg_kit_basedir::__hashed::Count for Counted {
+        fn count(steps: impl FnOnce() -> usize) {
+            count_with(steps);
+        }
+    }
+
+    /// Text keys, counted here.
+    pub(crate) type Text = xdg_kit_basedir::__hashed::Str<Counted>;
+
+    /// Path keys, counted here.
+    pub(crate) type PathKey = xdg_kit_basedir::__hashed::PathKey<Counted>;
 
     /// Counts the steps `steps` works out, calling it only when counting,
     /// so that working them out costs nothing otherwise.
@@ -2747,7 +2628,10 @@ pub(crate) mod work {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::borrow::Borrow;
     use std::time::{Duration, Instant};
+
+    use xdg_kit_basedir::__hashed::{UseCached, View};
 
     const SAMPLE: &str = "# A comment\n\
         [Desktop Entry]\n\
@@ -3841,19 +3725,15 @@ mod tests {
         other: &Lookup<'_, T>,
     ) {
         let key = stored.to_owned();
-        assert_eq!(key.text.parts(), same.parts);
-        let hash = |view: &dyn View<T>| UseCached.hash_one(view);
+        assert_eq!(key.owned().parts(), same.text());
+        let hash = |view: &dyn View<Key<T>>| UseCached.hash_one(view);
         assert_eq!(UseCached.hash_one(&key), hash(same.view()));
         assert_eq!(hash(key.borrow()), hash(same.view()));
-        assert!(Borrow::<dyn View<T>>::borrow(&key) == same.view());
+        assert!(Borrow::<dyn View<Key<T>>>::borrow(&key) == same.view());
         assert!(key == same.to_owned());
-        assert!(Borrow::<dyn View<T>>::borrow(&key) != other.view());
-        let collides = Lookup::<T> {
-            hash: key.hash,
-            parts: other.parts,
-            text: PhantomData,
-        };
-        assert!(Borrow::<dyn View<T>>::borrow(&key) != collides.view());
+        assert!(Borrow::<dyn View<Key<T>>>::borrow(&key) != other.view());
+        let collides = Lookup::<T>::with_hash(stored.hash(), other.text());
+        assert!(Borrow::<dyn View<Key<T>>>::borrow(&key) != collides.view());
         assert!(key != collides.to_owned());
         let map: ByText<T, usize> = HashMap::from_iter([(key, 0)]);
         assert!(map.contains_key(same.view()));
@@ -3905,8 +3785,8 @@ mod tests {
         );
         // A clone of the seed hashes as the seed does.
         assert_eq!(
-            seed.clone().name("Desktop Entry").hash,
-            seed.name(&name).hash
+            seed.clone().name("Desktop Entry").hash(),
+            seed.name(&name).hash()
         );
     }
 
@@ -3915,14 +3795,15 @@ mod tests {
         // Equal hashes do not make names equal: a map holding names of one
         // hash keeps each, and finds each by comparing its text, with a
         // step per byte compared.
-        let lookup = |text: &'static str| Lookup::<Box<str>> {
-            hash: 7,
-            parts: Parts {
-                number: 0,
-                first: Some(text),
-                second: None,
-            },
-            text: PhantomData,
+        let lookup = |text: &'static str| {
+            Lookup::<Box<str>>::with_hash(
+                7,
+                Parts {
+                    number: 0,
+                    first: Some(text),
+                    second: None,
+                },
+            )
         };
         let mut map: ByText<Box<str>, usize> = HashMap::default();
         for (at, text) in ["first", "second", "third"].into_iter().enumerate() {
@@ -3973,12 +3854,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "only a cached hash is written")]
-    fn the_maps_hasher_takes_only_a_cached_hash() {
-        UseCached.build_hasher().write(b"text");
-    }
-
-    #[test]
     fn the_maps_hasher_is_fed_a_number_per_key_whatever_the_names() {
         // The maps' hasher is given eight bytes per key hashed, whatever
         // the key's text: a name of a MiB kept while short ones come and go
@@ -3988,9 +3863,9 @@ mod tests {
         // time it took it in, grew or shrank: more than a MiB.
         let long = 1 << 20;
         let fed = |kept, long| {
-            let before = FED.with(std::cell::Cell::get);
+            let before = hashed::fed();
             long_name_kept(kept, long, 4);
-            FED.with(std::cell::Cell::get) - before
+            hashed::fed() - before
         };
         for kept in [Kept::Key, Kept::Group, Kept::Locale] {
             let (short, beside_long) = (fed(kept, 1), fed(kept, long));

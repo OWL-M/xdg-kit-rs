@@ -4,14 +4,14 @@
 //! the reference parser that xdg-user-dirs ships for applications
 //! (`src/xdg-user-dir-lookup.c`).
 
-use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
+use crate::__hashed::{Map, Str};
 use crate::paths::normalize;
-use crate::work;
+use crate::work::{self, Counted};
 use crate::{BaseDirs, Diagnostic, Limits};
 
 /// A user folder, by its name in `user-dirs.dirs` (`XDG_<NAME>_DIR`).
@@ -87,7 +87,7 @@ pub struct UserDirs {
     dirs: Vec<(UserDirKind, PathBuf)>,
     // Where each name is in `dirs`. A name is its kind's name, so this
     // matches kinds as lookups do.
-    index: HashMap<String, usize>,
+    index: Map<Str<Counted>, usize>,
     diagnostics: Vec<Diagnostic>,
 }
 
@@ -150,22 +150,24 @@ impl UserDirs {
     #[must_use]
     pub fn from_bytes(home: &Path, contents: &[u8]) -> Self {
         let mut dirs: Vec<(UserDirKind, PathBuf)> = Vec::new();
-        let mut index: HashMap<String, usize> = HashMap::new();
+        let mut index = Map::<Str<Counted>, usize>::new();
         for line in contents.split(|&byte| byte == b'\n') {
             // The line, and each byte the split went over.
             work::count(1 + line.len());
             let Some((name, path)) = parse_line(home, line) else {
                 continue;
             };
-            // The lookup, and each byte of the name hashed and compared.
-            work::count(1 + 2 * name.len());
-            if let Some(&at) = index.get(name) {
+            // The lookup; the map counts each byte of the name hashed, and
+            // compared on a match.
+            work::count(1);
+            let lookup = index.lookup(name);
+            if let Some(&at) = index.get_at(&lookup) {
                 dirs[at].1 = path;
             } else {
-                // Each byte of a new name copied into the key and the kind,
-                // and hashed and compared again to insert it.
-                work::count(4 * name.len());
-                index.insert(name.to_owned(), dirs.len());
+                // Each byte of a new name copied into the kind; the map
+                // counts its copy into the key.
+                work::count(name.len());
+                index.insert_at(&lookup, dirs.len());
                 dirs.push((UserDirKind::from_name(name), path));
             }
         }
@@ -220,8 +222,9 @@ impl UserDirs {
     }
 
     fn set(&self, kind: &UserDirKind) -> Option<&Path> {
-        // The lookup, and each byte of the name hashed and compared.
-        work::count(1 + 2 * kind.name().len());
+        // The lookup; the map counts each byte of the name hashed, and
+        // compared on a match.
+        work::count(1);
         self.index
             .get(kind.name())
             .map(|&at| self.dirs[at].1.as_path())
@@ -309,6 +312,30 @@ fn trim_blanks_end(bytes: &[u8]) -> &[u8] {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_long_name_is_hashed_once_as_more_arrive() {
+        use std::fmt::Write as _;
+        // One long name, then many short distinct ones: the index hashes
+        // the long name's text once, and feeds its hasher eight bytes per
+        // name moved as it grows, whatever its length.
+        let long = "L".repeat(1 << 20);
+        let n = 1 << 12;
+        let mut contents = format!("XDG_{long}_DIR=\"$HOME/l\"\n");
+        for at in 0..n {
+            let _ = writeln!(contents, "XDG_N{at}_DIR=\"$HOME/{at}\"");
+        }
+        let before = crate::__hashed::fed();
+        let dirs = UserDirs::from_bytes(Path::new(HOME), contents.as_bytes());
+        let fed = crate::__hashed::fed() - before;
+        assert!(fed >= 8 * n, "{fed} bytes fed for {n} names");
+        assert!(
+            fed < long.len() / 4,
+            "{fed} bytes fed beside a name of {} bytes",
+            long.len()
+        );
+        assert_eq!(dirs.dirs.len(), n + 1);
+    }
+
     use std::fs;
 
     use super::*;

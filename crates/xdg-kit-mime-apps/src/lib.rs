@@ -63,8 +63,10 @@ pub use pattern::{MediaType, TypePattern};
 /// `contains` or `trim` (counted by the bytes it may walk). So does each
 /// character of input text copied (`to_owned`, `clone`, `format!`, a
 /// media type made from text), hashed (a set or map key inserted or looked
-/// up: hashed and compared, two steps per byte) or compared with other
-/// input, and each byte of a message that input is written into. Comparing
+/// up: hashed and compared, two steps per byte; maps and sets keyed by
+/// text are `xdg_kit_basedir::__hashed`'s, which count that themselves on
+/// this counter and grow a step per entry moved, whatever the keys'
+/// length) or compared with other input, and each byte of a message that input is written into. Comparing
 /// with a fixed name (a literal) is bounded by that name and not counted;
 /// nor is file I/O. A new loop over input on such a path must count its
 /// steps too.
@@ -95,6 +97,72 @@ pub(crate) mod work {
         xdg_kit_desktop_entry::__count_work::count(steps);
         #[cfg(not(test))]
         let _ = steps;
+    }
+
+    /// Counts the work of the shared maps keyed by text
+    /// ([`xdg_kit_basedir::__hashed`]) on this crate's counter.
+    pub(crate) struct Counted;
+
+    impl xdg_kit_basedir::__hashed::Count for Counted {
+        fn count(steps: impl FnOnce() -> usize) {
+            count_with(steps);
+        }
+    }
+
+    /// Text keys, counted here.
+    pub(crate) type Text = xdg_kit_basedir::__hashed::Str<Counted>;
+
+    /// Text borrowed as a key for the life of a set, counted here.
+    pub(crate) type Borrowed<'a> = xdg_kit_basedir::__hashed::Ref<'a, str, Counted>;
+
+    /// A path borrowed as a key for the life of a map, counted here.
+    pub(crate) type BorrowedPath<'a> = xdg_kit_basedir::__hashed::Ref<'a, std::path::Path, Counted>;
+
+    /// Type patterns as keys, counted here: one of at most 255 bytes, a
+    /// step per byte of its text.
+    pub(crate) struct Pattern;
+
+    impl xdg_kit_basedir::__hashed::Kind for Pattern {
+        type Owned = crate::TypePattern;
+        type View<'a>
+            = &'a crate::TypePattern
+        where
+            Self: 'a;
+
+        fn view<'a>(owned: &'a crate::TypePattern) -> &'a crate::TypePattern
+        where
+            Self: 'a,
+        {
+            owned
+        }
+
+        fn shorten<'s, 'l: 's>(view: &'l crate::TypePattern) -> &'s crate::TypePattern
+        where
+            Self: 'l,
+        {
+            view
+        }
+
+        fn same(a: &crate::TypePattern, b: &crate::TypePattern) -> bool {
+            a == b
+        }
+
+        fn bytes(view: &crate::TypePattern) -> usize {
+            view.text_len()
+        }
+
+        fn count(steps: impl FnOnce() -> usize) {
+            count_with(steps);
+        }
+    }
+
+    impl xdg_kit_basedir::__hashed::Copied for Pattern {
+        fn to_owned<'a>(view: &'a crate::TypePattern) -> crate::TypePattern
+        where
+            Self: 'a,
+        {
+            view.clone()
+        }
     }
 
     /// Counts the steps `steps` works out, calling it only in tests, so

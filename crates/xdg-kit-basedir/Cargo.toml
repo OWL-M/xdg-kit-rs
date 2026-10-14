@@ -11,6 +11,13 @@ documentation = "https://docs.rs/xdg-kit-basedir"
 keywords = ["xdg", "freedesktop", "basedir", "user-dirs", "config"]
 categories = ["os::unix-apis", "filesystem", "config"]
 
+[features]
+# Not public API: the count of bytes fed to the hashers of `__hashed`'s
+# maps (`__hashed::fed`), for the workspace's own tests. Turned on by the
+# other crates' dev-dependencies. It may change or go at any time; nothing
+# else should turn it on.
+__count-work = []
+
 [dependencies]
 rustix = { workspace = true, features = ["fs"] }
 

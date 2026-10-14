@@ -5,13 +5,14 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use xdg_kit_basedir::__hashed::{Map, PathKey, Set};
 use xdg_kit_basedir::{BaseDirs, FileStamp};
 
 use crate::fnmatch::Pattern;
 use crate::merge::{self, Merged, Ranked};
 use crate::model::{Folder, Glob, MagicRule};
 use crate::read::{cache, text};
-use crate::work;
+use crate::work::{self, Borrowed, Counted, Text};
 use crate::xml::TypeInfo;
 use crate::{Diagnostic, Limits, MimeType};
 
@@ -191,9 +192,9 @@ pub(crate) struct IndexedMagic {
 pub(crate) struct GlobIndex {
     pub(crate) all: Vec<IndexedGlob>,
     /// Patterns without wildcards, by compared text.
-    pub(crate) literal: HashMap<String, Vec<usize>>,
+    pub(crate) literal: Map<Text, Vec<usize>>,
     /// `*` and a literal tail: by the tail.
-    pub(crate) suffix: HashMap<String, Vec<usize>>,
+    pub(crate) suffix: Map<Text, Vec<usize>>,
     /// The lengths in bytes of the `suffix` tails, each once, shortest
     /// first.
     pub(crate) suffix_lens: Vec<usize>,
@@ -255,16 +256,19 @@ impl GlobIndex {
             let at = index.all.len();
             match pattern_kind(&compared) {
                 PatternKind::Literal => {
-                    // Each byte copied, hashed and compared.
-                    work::count(3 * compared.len());
-                    index.literal.entry(compared.clone()).or_default().push(at);
+                    // The map counts each byte hashed, compared on a match
+                    // and copied if new.
+                    work::count(1);
+                    index
+                        .literal
+                        .get_or_insert_with(&compared, Vec::new)
+                        .push(at);
                 }
                 PatternKind::Suffix => {
-                    work::count(3 * compared.len());
+                    work::count(1);
                     index
                         .suffix
-                        .entry(compared[1..].to_owned())
-                        .or_default()
+                        .get_or_insert_with(&compared[1..], Vec::new)
                         .push(at);
                 }
                 // Folded by the matcher, which keeps sets as written.
@@ -304,8 +308,8 @@ impl GlobIndex {
         }
         index.suffix_lens = index
             .suffix
-            .keys()
-            .map(|suffix| {
+            .iter()
+            .map(|(suffix, _)| {
                 // Each key's length collected.
                 work::count(1);
                 suffix.len()
@@ -440,15 +444,15 @@ impl MimeDatabase {
         // Most important first, as base dirs list them; reversed below.
         // A folder listed again (the data home in `$XDG_DATA_DIRS`) is read
         // once, at its first place.
-        let mut seen = HashSet::new();
+        let mut seen = Set::<PathKey<Counted>>::new();
         let candidates = std::iter::once(base_dirs.data_home())
             .chain(base_dirs.data_dirs().iter().map(PathBuf::as_path))
             .map(|dir| dir.join("mime"))
             .filter(|mime| {
-                // Each byte copied by the join, then copied, hashed and
-                // compared.
-                work::count(1 + 4 * mime.as_os_str().len());
-                seen.insert(mime.clone())
+                // Each byte copied by the join; the set counts each byte
+                // hashed, compared on a match and copied if new.
+                work::count(1 + mime.as_os_str().len());
+                seen.insert(mime)
             })
             .collect();
         Self::from_candidates(candidates, limits)
@@ -816,13 +820,14 @@ impl MimeDatabase {
     #[must_use]
     pub fn patterns_for(&self, mime: &MimeType) -> Vec<String> {
         let mut patterns: Vec<String> = Vec::new();
-        let mut seen: HashSet<&str> = HashSet::new();
+        let mut seen = Set::<Borrowed<'_>>::new();
         let found = self.globs.by_type.get(&self.canonical(mime));
         for &at in found.into_iter().flatten() {
             let pattern = &self.globs.all[at].pattern;
-            // Hashed and compared; copied when new.
-            crate::work::count(1 + 2 * pattern.len());
-            if seen.insert(pattern) {
+            // The set counts each byte hashed, and compared on a match;
+            // copied when new.
+            crate::work::count(1);
+            if seen.insert_owned(pattern) {
                 crate::work::count(pattern.len());
                 patterns.push(pattern.clone());
             }
@@ -961,6 +966,52 @@ fn spellings_in(types: &[MimeType], mime: &MimeType, listed: bool) -> Vec<MimeTy
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_long_pattern_or_namespace_is_hashed_once_as_more_arrive() {
+        use std::fmt::Write as _;
+        // One long literal pattern, suffix and namespace, then many short
+        // distinct ones: the maps and sets that keep them (literals,
+        // suffixes, namespaces, the repeat check of the globs) hash the
+        // long ones' text once, when they arrive, and feed their hashers
+        // eight bytes per key moved, whatever its length.
+        // Four maps grow here, so their hashers are fed more than in the
+        // other such tests: the long names are longer, so that being fed
+        // any of them once would show.
+        let long = "x".repeat(4 << 20);
+        let n = 1 << 12;
+        let mut globs = format!("50:text/x-a:{long}\n50:text/x-a:*.{long}\n");
+        let mut namespaces = format!("urn:{long} r text/x-a\n");
+        for at in 0..n {
+            let _ = writeln!(globs, "50:text/x-a:n{at}\n50:text/x-a:*.s{at}");
+            let _ = writeln!(namespaces, "urn:{at} r text/x-a");
+        }
+        let before = xdg_kit_basedir::__hashed::fed();
+        let db = crate::MimeDatabase::from_files(&[vec![
+            ("globs2", globs.as_bytes()),
+            ("XMLnamespaces", namespaces.as_bytes()),
+        ]]);
+        let fed = xdg_kit_basedir::__hashed::fed() - before;
+        assert!(
+            fed >= 8 * 3 * n,
+            "{fed} bytes fed for {n} names of each kind"
+        );
+        assert!(
+            fed < long.len() / 2,
+            "{fed} bytes fed beside names of {} bytes",
+            long.len()
+        );
+        let found = |name: &str| db.type_for_name(name).best().map(|found| found.mime);
+        assert_eq!(
+            found(&long).as_ref().map(MimeType::as_str),
+            Some("text/x-a")
+        );
+        assert_eq!(found("n7").as_ref().map(MimeType::as_str), Some("text/x-a"));
+        assert_eq!(
+            found("f.s7").as_ref().map(MimeType::as_str),
+            Some("text/x-a")
+        );
+    }
+
     /// Files of two folders: globs, aliases, parents (with a loop),
     /// magic and XML namespaces, the second folder deleting a glob of the
     /// first.

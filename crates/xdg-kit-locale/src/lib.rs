@@ -19,9 +19,10 @@
 //! assert_eq!(keys, ["de_DE@euro", "de_DE", "de@euro", "de"]);
 //! ```
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fmt;
+use std::hash::{BuildHasher, Hash, RandomState};
 
 mod work;
 
@@ -132,6 +133,30 @@ impl fmt::Display for Locale {
     }
 }
 
+/// `items` in order, each kept once, as they arrive: what is held grows
+/// with the items kept, not with repeats. A set of the items kept would
+/// hash each again every time it grew (a long one about log2 n times
+/// among n); this map is keyed by each item's hash, computed once with a
+/// random seed, so growing it costs a step per entry, however long the
+/// items. An item is compared only with kept ones of its hash. `len`
+/// measures an item for the work counter.
+fn once_each<T: Hash + Eq>(items: impl Iterator<Item = T>, len: impl Fn(&T) -> usize) -> Vec<T> {
+    let seed = RandomState::new();
+    let mut kept: Vec<T> = Vec::new();
+    let mut by_hash: HashMap<u64, Vec<usize>> = HashMap::new();
+    for item in items {
+        // Hashed once, and compared with each kept item of its hash: two
+        // steps per byte, and a step.
+        work::count(1 + 2 * len(&item));
+        let places = by_hash.entry(seed.hash_one(&item)).or_default();
+        if !places.iter().any(|&at| kept[at] == item) {
+            places.push(kept.len());
+            kept.push(item);
+        }
+    }
+    kept
+}
+
 /// The user's languages, most preferred first.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Locales {
@@ -198,27 +223,13 @@ impl Locales {
     /// The given languages, most preferred first. Names that cannot be
     /// parsed, and repeats, are skipped.
     pub fn new(names: impl IntoIterator<Item = impl AsRef<str>>) -> Self {
-        // Each kept in order, and once: a set of those seen beside each.
-        let mut locales: Vec<Locale> = Vec::new();
-        let mut seen: HashSet<Locale> = HashSet::new();
-        for locale in names
-            .into_iter()
-            .filter_map(|name| Locale::parse(name.as_ref()))
-        {
-            // Cloned, hashed and compared: three steps per byte.
-            work::count(1 + 3 * locale.len());
-            if seen.insert(locale.clone()) {
-                locales.push(locale);
-            }
-        }
-        let mut keys: Vec<String> = Vec::new();
-        let mut seen: HashSet<String> = HashSet::new();
-        for key in locales.iter().flat_map(Locale::variants) {
-            work::count(1 + 3 * key.len());
-            if seen.insert(key.clone()) {
-                keys.push(key);
-            }
-        }
+        let locales = once_each(
+            names
+                .into_iter()
+                .filter_map(|name| Locale::parse(name.as_ref())),
+            Locale::len,
+        );
+        let keys = once_each(locales.iter().flat_map(Locale::variants), String::len);
         Self { locales, keys }
     }
 

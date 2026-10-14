@@ -11,7 +11,16 @@
 //!
 //! Copying input (`to_owned`, `clone`, `join`, pushing a byte) counts one
 //! step per byte. Hashing and comparing a set or map key for insertion or
-//! lookup counts two; copying the key as well counts three. Also count each
+//! lookup counts two; copying the key as well counts three. Maps and sets
+//! keyed by text of unbounded length are `xdg_kit_basedir::__hashed`'s,
+//! which count those steps themselves on this counter ([`Counted`]): a
+//! key's text is hashed once per lookup (a step per byte), compared only
+//! with a key of the same hash (a step per byte compared) and copied only
+//! when stored (a step per byte); growing takes the hashes the keys carry,
+//! a step per entry moved, whatever their length, amortized into the step
+//! each insertion counts. A std map would hash every key it holds again
+//! each time it grew. Keys of bounded length (a `MimeType`, at most 255
+//! bytes) may stay in std maps. Also count each
 //! byte compared with other input and each byte of a message containing
 //! input. Comparisons of two [`MimeType`](crate::MimeType)s count the bytes
 //! compared, like other input comparisons. Comparisons with fixed names
@@ -107,6 +116,22 @@ pub(crate) fn count(steps: usize) {
     #[cfg(not(test))]
     let _ = steps;
 }
+
+/// Counts the work of the shared maps keyed by text
+/// ([`xdg_kit_basedir::__hashed`]) on this crate's counter.
+pub(crate) struct Counted;
+
+impl xdg_kit_basedir::__hashed::Count for Counted {
+    fn count(steps: impl FnOnce() -> usize) {
+        count_by(steps);
+    }
+}
+
+/// Text keys, counted here.
+pub(crate) type Text = xdg_kit_basedir::__hashed::Str<Counted>;
+
+/// Text borrowed as a key for the life of a set, counted here.
+pub(crate) type Borrowed<'a> = xdg_kit_basedir::__hashed::Ref<'a, str, Counted>;
 
 /// Evaluates `steps` and counts its result in tests only. Use when
 /// calculating the count requires its own traversal, such as counting

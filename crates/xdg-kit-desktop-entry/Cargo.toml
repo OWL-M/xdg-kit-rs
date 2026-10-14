@@ -36,6 +36,10 @@ libc.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# The hidden `__count-work` feature (not public API): the bytes fed to the
+# hashers of the shared maps keyed by text, for the tests that check a
+# long key is not hashed again as a map grows.
+xdg-kit-basedir = { workspace = true, features = ["__count-work"] }
 # The D-Bus test (tests/dbus.rs) serves a bus through zbus's blocking API.
 zbus = { workspace = true, features = ["blocking-api"] }
 

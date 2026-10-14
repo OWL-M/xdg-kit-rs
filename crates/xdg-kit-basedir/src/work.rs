@@ -10,7 +10,10 @@
 //! (counted by the bytes it may walk). So does each byte of input copied
 //! (`to_owned`, `clone`, `join`, a byte pushed), hashed (a set or map key
 //! inserted or looked up: hashed and compared, two steps per byte) or
-//! compared with other input, and each byte of a message that input is
+//! compared with other input (maps and sets keyed by text are
+//! [`crate::__hashed`]'s, which count their hashing, comparing and copying
+//! on this counter ([`Counted`]) and grow a step per entry moved, whatever
+//! the keys' length; a std map would hash every key again as it grew), and each byte of a message that input is
 //! written into. Comparing with a fixed name (a literal such as `XDG_` or
 //! a known folder name) is bounded by that name and not counted; nor is
 //! file I/O. A new loop over input on such a path must count its steps
@@ -38,6 +41,19 @@ pub(crate) fn count(steps: usize) {
     STEPS.with(|done| done.set(done.get() + steps));
     #[cfg(not(test))]
     let _ = steps;
+}
+
+/// Counts the work of the shared maps keyed by text ([`crate::__hashed`])
+/// on this crate's counter.
+pub(crate) struct Counted;
+
+impl crate::__hashed::Count for Counted {
+    fn count(steps: impl FnOnce() -> usize) {
+        #[cfg(test)]
+        count(steps());
+        #[cfg(not(test))]
+        let _ = steps;
+    }
 }
 
 /// Returns `f`'s result and the number of steps it counted on this thread.

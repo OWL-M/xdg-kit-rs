@@ -6,6 +6,7 @@ use std::ffi::OsString;
 use std::io;
 use std::path::Path;
 
+use xdg_kit_basedir::__hashed::Set;
 use xdg_kit_locale::Locales;
 
 use crate::key_file::work;
@@ -54,16 +55,16 @@ impl Desktops {
     /// The given desktop names, skipping empty names and keeping only the
     /// first occurrence of each name.
     pub fn new(names: impl IntoIterator<Item = impl Into<String>>) -> Self {
-        let mut seen = HashSet::new();
+        let mut seen = Set::<work::Text>::new();
         Self(
             names
                 .into_iter()
                 .map(Into::into)
                 .filter(|name: &String| {
-                    // The repeat check: a step, and the name copied, hashed
-                    // and compared.
-                    work::count(1 + 3 * name.len());
-                    !name.is_empty() && seen.insert(name.clone())
+                    // The repeat check: a step; the set counts each byte
+                    // hashed, compared on a match and copied if new.
+                    work::count(1);
+                    !name.is_empty() && seen.insert(name)
                 })
                 .collect(),
         )
@@ -428,15 +429,15 @@ impl DesktopEntry {
     /// `Actions`: the ids of the application's actions.
     #[must_use]
     pub fn action_ids(&self) -> Vec<String> {
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = Set::<work::Text>::new();
         self.list("Actions")
             .unwrap_or_default()
             .into_iter()
             .filter(|id| {
-                // The repeat check: a step, and the id copied, hashed and
-                // compared.
-                work::count(1 + 3 * id.len());
-                seen.insert(id.clone())
+                // The repeat check: a step; the set counts each byte hashed,
+                // compared on a match and copied if new.
+                work::count(1);
+                seen.insert(id)
             })
             .collect()
     }
@@ -575,6 +576,32 @@ impl Action<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_long_action_id_is_hashed_once_as_more_arrive() {
+        use std::fmt::Write as _;
+        // One long action ID, then many short distinct ones: the repeat
+        // check of `action_ids` hashes the long one's text once, and feeds
+        // its hasher eight bytes per ID moved as it grows.
+        let long = "l".repeat(1 << 20);
+        let n = 1 << 12;
+        let mut text = format!("[Desktop Entry]\nType=Application\nName=A\nActions={long};");
+        for at in 0..n {
+            let _ = write!(text, "a{at};");
+        }
+        text.push('\n');
+        let entry = DesktopEntry::parse(text.as_bytes());
+        let before = xdg_kit_basedir::__hashed::fed();
+        let ids = entry.action_ids();
+        let fed = xdg_kit_basedir::__hashed::fed() - before;
+        assert_eq!(ids.len(), n + 1);
+        assert!(fed >= 8 * n, "{fed} bytes fed for {n} IDs");
+        assert!(
+            fed < long.len() / 4,
+            "{fed} bytes fed beside an ID of {} bytes",
+            long.len()
+        );
+    }
 
     const FOO: &str = "[Desktop Entry]\n\
         Version=1.5\n\

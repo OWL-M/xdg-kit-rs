@@ -2,22 +2,23 @@
 //! Uses the spec's two algorithms to find the applications associated with
 //! a type and its default application.
 
-use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use xdg_kit_basedir::__hashed::{Map, Set};
 use xdg_kit_basedir::{BaseDirs, FileStamp};
 use xdg_kit_desktop_entry::{AppEntry, AppIndex, Desktops, EntryType};
 use xdg_kit_mime::{MimeDatabase, MimeType};
 
 use crate::error::quoted;
 use crate::list::{Group, MIMEAPPS_LIST, MimeAppsList};
+use crate::work::{Borrowed, BorrowedPath, Text};
 use crate::{Diagnostic, Limits, MediaType, TypePattern, work};
 
 /// One step's associations, in order and as a set.
-type Associations<'a> = (Vec<&'a str>, HashSet<&'a str>);
+type Associations<'a> = (Vec<&'a str>, Set<Borrowed<'a>>);
 
 /// How an application matched a type.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,7 +85,7 @@ pub struct MimeApps {
     folder_types: Vec<HashMap<TypePattern, Vec<String>>>,
     /// For each desktop file ID an `AppIndex` folder holds, the last
     /// folder holding it ([`AppIndex::dir_holds`]).
-    held: HashMap<String, usize>,
+    held: Map<Text, usize>,
     try_exec: Option<OsString>,
     /// Problems found before the files were read (desktop names that
     /// cannot name a file); kept across refreshes.
@@ -187,22 +188,23 @@ impl MimeApps {
         // files at its data level, as in `GLib`.
         // For each path, whether a place kept for it is a data level, and
         // for each place whether it is kept and read.
-        let mut known: HashMap<&Path, bool> = HashMap::new();
+        let mut known = Map::<BorrowedPath<'_>, bool>::new();
         let mut keep: Vec<Option<bool>> = Vec::with_capacity(places.len());
         for place in &places {
-            // The path hashed and compared.
-            work::count(1 + 2 * place.path.as_os_str().len());
+            // The lookup; the map counts each byte of the path hashed, and
+            // compared on a match.
+            work::count(1);
             let data = place.applications.is_some();
-            keep.push(match known.entry(&place.path) {
-                Entry::Vacant(entry) => {
-                    entry.insert(data);
+            let lookup = known.lookup(&place.path);
+            keep.push(match known.get_mut_at(&lookup) {
+                None => {
+                    known.insert_owned_at(&lookup, &place.path, data);
                     Some(true)
                 }
-                Entry::Occupied(mut entry) => (!*entry.get() && data && !place.desktop_specific)
-                    .then(|| {
-                        entry.insert(true);
-                        false
-                    }),
+                Some(entry) => (!*entry && data && !place.desktop_specific).then(|| {
+                    *entry = true;
+                    false
+                }),
             });
         }
         let kept = places
@@ -226,19 +228,21 @@ impl MimeApps {
     ) -> Self {
         let dirs = apps.dirs();
         // Each folder's index: the first, should one be listed twice.
-        let mut indexes: HashMap<&Path, usize> = HashMap::new();
+        let mut indexes = Map::<BorrowedPath<'_>, usize>::new();
         for (at, dir) in dirs.iter().enumerate() {
-            // Hashed and compared.
-            work::count(1 + 2 * dir.as_os_str().len());
-            indexes.entry(dir).or_insert(at);
+            // The lookup; the map counts each byte hashed, and compared on
+            // a match.
+            work::count(1);
+            indexes.get_or_insert_owned(dir, || at);
         }
         // For each ID a folder holds, the last folder holding it.
-        let mut held: HashMap<String, usize> = HashMap::new();
+        let mut held = Map::<Text, usize>::new();
         for folder in 0..dirs.len() {
             for id in apps.dir_ids(folder) {
-                // Copied, hashed and compared.
-                work::count(1 + 3 * id.len());
-                held.insert(id.to_owned(), folder);
+                // The map counts each byte hashed, compared on a match and
+                // copied if new.
+                work::count(1);
+                held.insert(id, folder);
             }
         }
         // The problems found before copied.
@@ -397,12 +401,12 @@ impl MimeApps {
     #[must_use]
     pub fn apps_for(&self, mime: &MimeType) -> Vec<AppMatch> {
         let mut found = Vec::new();
-        let mut seen = HashSet::new();
+        let mut seen = Set::<Borrowed<'_>>::new();
         for (step, matched) in self.steps(mime) {
             for id in self.associated(&step).0 {
-                // Hashed and compared.
-                work::count(1 + 2 * id.len());
-                if seen.insert(id)
+                // The set counts each byte hashed, and compared on a match.
+                work::count(1);
+                if seen.insert_owned(id)
                     && let Some(app) = self.installed(id)
                 {
                     // How it matched, copied: a media wildcard's name byte
@@ -615,45 +619,47 @@ impl MimeApps {
     /// applications are installed.
     fn associated(&self, step: &TypePattern) -> Associations<'_> {
         let mut results: Vec<&str> = Vec::new();
-        let mut listed: HashSet<&str> = HashSet::new();
-        let mut excluded: HashSet<&str> = HashSet::new();
+        let mut listed = Set::<Borrowed<'_>>::new();
+        let mut excluded = Set::<Borrowed<'_>>::new();
         for level in &self.levels {
             // The step hashed and compared in each of three maps.
             work::count(1 + 6 * step.text_len());
             for id in level.added.get(step).into_iter().flatten() {
-                // Hashed and compared in each of two sets, then inserted.
-                work::count(1 + 6 * id.len());
+                // Looked up in each of two sets, then inserted; the sets
+                // count each byte hashed, and compared on a match.
+                work::count(1);
                 if !excluded.contains(id.as_str())
                     && !listed.contains(id.as_str())
                     && self.held_from(level.lowest, id)
                 {
-                    listed.insert(id);
+                    listed.insert_owned(id);
                     results.push(id);
                 }
             }
             for id in level.removed.get(step).into_iter().flatten() {
-                // Inserted: hashed and compared.
-                work::count(1 + 2 * id.len());
+                // Inserted; the set counts each byte hashed, and compared
+                // on a match.
+                work::count(1);
                 if self.held_from(level.lowest, id) {
-                    excluded.insert(id);
+                    excluded.insert_owned(id);
                 }
             }
             if let Some(folder) = level.folder {
                 for id in self.folder_types[folder].get(step).into_iter().flatten() {
-                    // Hashed and compared in each of two sets, then
-                    // inserted.
-                    work::count(1 + 6 * id.len());
+                    // Looked up in each of two sets, then inserted; the
+                    // sets count each byte hashed, and compared on a match.
+                    work::count(1);
                     if !excluded.contains(id.as_str()) && !listed.contains(id.as_str()) {
-                        listed.insert(id);
+                        listed.insert_owned(id);
                         results.push(id);
                     }
                 }
-                excluded.extend(
-                    self.apps
-                        .dir_ids(folder)
-                        // Inserted: hashed and compared.
-                        .inspect(|id| work::count(1 + 2 * id.len())),
-                );
+                for id in self.apps.dir_ids(folder) {
+                    // Inserted; the set counts each byte hashed, and
+                    // compared on a match.
+                    work::count(1);
+                    excluded.insert_owned(id);
+                }
             }
         }
         (results, listed)
@@ -661,8 +667,9 @@ impl MimeApps {
 
     /// Whether a folder from `lowest` on holds a desktop file `id`.
     fn held_from(&self, lowest: usize, id: &str) -> bool {
-        // Hashed and compared.
-        work::count(1 + 2 * id.len());
+        // The lookup; the map counts each byte hashed, and compared on a
+        // match.
+        work::count(1);
         self.held.get(id).is_some_and(|&last| last >= lowest)
     }
 

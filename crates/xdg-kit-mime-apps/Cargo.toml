@@ -29,6 +29,10 @@ tempfile.workspace = true
 # src/lib.rs). Dev-dependencies only: it is on when this crate's tests are
 # built, never for those who depend on this crate.
 xdg-kit-desktop-entry = { workspace = true, features = ["__count-work"] }
+# The same feature of basedir: the bytes fed to the hashers of the shared
+# maps keyed by text, for the tests that check a long key is not hashed
+# again as a map grows.
+xdg-kit-basedir = { workspace = true, features = ["__count-work"] }
 
 [lints]
 workspace = true
