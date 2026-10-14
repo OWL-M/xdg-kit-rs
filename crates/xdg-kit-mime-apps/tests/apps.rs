@@ -392,6 +392,76 @@ fn try_exec_counts_when_asked() {
 }
 
 #[test]
+fn associated_apps_are_those_some_type_lists() {
+    let fixture = Fixture::new();
+    fixture.app(
+        "share1/applications",
+        "xkt-own.desktop",
+        "text/x-xkt-plain;",
+        "",
+    );
+    fixture.app("share1/applications", "xkt-added.desktop", "", "");
+    fixture.app(
+        "share1/applications",
+        "xkt-removed.desktop",
+        "image/x-xkt-svg;",
+        "",
+    );
+    fixture.app("share1/applications", "xkt-none.desktop", "", "");
+    fixture.app("share1/applications", "xkt-default.desktop", "", "");
+    fixture.app(
+        "share1/applications",
+        "xkt-web.desktop",
+        "x-scheme-handler/xkt-web;",
+        "",
+    );
+    fixture.app(
+        "share1/applications",
+        "xkt-gone.desktop",
+        "text/x-xkt-plain;",
+        "TryExec=xkt-no-such-program\n",
+    );
+    fixture.write(
+        "config/mimeapps.list",
+        "[Added Associations]\n\
+         image/*=xkt-added.desktop;\n\
+         [Removed Associations]\n\
+         image/x-xkt-svg=xkt-removed.desktop;\n\
+         [Default Applications]\n\
+         text/x-xkt-plain=xkt-default.desktop;\n",
+    );
+    let apps = fixture.mime_apps();
+    let listed = |apps: &xdg_kit_mime_apps::MimeApps| -> Vec<String> {
+        apps.associated_apps()
+            .iter()
+            .map(|app| app.id().to_owned())
+            .filter(|id| id.starts_with("xkt-"))
+            .collect()
+    };
+    assert_eq!(
+        listed(&apps),
+        [
+            "xkt-added.desktop",
+            "xkt-gone.desktop",
+            "xkt-own.desktop",
+            "xkt-web.desktop"
+        ],
+        "a removal, no association and a default alone do not associate"
+    );
+    assert_eq!(
+        apps.default_for(&m("text/x-xkt-plain")).unwrap().id(),
+        "xkt-gone.desktop",
+        "the default named alone is not taken either"
+    );
+    let apps = apps.with_try_exec(fixture.path("bin").into_os_string());
+    assert_eq!(
+        listed(&apps),
+        ["xkt-added.desktop", "xkt-own.desktop", "xkt-web.desktop"],
+        "an application TryExec rules out is not installed"
+    );
+}
+
+#[test]
 fn problems_in_list_files_reach_the_snapshot() {
     let fixture = Fixture::new();
     fixture.write(

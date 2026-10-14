@@ -2,7 +2,7 @@
 //! Uses the spec's two algorithms to find the applications associated with
 //! a type and its default application.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -425,6 +425,83 @@ impl MimeApps {
         found
     }
 
+    /// Every installed application associated with at least one type or
+    /// wildcard, by the rules of [`MimeApps::apps_for`]: through its desktop
+    /// file's `MimeType=` or an added association in a `mimeapps.list`, and
+    /// not removed by a more important one. An application named only
+    /// under `[Default Applications]` is not associated, and
+    /// [`MimeApps::default_for`] does not take it either. In desktop file ID
+    /// byte order.
+    #[must_use]
+    pub fn associated_apps(&self) -> Vec<AppEntry> {
+        // The listing algorithm of `associated`, for every pattern in one
+        // walk down the levels: an ID added at a level, or listed by its
+        // `applications` folder, counts unless a more important level
+        // removed it for that pattern or a more important folder holds its
+        // own file of that ID.
+        let mut associated = Set::<Borrowed<'_>>::new();
+        let mut removed = Map::<Borrowed<'_>, HashSet<&TypePattern>>::new();
+        let mut shadowed = Set::<Borrowed<'_>>::new();
+        let open = |removed: &Map<Borrowed<'_>, HashSet<&TypePattern>>,
+                    shadowed: &Set<Borrowed<'_>>,
+                    id: &str,
+                    pattern: &TypePattern| {
+            // Two lookups, the sets counting each byte hashed and compared
+            // on a match; the pattern hashed and compared.
+            work::count(2 + 2 * pattern.text_len());
+            !shadowed.contains(id)
+                && !removed
+                    .get(id)
+                    .is_some_and(|patterns| patterns.contains(pattern))
+        };
+        for level in &self.levels {
+            // A step per level.
+            work::count(1);
+            for (pattern, ids) in &level.added {
+                for id in ids {
+                    if self.held_from(level.lowest, id) && open(&removed, &shadowed, id, pattern) {
+                        work::count(1);
+                        associated.insert_owned(id);
+                    }
+                }
+            }
+            for (pattern, ids) in &level.removed {
+                for id in ids {
+                    if self.held_from(level.lowest, id) {
+                        // The pattern hashed and compared.
+                        work::count(2 + 2 * pattern.text_len());
+                        removed
+                            .get_or_insert_owned(id, HashSet::new)
+                            .insert(pattern);
+                    }
+                }
+            }
+            if let Some(folder) = level.folder {
+                for (pattern, ids) in &self.folder_types[folder] {
+                    for id in ids {
+                        if open(&removed, &shadowed, id, pattern) {
+                            work::count(1);
+                            associated.insert_owned(id);
+                        }
+                    }
+                }
+                for id in self.apps.dir_ids(folder) {
+                    work::count(1);
+                    shadowed.insert_owned(id);
+                }
+            }
+        }
+        self.apps
+            .iter()
+            .filter(|app| {
+                // The set counts each byte hashed, and compared on a match.
+                work::count(1);
+                associated.contains(app.id())
+            })
+            .filter_map(|app| self.installed_entry(app))
+            .collect()
+    }
+
     /// The default application for `mime`. For each step of the order of
     /// [`MimeApps::apps_for`], most specific first:
     ///
@@ -678,7 +755,11 @@ impl MimeApps {
     /// asked to check it. As in `GLib`, an entry with neither `Exec` nor
     /// `DBusActivatable=true` is installed too.
     fn installed(&self, id: &str) -> Option<AppEntry> {
-        let app = self.apps.get(id)?;
+        self.installed_entry(self.apps.get(id)?)
+    }
+
+    /// `app`, if it is installed, as [`MimeApps::installed`] decides.
+    fn installed_entry(&self, app: AppEntry) -> Option<AppEntry> {
         if app.entry().entry_type() != Some(EntryType::Application) {
             return None;
         }
@@ -787,6 +868,159 @@ mod tests {
     /// The bytes of the paths of the lists `apps` reads.
     fn path_bytes(apps: &MimeApps) -> usize {
         apps.files().iter().map(|path| path.as_os_str().len()).sum()
+    }
+
+    /// Every installed application `associated` lists for some pattern
+    /// named anywhere: what `associated_apps` gives, worked out one pattern
+    /// at a time.
+    fn associated_one_pattern_at_a_time(apps: &MimeApps) -> Vec<String> {
+        let mut patterns: Vec<&TypePattern> = apps
+            .levels
+            .iter()
+            .flat_map(|level| level.added.keys().chain(level.removed.keys()))
+            .chain(apps.folder_types.iter().flat_map(HashMap::keys))
+            .collect();
+        patterns.sort_by_key(ToString::to_string);
+        patterns.dedup();
+        let mut ids: Vec<String> = patterns
+            .into_iter()
+            .flat_map(|pattern| apps.associated(pattern).0)
+            .filter(|id| apps.installed(id).is_some())
+            .map(str::to_owned)
+            .collect();
+        ids.sort();
+        ids.dedup();
+        ids
+    }
+
+    #[test]
+    fn associated_apps_agree_with_the_listing_of_each_pattern() {
+        // Generated setups: IDs in several `applications` folders (a more
+        // important folder's file shadowing a later one), each listing a few
+        // types, and lists at config and data levels adding and removing
+        // IDs for types and wildcards.
+        const PATTERNS: [&str; 5] = [
+            "text/x-probe",
+            "text/x-other",
+            "image/x-probe",
+            "image/*",
+            "*/*",
+        ];
+        let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = |below: usize| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            usize::try_from(state >> 33).unwrap() % below
+        };
+        let (mut listed_in_all, mut empty) = (0, 0);
+        for _ in 0..150 {
+            let root = tempfile::tempdir().unwrap();
+            let data = [root.path().join("share1"), root.path().join("share2")];
+            // The second config folder is also the first data folder's
+            // `applications` folder.
+            let config = [root.path().join("etc"), data[0].join("applications")];
+            let base = base_dirs(root.path(), &config, &data);
+            let folders = [
+                root.path().join("data/applications"),
+                data[0].join("applications"),
+                data[1].join("applications"),
+            ];
+            for at in 0..6 {
+                for folder in &folders {
+                    if next(3) == 0 {
+                        let mut types = String::new();
+                        for _ in 0..next(3) {
+                            let _ = write!(types, "{};", PATTERNS[next(5)]);
+                        }
+                        let kind = if next(8) == 0 { "Link" } else { "Application" };
+                        write(
+                            &folder.join(format!("a{at}.desktop")),
+                            &app(&types).replace("Application", kind),
+                        );
+                    }
+                }
+            }
+            let lists = [
+                root.path().join("config/xkt-mimeapps.list"),
+                root.path().join("config/mimeapps.list"),
+                root.path().join("etc/mimeapps.list"),
+                folders[0].join("mimeapps.list"),
+                folders[1].join("xkt-mimeapps.list"),
+                folders[1].join("mimeapps.list"),
+                folders[2].join("mimeapps.list"),
+            ];
+            for list in &lists {
+                let mut text = String::new();
+                for group in ["Added Associations", "Removed Associations"] {
+                    let _ = writeln!(text, "[{group}]");
+                    for pattern in PATTERNS {
+                        if next(2) == 0 {
+                            let mut ids = String::new();
+                            for _ in 0..next(3) {
+                                let _ = write!(ids, "a{}.desktop;", next(6));
+                            }
+                            let _ = writeln!(text, "{pattern}={ids}");
+                        }
+                    }
+                }
+                write(list, &text);
+            }
+            let (apps, mime) = indexes(&base);
+            let mime_apps = MimeApps::load(&base, &Desktops::new(["XKT"]), apps, mime);
+            let listed: Vec<String> = mime_apps
+                .associated_apps()
+                .iter()
+                .map(|app| app.id().to_owned())
+                .collect();
+            assert_eq!(listed, associated_one_pattern_at_a_time(&mime_apps));
+            listed_in_all += listed.len();
+            empty += usize::from(listed.is_empty());
+        }
+        // The setups vary: most list some applications, a few none.
+        assert!(
+            listed_in_all > 300 && empty > 0,
+            "{listed_in_all} listed, {empty} empty"
+        );
+    }
+
+    #[test]
+    fn associated_apps_are_found_in_linear_time() {
+        // `n` config folders and `n` applications, each listing a type of
+        // its own, which the user's list also adds it for: `n` patterns
+        // over `n` levels, which one walk per pattern would take `n * n`
+        // steps for.
+        let steps = |n: usize| {
+            let root = tempfile::tempdir().unwrap();
+            let config: Vec<PathBuf> = (0..n)
+                .map(|at| root.path().join(format!("c{at}")))
+                .collect();
+            let base = base_dirs(root.path(), &config, &[root.path().join("share")]);
+            let mut added = String::from("[Added Associations]\n");
+            let mut bytes = 0;
+            for at in 0..n {
+                let id = format!("a{at}.desktop");
+                let pattern = format!("text/x-probe{at}");
+                let path = root.path().join("data/applications").join(&id);
+                write(&path, &app(&format!("{pattern};")));
+                let _ = writeln!(added, "{pattern}={id};");
+                bytes += id.len() + pattern.len() + path.as_os_str().len();
+            }
+            write(&root.path().join("config/mimeapps.list"), &added);
+            let (apps, mime) = indexes(&base);
+            let mime_apps = MimeApps::load(&base, &Desktops::default(), apps, mime);
+            let (found, steps) = work::steps(|| mime_apps.associated_apps().len());
+            assert_eq!(found, n);
+            // Per level a step. Per byte of the IDs, the patterns
+            // and the applications' paths about 7: each ID, added and
+            // listed by its folder, looked up and set aside; each pattern
+            // hashed against the removals; each application's entry, with
+            // its ID and path, copied when listed and when found
+            // installed. Twice that is allowed.
+            let levels = mime_apps.levels.len();
+            (steps, 2 * (2 * levels + 7 * bytes))
+        };
+        work::assert_linear("associated applications", steps(250), steps(500));
     }
 
     #[test]
