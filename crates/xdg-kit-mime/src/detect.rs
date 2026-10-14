@@ -379,11 +379,15 @@ impl MimeDatabase {
     ///
     /// For a file whose reported size is nonzero, supplying the first
     /// [`MimeDatabase::sniff_len`] bytes gives the content-based type used
-    /// by [`MimeDatabase::type_for_path`]. For a regular file with a reported
-    /// size of 0 (as for most files under `/proc`), `type_for_path` reads
-    /// nothing. It returns `application/x-zerosize` from the size alone
-    /// unless all matching name patterns give one type, or an extended
-    /// attribute decides the type when that option is enabled.
+    /// by [`MimeDatabase::type_for_path`], except for a desktop entry
+    /// (`application/x-desktop`): a path always has a name, so there it
+    /// counts as `text/plain` unless the name makes the file one (see
+    /// [`MimeDatabase::type_for_name_and_data`]). For a regular file with a
+    /// reported size of 0 (as for most files under `/proc`),
+    /// `type_for_path` reads nothing. It returns `application/x-zerosize`
+    /// from the size alone unless all matching name patterns give one type,
+    /// or an extended attribute decides the type when that option is
+    /// enabled.
     ///
     /// The prefix is not always enough: it misses magic matches beyond
     /// 64 KiB and XML root elements beyond the prefix.
@@ -426,6 +430,12 @@ impl MimeDatabase {
     /// type or a subclass of it wins (certain when magic gave the type, a
     /// guess when text-or-binary did), else the best name match (a guess),
     /// else the content's type. Performs no I/O.
+    ///
+    /// Content that is a desktop entry (`application/x-desktop`) counts as
+    /// `text/plain` here, as in `GLib`: a desktop entry runs any command
+    /// line and is shown by its own `Name`, so only a name such as
+    /// `*.desktop` makes a file one. [`MimeDatabase::type_for_data`], which
+    /// has no name, reports it.
     ///
     /// For a regular file whose reported size is nonzero, supplying its
     /// name and first [`MimeDatabase::sniff_len`] bytes gives the same
@@ -472,7 +482,7 @@ impl MimeDatabase {
         // checking order"); a name that is that type or a subclass of it is
         // preferred, so text content picks a text type among names that
         // disagree.
-        let content = self.magic_type(data);
+        let content = self.magic_type(data).map(|found| self.named_content(found));
         let (sniffed, certainty) = match &content {
             Some(found) => (found.mime.clone(), Certainty::Certain),
             None => (self.canonical(&text_or_binary(data)), Certainty::Guess),
@@ -492,6 +502,23 @@ impl MimeDatabase {
         }
     }
 
+    /// `found`, the type of a named file's content, except that a desktop
+    /// entry counts as text: a desktop entry runs any command line and is
+    /// shown by its own `Name`, so content alone must not let a file pass
+    /// for one under another name. A name that makes it one decides before
+    /// the content is read. As `GLib` does (`g_content_type_guess`).
+    fn named_content(&self, found: Detection) -> Detection {
+        if found.mime == self.fixed(&MimeType::APPLICATION_X_DESKTOP) {
+            Detection {
+                mime: self.fixed(&MimeType::TEXT_PLAIN),
+                decided_by: DecidedBy::Content,
+                ..found
+            }
+        } else {
+            found
+        }
+    }
+
     /// The type of the file at `path`, by the spec's recommended order.
     ///
     /// The file's kind is checked first (`lstat`, and `stat` for a followed
@@ -500,7 +527,8 @@ impl MimeDatabase {
     /// its extended attribute (when asked for); its name, when all its
     /// matching patterns give one type; empty is `application/x-zerosize`; otherwise
     /// up to [`MimeDatabase::sniff_len`] bytes are read and weighed with the
-    /// name as [`MimeDatabase::type_for_name_and_data`] does.
+    /// name as [`MimeDatabase::type_for_name_and_data`] does, so content
+    /// alone never makes it a desktop entry.
     ///
     /// # Errors
     ///

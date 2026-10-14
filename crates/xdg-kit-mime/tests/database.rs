@@ -717,6 +717,83 @@ fn results_are_canonical_even_for_aliased_built_in_types() {
     );
 }
 
+/// Desktop entries, and two types a name can match at once.
+const DESKTOP: &str = r#"
+  <mime-type type="application/x-desktop">
+    <alias type="application/x-gnome-app-info"/>
+    <sub-class-of type="text/plain"/>
+    <glob pattern="*.desktop"/>
+    <magic priority="50"><match type="string" offset="0" value="[Desktop Entry]"/></magic>
+  </mime-type>
+  <mime-type type="text/x-twin"><sub-class-of type="text/plain"/><glob pattern="*.twin"/></mime-type>
+  <mime-type type="application/x-twin"><glob pattern="*.twin"/></mime-type>
+"#;
+
+const ENTRY: &[u8] = b"[Desktop Entry]\nType=Application\nName=Viewer\nExec=viewer\n";
+
+#[test]
+fn content_alone_never_makes_a_named_file_a_desktop_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = MimeDatabase::from_dirs([build(dir.path(), DESKTOP)]);
+    let detect = |name: &str| {
+        let found = db.type_for_name_and_data(name, ENTRY);
+        (found.mime.to_string(), found.decided_by)
+    };
+    assert_eq!(
+        detect("viewer.desktop"),
+        ("application/x-desktop".into(), DecidedBy::Name),
+        "the name decides"
+    );
+    assert_eq!(
+        detect("viewer"),
+        ("text/plain".into(), DecidedBy::Content),
+        "no name match: the content counts as text"
+    );
+    assert_eq!(
+        detect("viewer.twin").0,
+        "text/x-twin",
+        "names that disagree: the text one fits the content"
+    );
+    assert_eq!(
+        db.type_for_data(ENTRY).mime,
+        m("application/x-desktop"),
+        "without a name the content decides"
+    );
+
+    let launcher = dir.path().join("launcher");
+    let named = dir.path().join("launcher.desktop");
+    fs::write(&launcher, ENTRY).unwrap();
+    fs::write(&named, ENTRY).unwrap();
+    let options = PathOptions::default();
+    assert_eq!(
+        db.type_for_path(&launcher, &options).unwrap().mime,
+        m("text/plain")
+    );
+    assert_eq!(
+        db.type_for_path(&named, &options).unwrap().mime,
+        m("application/x-desktop")
+    );
+}
+
+#[test]
+fn a_desktop_entry_under_another_canonical_name_is_held_back_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = MimeDatabase::from_dirs([build(
+        dir.path(),
+        r#"
+  <mime-type type="x-test/launcher">
+    <alias type="application/x-desktop"/>
+    <magic priority="50"><match type="string" offset="0" value="[Desktop Entry]"/></magic>
+  </mime-type>
+"#,
+    )]);
+    assert_eq!(db.type_for_data(ENTRY).mime, m("x-test/launcher"));
+    assert_eq!(
+        db.type_for_name_and_data("viewer", ENTRY).mime,
+        m("text/plain")
+    );
+}
+
 #[test]
 fn refresh_notices_a_changed_mode() {
     let dir = tempfile::tempdir().unwrap();
