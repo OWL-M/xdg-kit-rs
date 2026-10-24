@@ -202,6 +202,11 @@ fn served_activation() {
         assert!(matches!(plan.launch, Launch::DBus(_)), "{plan:?}");
         assert!(plan.spawn().unwrap().is_empty());
     };
+    // The first launch warms persistent state up — zbus's runtime and
+    // zruntime's reactor open descriptors of their own on first use — so
+    // that the count below sees only per-call descriptors.
+    launch(&[], &options);
+    let baseline = open_sockets();
     launch(&[], &options);
     launch(
         &[
@@ -212,12 +217,30 @@ fn served_activation() {
     );
     options.action = Some("New".into());
     launch(&[], &options);
+    // Teardown is part of each call: every socket a call opened is closed
+    // again before its spawn returned.
+    assert_eq!(open_sockets(), baseline);
     assert_eq!(
         *calls.lock().unwrap(),
         [
+            "Activate token=tok startup=sid",
             "Activate token=tok startup=sid",
             "Open file:///tmp/a%20b https://example.org/x token=tok startup=sid",
             "ActivateAction New parameters=0 token=tok startup=sid"
         ]
     );
+}
+
+/// How many sockets this process has open. Deterministic here: the inner
+/// test runs alone in its own process (`--test-threads=1`), and only
+/// connections hold sockets — the runtimes' own descriptors (zruntime's
+/// reactors come and go with its helper thread) are left out.
+fn open_sockets() -> usize {
+    std::fs::read_dir("/proc/self/fd")
+        .unwrap()
+        .filter(|entry| {
+            std::fs::read_link(entry.as_ref().unwrap().path())
+                .is_ok_and(|target| target.to_string_lossy().starts_with("socket:"))
+        })
+        .count()
 }

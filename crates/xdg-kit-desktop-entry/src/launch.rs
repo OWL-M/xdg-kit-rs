@@ -850,15 +850,17 @@ fn call_bus_at(
             Ok(Err(err)) => Err(LaunchError::DBus(call_error(err))),
             Err(_) => Err(LaunchError::DBus(DBusError::Timeout(limit))),
         };
-        // Cleanup is part of the operation: closed while the runtime is
-        // still driven, with a bound of its own so a wedged peer cannot
-        // hold the caller. A close that times out has still shut the
-        // connection's tasks down as far as the runtime got.
+        // Cleanup is part of the operation: the socket is closed at once
+        // (the peer sees it), then the shutdown is awaited until the
+        // connection — reader task, buffers and all — is fully dropped,
+        // all while the runtime is still driven. The bound keeps a wedged
+        // teardown from holding the caller; past it, what remains is
+        // reclaimed when the runtime next runs.
         let _ = runtime
-            .timeout_at(
-                std::time::Instant::now() + CLEANUP_TIMEOUT,
-                connection.close(),
-            )
+            .timeout_at(std::time::Instant::now() + CLEANUP_TIMEOUT, async {
+                let _ = connection.clone().close().await;
+                connection.graceful_shutdown().await;
+            })
             .await;
         answer
     })
