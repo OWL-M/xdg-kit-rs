@@ -48,6 +48,17 @@ jobs:
         run: nix develop -c cargo test -p xdg-kit-mime --features quick-xml/escape-html --locked
       - name: Each crate with its default features and with none
         run: nix develop -c ci/build-features.sh
+      # `--all-features` enables this workspace's features, not a
+      # dependency's: the runtimes zbus can keep instead of its own need
+      # runs of their own (see `call_bus_at` in the desktop entry crate).
+      - name: The desktop-entry crate's tests with zbus's tokio feature
+        run: >
+          nix develop -c cargo test -p xdg-kit-desktop-entry
+          --features dbus,zbus/tokio --locked
+      - name: The desktop-entry crate's tests with zbus's tokio-multithread feature
+        run: >
+          nix develop -c cargo test -p xdg-kit-desktop-entry
+          --features dbus,zbus/tokio-multithread --locked
 
   # The targets of the dev shell `cross`, read from the flake.
   cross-targets:
