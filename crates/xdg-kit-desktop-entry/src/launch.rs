@@ -1511,7 +1511,12 @@ mod deadline_tests {
 
     /// The steps of the start of a connection that the fake bus answers,
     /// in order; it answers the first `answered`, then nothing more.
-    const STEPS: [&str; 3] = ["authentication", "file descriptor passing", "Hello"];
+    const STEPS: [&str; 4] = [
+        "authentication",
+        "file descriptor passing",
+        "Hello",
+        "the call",
+    ];
 
     /// A bus that answers the first `answered` of [`STEPS`] and then stays
     /// silent. The receiver gets the moment the client closed the
@@ -1562,23 +1567,50 @@ mod deadline_tests {
             0 => (has(b"AUTH EXTERNAL") && has(b"\r\n"))
                 .then(|| b"OK 0123456789abcdef0123456789abcdef\r\n".to_vec()),
             1 => has(b"NEGOTIATE_UNIX_FD\r\n").then(|| b"AGREE_UNIX_FD\r\n".to_vec()),
-            _ => {
-                let at = read.windows(7).position(|window| window == b"BEGIN\r\n")? + 7;
-                let header = read.get(at..at + 12)?;
+            step => {
+                let mut at = read.windows(7).position(|window| window == b"BEGIN\r\n")? + 7;
+                // Step 2 answers the first message (`Hello`), step 3 the
+                // second (the activation call), each once it is whole.
+                for _ in 2..step {
+                    at += message_length(read.get(at..)?)?;
+                }
+                let length = message_length(read.get(at..)?)?;
+                if read.len() < at + length {
+                    return None;
+                }
+                let header = &read[at..at + 12];
                 let serial: [u8; 4] = header[8..12].try_into().unwrap();
                 let serial = if header[0] == b'l' {
                     u32::from_le_bytes(serial)
                 } else {
                     u32::from_be_bytes(serial)
                 };
-                Some(hello_reply(serial))
+                Some(reply(serial, (step == 2).then_some(":1.1")))
             }
         }
     }
 
-    /// The bus's reply to `Hello` (a little-endian method return to
-    /// `serial` from `org.freedesktop.DBus`, with the unique name `:1.1`).
-    fn hello_reply(serial: u32) -> Vec<u8> {
+    /// The whole length of the message starting at `header`, once its
+    /// fixed header has arrived; the endianness is its first byte.
+    fn message_length(header: &[u8]) -> Option<usize> {
+        let bytes = header.get(..16)?;
+        let number = |at: usize| {
+            let quad: [u8; 4] = bytes[at..at + 4].try_into().unwrap();
+            if bytes[0] == b'l' {
+                u32::from_le_bytes(quad)
+            } else {
+                u32::from_be_bytes(quad)
+            }
+        };
+        let body = number(4) as usize;
+        let fields = number(12) as usize;
+        Some(16 + fields.next_multiple_of(8) + body)
+    }
+
+    /// A little-endian method return to `serial` from
+    /// `org.freedesktop.DBus`, with one string `body` (the unique name, for
+    /// `Hello`) or none (the activation call's empty answer).
+    fn reply(serial: u32, body: Option<&str>) -> Vec<u8> {
         fn pad(message: &mut Vec<u8>, to: usize) {
             while !message.len().is_multiple_of(to) {
                 message.push(0);
@@ -1590,11 +1622,14 @@ mod deadline_tests {
             message.extend_from_slice(text.as_bytes());
             message.push(0);
         }
-        let body = ":1.1";
         // Endianness, method return, no flags, version 1; the body's
         // length; this message's serial.
         let mut message = vec![b'l', 2, 0, 1];
-        message.extend_from_slice(&u32::try_from(4 + body.len() + 1).unwrap().to_le_bytes());
+        message.extend_from_slice(
+            &body
+                .map_or(0, |text| u32::try_from(4 + text.len() + 1).unwrap())
+                .to_le_bytes(),
+        );
         message.extend_from_slice(&1_u32.to_le_bytes());
         // The header fields' length, filled in below.
         message.extend_from_slice(&[0; 4]);
@@ -1607,13 +1642,17 @@ mod deadline_tests {
         pad(&mut message, 8);
         message.extend_from_slice(&[7, 1, b's', 0]);
         string(&mut message, "org.freedesktop.DBus");
-        // SIGNATURE (8), a `g`: the body is one string.
-        pad(&mut message, 8);
-        message.extend_from_slice(&[8, 1, b'g', 0, 1, b's', 0]);
+        if body.is_some() {
+            // SIGNATURE (8), a `g`: the body is one string.
+            pad(&mut message, 8);
+            message.extend_from_slice(&[8, 1, b'g', 0, 1, b's', 0]);
+        }
         let length = u32::try_from(message.len() - fields).unwrap();
         message[fields - 4..fields].copy_from_slice(&length.to_le_bytes());
         pad(&mut message, 8);
-        string(&mut message, body);
+        if let Some(text) = body {
+            string(&mut message, text);
+        }
         message
     }
 
@@ -1648,7 +1687,7 @@ mod deadline_tests {
         let called = sent.windows(8).any(|window| window == b"Activate");
         assert_eq!(
             called,
-            answered == STEPS.len(),
+            answered >= 3,
             "stopped at {stage}: the call was sent"
         );
     }
@@ -1671,5 +1710,46 @@ mod deadline_tests {
     #[test]
     fn an_application_that_never_answers_fails_the_call_at_the_deadline() {
         assert_given_up_at_the_deadline(3);
+    }
+
+    /// Calls `Activate` on a fake bus that answers everything, and checks
+    /// the call succeeds and the bus still sees the connection closed:
+    /// cleanup is part of the operation, not of some later call.
+    fn assert_answered_call_closes_the_connection() {
+        let (address, closed_at) = fake_bus(STEPS.len());
+        let call = DBusCall {
+            bus_name: "org.example.Foo".to_owned(),
+            object_path: "/org/example/Foo".to_owned(),
+            method: DBusMethod::Activate,
+            platform_data: Vec::new(),
+            timeout: LIMIT,
+        };
+        let found = call_bus_at(&call, address, LIMIT);
+        assert!(found.is_ok(), "{found:?}");
+        let (_, sent) = closed_at
+            .recv_timeout(SLACK)
+            .expect("answered: the connection is still open");
+        assert!(sent.windows(8).any(|window| window == b"Activate"));
+    }
+
+    #[test]
+    fn an_answered_call_succeeds_and_closes_the_connection() {
+        assert_answered_call_closes_the_connection();
+    }
+
+    #[test]
+    fn repeated_answered_calls_each_close_their_connection() {
+        for _ in 0..3 {
+            assert_answered_call_closes_the_connection();
+        }
+    }
+
+    #[test]
+    fn repeated_timed_out_calls_each_close_their_connection() {
+        // Each round proves its own closure before the next call exists to
+        // drive any runtime: nothing accumulates.
+        for _ in 0..3 {
+            assert_given_up_at_the_deadline(3);
+        }
     }
 }
