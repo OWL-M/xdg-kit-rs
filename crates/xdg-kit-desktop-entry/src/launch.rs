@@ -699,14 +699,23 @@ fn call_dbus(call: &DBusCall) -> Result<(), LaunchError> {
 }
 
 /// Makes `call` on the bus at `address`. Connection, authentication, `Hello`
-/// and the call run as one future with deadline `limit`. At the deadline,
-/// dropping the future closes the connection.
+/// and the call run under one absolute deadline, `limit` from entry — taken
+/// before connecting, so thread or task scheduling cannot extend it. The
+/// connection is explicitly closed before this returns, on success, on a
+/// remote error and at the deadline alike, while the runtime is still
+/// driven; the close itself is bounded by [`CLEANUP_TIMEOUT`].
 ///
 /// zbus's own `method_timeout` bounds only the call, not the steps before
 /// it, and its socket is non-blocking, so a socket timeout bounds nothing.
-/// zbus has no timer of its own to offer, and which runtime its `block_on`
-/// uses depends on the features other crates turn on, so the deadline is
-/// one that needs no runtime: see [`Deadline`].
+/// The deadline is a timer of the runtime driving the call instead: the
+/// thread's own zruntime, the very one zbus's `block_on` drives
+/// (`default-rt`). When some other runtime drives the call — zbus's `tokio`
+/// feature, unified in by another crate, makes `block_on` a persistent Tokio
+/// runtime — the timer is fired by zruntime's own short-lived helper thread
+/// (its `helper` feature, which zbus turns on). This crate starts no thread
+/// either way, and closing the connection inside `block_on` is what
+/// guarantees cleanup even on a runtime that stops being driven the moment
+/// `block_on` returns.
 #[cfg(feature = "dbus")]
 fn call_bus_at(
     call: &DBusCall,
@@ -726,120 +735,87 @@ fn call_bus_at(
         call.object_path.as_str(),
         "org.freedesktop.Application",
     );
-    let connect_and_call = async {
-        let connection = zbus::connection::Builder::address(address).build().await?;
-        match &call.method {
-            DBusMethod::Activate => {
-                connection
-                    .call_method(
-                        Some(bus),
-                        path,
-                        Some(interface),
-                        "Activate",
-                        &(&platform_data,),
-                    )
-                    .await
-            }
-            DBusMethod::Open(uris) => {
-                connection
-                    .call_method(
-                        Some(bus),
-                        path,
-                        Some(interface),
-                        "Open",
-                        &(uris, &platform_data),
-                    )
-                    .await
-            }
-            DBusMethod::ActivateAction(name) => {
-                connection
-                    .call_method(
-                        Some(bus),
-                        path,
-                        Some(interface),
-                        "ActivateAction",
-                        &(name, Vec::<Variant<'_>>::new(), &platform_data),
-                    )
-                    .await
-            }
-        }
-        .map(drop)
-    };
-    let work = async {
-        connect_and_call
+    // Taken before any connection work: scheduling delays shorten the wait
+    // rather than extend the documented bound.
+    let expires = std::time::Instant::now() + limit;
+    zbus::block_on(async {
+        let runtime = zruntime::SharedRuntime::current()
+            .map_err(|err| LaunchError::DBus(DBusError::Resource(err)))?;
+        // Built under the deadline, and kept out of the call future, so it
+        // is still here to close whichever way the call ends. A build
+        // stopped at the deadline is dropped inside `block_on`, while the
+        // runtime still runs its cancellation.
+        let connection = match runtime
+            .timeout_at(expires, zbus::connection::Builder::address(address).build())
             .await
-            .map_err(|err: zbus::Error| LaunchError::DBus(DBusError::Call(err.to_string())))
-    };
-    // Started before the call is first polled, so that the deadline counts
-    // from before connecting.
-    let mut deadline = Deadline::after(limit);
-    let mut work = std::pin::pin!(work);
-    zbus::block_on(std::future::poll_fn(|cx| {
-        if let std::task::Poll::Ready(done) = work.as_mut().poll(cx) {
-            return std::task::Poll::Ready(done);
-        }
-        std::pin::Pin::new(&mut deadline)
-            .poll(cx)
-            .map(|()| Err(LaunchError::DBus(DBusError::Timeout(limit))))
-    }))
-}
-
-/// A future ready once its time is up, on whatever runtime polls it: a
-/// thread of its own waits out the time and wakes it. Dropped earlier, it
-/// ends that thread at once.
-#[cfg(feature = "dbus")]
-struct Deadline {
-    /// Whether the time is up, and the waker to wake when it is.
-    shared: std::sync::Arc<std::sync::Mutex<(bool, Option<std::task::Waker>)>>,
-    /// Dropped with the deadline, which wakes the thread before its time.
-    _cancel: std::sync::mpsc::Sender<()>,
-}
-
-#[cfg(feature = "dbus")]
-impl Deadline {
-    fn after(limit: std::time::Duration) -> Self {
-        let shared = std::sync::Arc::new(std::sync::Mutex::new((false, None::<std::task::Waker>)));
-        let (cancel, cancelled) = std::sync::mpsc::channel::<()>();
-        let timer = std::sync::Arc::clone(&shared);
-        std::thread::spawn(move || {
-            // Nothing is ever sent: only the time running out, or the
-            // sender being dropped, ends the wait.
-            if cancelled.recv_timeout(limit) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
-                let mut state = timer
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                state.0 = true;
-                if let Some(waker) = state.1.take() {
-                    waker.wake();
+        {
+            Ok(Ok(connection)) => connection,
+            Ok(Err(err)) => {
+                return Err(LaunchError::DBus(DBusError::Connect(err.to_string())));
+            }
+            Err(_) => return Err(LaunchError::DBus(DBusError::Timeout(limit))),
+        };
+        let called = async {
+            match &call.method {
+                DBusMethod::Activate => {
+                    connection
+                        .call_method(
+                            Some(bus),
+                            path,
+                            Some(interface),
+                            "Activate",
+                            &(&platform_data,),
+                        )
+                        .await
+                }
+                DBusMethod::Open(uris) => {
+                    connection
+                        .call_method(
+                            Some(bus),
+                            path,
+                            Some(interface),
+                            "Open",
+                            &(uris, &platform_data),
+                        )
+                        .await
+                }
+                DBusMethod::ActivateAction(name) => {
+                    connection
+                        .call_method(
+                            Some(bus),
+                            path,
+                            Some(interface),
+                            "ActivateAction",
+                            &(name, Vec::<Variant<'_>>::new(), &platform_data),
+                        )
+                        .await
                 }
             }
-        });
-        Self {
-            shared,
-            _cancel: cancel,
-        }
-    }
+            .map(drop)
+        };
+        let answer = match runtime.timeout_at(expires, called).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(err)) => Err(LaunchError::DBus(DBusError::Call(err.to_string()))),
+            Err(_) => Err(LaunchError::DBus(DBusError::Timeout(limit))),
+        };
+        // Cleanup is part of the operation: closed while the runtime is
+        // still driven, with a bound of its own so a wedged peer cannot
+        // hold the caller. A close that times out has still shut the
+        // connection's tasks down as far as the runtime got.
+        let _ = runtime
+            .timeout_at(
+                std::time::Instant::now() + CLEANUP_TIMEOUT,
+                connection.close(),
+            )
+            .await;
+        answer
+    })
 }
 
+/// How long closing the connection may take after the call has ended,
+/// however it ended.
 #[cfg(feature = "dbus")]
-impl std::future::Future for Deadline {
-    type Output = ();
-
-    fn poll(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<()> {
-        let mut state = self
-            .shared
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.0 {
-            return std::task::Poll::Ready(());
-        }
-        state.1 = Some(cx.waker().clone());
-        std::task::Poll::Pending
-    }
-}
+const CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[cfg(not(feature = "dbus"))]
 fn call_dbus(_call: &DBusCall) -> Result<(), LaunchError> {
