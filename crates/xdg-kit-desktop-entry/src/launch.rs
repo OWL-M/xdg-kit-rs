@@ -151,7 +151,9 @@ pub struct LaunchPlan {
 pub enum LaunchError {
     /// The entry is a link: open its URL with the default handler instead.
     Link(Option<String>),
-    /// The entry is not an application (a folder, or an unknown type).
+    /// The entry cannot be launched: not an application (a folder, an
+    /// unknown type, or no type at all) — though a requested action also
+    /// accepts unknown types, whose actions run their own command.
     NotAnApplication(Option<EntryType>),
     /// No such action in the entry.
     NoSuchAction(String),
@@ -315,8 +317,9 @@ impl std::error::Error for LaunchError {
 /// Works out how to launch `entry` with `targets`, without starting
 /// anything.
 ///
-/// `DBusActivatable=true` with [`LaunchOptions::dbus`] (and the `dbus`
-/// feature) gives a D-Bus call; otherwise the `Exec` command line is
+/// For a `Type=Application` entry, `DBusActivatable=true` with
+/// [`LaunchOptions::dbus`] (and the `dbus` feature) gives a D-Bus call;
+/// otherwise the `Exec` command line is
 /// expanded: `%f`/`%u` take one target per command, `%F`/`%U` all of them
 /// in one; `%f`/`%F` need local files (a `file:` URI is turned into its
 /// path, a URI with another scheme is [`LaunchError::NeedsLocalCopy`]);
@@ -324,19 +327,29 @@ impl std::error::Error for LaunchError {
 ///
 /// # Errors
 ///
-/// When the entry is not an application, the action or `Exec` is missing
-/// or unusable, a target cannot be passed, or a terminal is needed and not
-/// given.
+/// When the entry cannot be launched this way: launching the entry itself
+/// needs `Type=Application`, while a requested action also accepts other
+/// types (KDE service menus, for example, whose actions carry their own
+/// `Exec`) but never links, folders, or files without a `Type`. Also when
+/// the action or `Exec` is missing or unusable (an action's command is its
+/// own `Exec`, never the entry's), a target cannot be passed, or a
+/// terminal is needed and not given. `Path=`, `Terminal=` and the
+/// `%c`/`%i` values come from the entry for actions too.
 pub fn prepare_launch(
     entry: &DesktopEntry,
     targets: &[Target],
     options: &LaunchOptions,
 ) -> Result<LaunchPlan, LaunchError> {
-    match entry.entry_type() {
-        Some(EntryType::Application) => {}
+    // An explicitly requested action runs its own command, so the entry
+    // may be of another type (KDE service menus are such files); links
+    // and folders stay excluded. Launching the entry itself remains for
+    // applications.
+    let application = match entry.entry_type() {
+        Some(EntryType::Application) => true,
         Some(EntryType::Link) => return Err(LaunchError::Link(entry.url())),
+        Some(EntryType::Other(_)) if options.action.is_some() => false,
         other => return Err(LaunchError::NotAnApplication(other)),
-    }
+    };
     let action = match &options.action {
         Some(id) => Some(
             entry
@@ -347,6 +360,7 @@ pub fn prepare_launch(
     };
     if cfg!(feature = "dbus")
         && options.dbus
+        && application
         && entry.dbus_activatable()
         && let Some(bus_name) = bus_name(entry)
     {
@@ -1419,6 +1433,170 @@ mod tests {
     #[cfg(feature = "dbus")]
     fn path_target(p: &str) -> Target {
         Target::Path(p.into())
+    }
+
+    /// Launches the action `id` of `text`, a complete desktop file.
+    fn action_plan(text: &str, id: &str, targets: &[Target]) -> Result<LaunchPlan, LaunchError> {
+        let options = LaunchOptions {
+            action: Some(id.into()),
+            ..LaunchOptions::default()
+        };
+        prepare_launch(&DesktopEntry::parse(text.as_bytes()), targets, &options)
+    }
+
+    #[test]
+    fn a_requested_action_launches_whatever_the_entry_type() {
+        // Leniency for an explicitly requested action: any present type
+        // that is not a link or a folder, misspelled and empty ones
+        // included. The action's own command runs; the entry's type
+        // describes the entry.
+        for kind in ["Service", "Whatever", ""] {
+            let plan = action_plan(
+                &format!(
+                    "[Desktop Entry]\nType={kind}\nName=Menu\nActions=Edit;\n\
+                     [Desktop Action Edit]\nName=Edit\nExec=editor %f\n"
+                ),
+                "Edit",
+                &[path("/tmp/a"), path("/tmp/b")],
+            )
+            .unwrap();
+            assert_eq!(
+                commands(&plan),
+                [["editor", "/tmp/a"], ["editor", "/tmp/b"]],
+                "Type={kind}"
+            );
+            assert!(!plan.targets_ignored);
+        }
+    }
+
+    #[test]
+    fn without_an_action_a_service_entry_is_still_no_application() {
+        let service = "[Desktop Entry]\nType=Service\nName=Menu\nExec=top\n\
+                       Actions=Edit;\n[Desktop Action Edit]\nName=Edit\nExec=editor\n";
+        let found = prepare_launch(
+            &DesktopEntry::parse(service.as_bytes()),
+            &[],
+            &LaunchOptions::default(),
+        );
+        assert!(
+            matches!(
+                &found,
+                Err(LaunchError::NotAnApplication(Some(EntryType::Other(kind))))
+                    if kind == "Service"
+            ),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn links_folders_and_untyped_files_reject_action_launches_too() {
+        let link = action_plan(
+            "[Desktop Entry]\nType=Link\nName=x\nURL=https://x.org/\n\
+             Actions=Edit;\n[Desktop Action Edit]\nName=Edit\nExec=editor\n",
+            "Edit",
+            &[],
+        );
+        assert!(
+            matches!(&link, Err(LaunchError::Link(Some(url))) if url == "https://x.org/"),
+            "{link:?}"
+        );
+        let folder = action_plan(
+            "[Desktop Entry]\nType=Directory\nName=x\n\
+             Actions=Edit;\n[Desktop Action Edit]\nName=Edit\nExec=editor\n",
+            "Edit",
+            &[],
+        );
+        assert!(
+            matches!(
+                folder,
+                Err(LaunchError::NotAnApplication(Some(EntryType::Directory)))
+            ),
+            "{folder:?}"
+        );
+        let untyped = action_plan(
+            "[Desktop Entry]\nName=x\n\
+             Actions=Edit;\n[Desktop Action Edit]\nName=Edit\nExec=editor\n",
+            "Edit",
+            &[],
+        );
+        assert!(
+            matches!(untyped, Err(LaunchError::NotAnApplication(None))),
+            "{untyped:?}"
+        );
+    }
+
+    #[test]
+    fn an_action_never_falls_back_to_the_entry_command() {
+        // The action's group must carry its own usable Exec; the entry's
+        // is not a substitute.
+        let none = action_plan(
+            "[Desktop Entry]\nType=Service\nName=Menu\nExec=top\n\
+             Actions=Edit;\n[Desktop Action Edit]\nName=Edit\n",
+            "Edit",
+            &[],
+        );
+        assert!(matches!(none, Err(LaunchError::NoExec)), "{none:?}");
+        let malformed = action_plan(
+            "[Desktop Entry]\nType=Service\nName=Menu\nExec=top\n\
+             Actions=Edit;\n[Desktop Action Edit]\nName=Edit\nExec=editor %z\n",
+            "Edit",
+            &[],
+        );
+        assert!(
+            matches!(
+                malformed,
+                Err(LaunchError::Exec(ExecError::UnknownFieldCode('z')))
+            ),
+            "{malformed:?}"
+        );
+        let unlisted = action_plan(
+            "[Desktop Entry]\nType=Service\nName=Menu\nExec=top\n\
+             Actions=Edit;\n[Desktop Action Edit]\nName=Edit\nExec=editor\n",
+            "Other",
+            &[],
+        );
+        assert!(
+            matches!(&unlisted, Err(LaunchError::NoSuchAction(id)) if id == "Other"),
+            "{unlisted:?}"
+        );
+    }
+
+    #[cfg(feature = "dbus")]
+    #[test]
+    fn dbus_activation_is_for_applications_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |kind: &str, action_exec: &str| {
+            // A bus-name-shaped filename of its own per type.
+            let path = dir.path().join(format!("org.example.{kind}.desktop"));
+            std::fs::write(
+                &path,
+                format!(
+                    "[Desktop Entry]\nType={kind}\nName=x\nDBusActivatable=true\n\
+                     Actions=Edit;\n[Desktop Action Edit]\nName=Edit\n{action_exec}"
+                ),
+            )
+            .unwrap();
+            DesktopEntry::read(&path).unwrap()
+        };
+        let options = LaunchOptions {
+            action: Some("Edit".into()),
+            ..LaunchOptions::default()
+        };
+        let targets = [path_target("/tmp/a")];
+        // The service entry would lose its targets to ActivateAction; its
+        // action's command runs instead.
+        let service =
+            prepare_launch(&write("Service", "Exec=editor %f\n"), &targets, &options).unwrap();
+        assert_eq!(commands(&service), [["editor", "/tmp/a"]]);
+        assert!(!service.targets_ignored);
+        // An application keeps D-Bus activation, and its action needs no
+        // Exec there (the call carries only the id).
+        let application = prepare_launch(&write("Application", ""), &targets, &options).unwrap();
+        let Launch::DBus(call) = &application.launch else {
+            panic!("{application:?}");
+        };
+        assert_eq!(call.method, DBusMethod::ActivateAction("Edit".into()));
+        assert!(application.targets_ignored);
     }
 
     #[test]
