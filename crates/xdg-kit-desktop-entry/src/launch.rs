@@ -205,7 +205,14 @@ pub enum DBusError {
     /// or `Hello`.
     Connect(String),
     /// The bus or the application rejected or failed the call.
-    Call(String),
+    Call {
+        /// The D-Bus error name (such as
+        /// `org.freedesktop.DBus.Error.ServiceUnknown`), when the failure
+        /// was an error reply; `None` for a local or transport failure.
+        name: Option<String>,
+        /// The error's message.
+        message: String,
+    },
     /// The bus or the application did not answer within this deadline
     /// ([`LaunchOptions::dbus_timeout`]), counted from before connecting.
     Timeout(std::time::Duration),
@@ -224,7 +231,12 @@ impl fmt::Display for DBusError {
             Self::Connect(err) => {
                 write!(f, "connecting to the bus failed: {}", quoted_message(err))
             }
-            Self::Call(err) => write!(f, "{}", quoted_message(err)),
+            Self::Call { name, message } => match name {
+                Some(name) => {
+                    write!(f, "{}: {}", quoted_message(name), quoted_message(message))
+                }
+                None => write!(f, "{}", quoted_message(message)),
+            },
             Self::Timeout(limit) => {
                 write!(
                     f,
@@ -835,7 +847,7 @@ fn call_bus_at(
         };
         let answer = match runtime.timeout_at(expires, called).await {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(err)) => Err(LaunchError::DBus(DBusError::Call(err.to_string()))),
+            Ok(Err(err)) => Err(LaunchError::DBus(call_error(err))),
             Err(_) => Err(LaunchError::DBus(DBusError::Timeout(limit))),
         };
         // Cleanup is part of the operation: closed while the runtime is
@@ -856,6 +868,22 @@ fn call_bus_at(
 /// however it ended.
 #[cfg(feature = "dbus")]
 const CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The [`DBusError`] for a failed call: a D-Bus error reply keeps its name,
+/// everything else is its message alone.
+#[cfg(feature = "dbus")]
+fn call_error(err: zbus::Error) -> DBusError {
+    match err {
+        zbus::Error::MethodError(name, detail, _) => DBusError::Call {
+            name: Some(name.to_string()),
+            message: detail.unwrap_or_default(),
+        },
+        other => DBusError::Call {
+            name: None,
+            message: other.to_string(),
+        },
+    }
+}
 
 #[cfg(not(feature = "dbus"))]
 fn call_dbus(_call: &DBusCall) -> Result<(), LaunchError> {
@@ -963,7 +991,10 @@ mod tests {
         assert!(timeout.to_string().contains("did not answer within 25s"));
         // Control characters in a bus-supplied message are not written
         // through.
-        let call = LaunchError::DBus(DBusError::Call("a\x1b[2J\nb".to_owned()));
+        let call = LaunchError::DBus(DBusError::Call {
+            name: None,
+            message: "a\x1b[2J\nb".to_owned(),
+        });
         assert!(!call.to_string().contains('\x1b'), "{call}");
         // A local resource failure keeps its source.
         let resource = LaunchError::DBus(DBusError::Resource(io::Error::other("no fds")));
@@ -972,7 +1003,10 @@ mod tests {
 
     #[test]
     fn an_error_from_d_bus_is_shown_escaped_and_cut_at_256_characters() {
-        let error = LaunchError::DBus(DBusError::Call(format!("a\x1b[2J\n{}", "b".repeat(5000))));
+        let error = LaunchError::DBus(DBusError::Call {
+            name: None,
+            message: format!("a\x1b[2J\n{}", "b".repeat(5000)),
+        });
         assert_eq!(
             error.to_string(),
             format!(
@@ -1562,6 +1596,15 @@ mod deadline_tests {
     /// silent. The receiver gets the moment the client closed the
     /// connection, and all the client sent.
     fn fake_bus(answered: usize) -> (zbus::Address, mpsc::Receiver<(Instant, Vec<u8>)>) {
+        fake_bus_at(answered, false)
+    }
+
+    /// [`fake_bus`], answering the call itself (the last of [`STEPS`]) with
+    /// an error reply instead of a method return when `rejecting`.
+    fn fake_bus_at(
+        answered: usize,
+        rejecting: bool,
+    ) -> (zbus::Address, mpsc::Receiver<(Instant, Vec<u8>)>) {
         // Unique to this run and bus: the process, the time and `answered`.
         let name = format!(
             "xdg-kit-test-{}-{}-{answered}",
@@ -1587,7 +1630,7 @@ mod deadline_tests {
                 };
                 read.extend_from_slice(&buffer[..n]);
                 while sent < answered {
-                    let Some(answer) = answer(sent, &read) else {
+                    let Some(answer) = answer(sent, &read, rejecting) else {
                         break;
                     };
                     stream.write_all(&answer).unwrap();
@@ -1600,8 +1643,9 @@ mod deadline_tests {
     }
 
     /// The answer to step `step` of [`STEPS`], once what the client sent
-    /// so far, `read`, holds its request.
-    fn answer(step: usize, read: &[u8]) -> Option<Vec<u8>> {
+    /// so far, `read`, holds its request; an error reply to the call when
+    /// `rejecting`.
+    fn answer(step: usize, read: &[u8], rejecting: bool) -> Option<Vec<u8>> {
         let has = |line: &[u8]| read.windows(line.len()).any(|window| window == line);
         match step {
             0 => (has(b"AUTH EXTERNAL") && has(b"\r\n"))
@@ -1625,7 +1669,13 @@ mod deadline_tests {
                 } else {
                     u32::from_be_bytes(serial)
                 };
-                Some(reply(serial, (step == 2).then_some(":1.1")))
+                Some(if step == 2 {
+                    reply(serial, Some(":1.1"))
+                } else if rejecting {
+                    error_reply(serial, "org.example.Error.No", "no")
+                } else {
+                    reply(serial, None)
+                })
             }
         }
     }
@@ -1650,18 +1700,22 @@ mod deadline_tests {
     /// A little-endian method return to `serial` from
     /// `org.freedesktop.DBus`, with one string `body` (the unique name, for
     /// `Hello`) or none (the activation call's empty answer).
-    fn reply(serial: u32, body: Option<&str>) -> Vec<u8> {
-        fn pad(message: &mut Vec<u8>, to: usize) {
-            while !message.len().is_multiple_of(to) {
-                message.push(0);
-            }
-        }
-        fn string(message: &mut Vec<u8>, text: &str) {
-            pad(message, 4);
-            message.extend_from_slice(&u32::try_from(text.len()).unwrap().to_le_bytes());
-            message.extend_from_slice(text.as_bytes());
+    /// Pads `message` with zeros to a multiple of `to` bytes.
+    fn pad(message: &mut Vec<u8>, to: usize) {
+        while !message.len().is_multiple_of(to) {
             message.push(0);
         }
+    }
+
+    /// Appends `text` as a little-endian D-Bus string.
+    fn string(message: &mut Vec<u8>, text: &str) {
+        pad(message, 4);
+        message.extend_from_slice(&u32::try_from(text.len()).unwrap().to_le_bytes());
+        message.extend_from_slice(text.as_bytes());
+        message.push(0);
+    }
+
+    fn reply(serial: u32, body: Option<&str>) -> Vec<u8> {
         // Endianness, method return, no flags, version 1; the body's
         // length; this message's serial.
         let mut message = vec![b'l', 2, 0, 1];
@@ -1693,6 +1747,39 @@ mod deadline_tests {
         if let Some(text) = body {
             string(&mut message, text);
         }
+        message
+    }
+
+    /// A little-endian error reply to `serial`: the error `name`, with one
+    /// string `text` as its message.
+    fn error_reply(serial: u32, name: &str, text: &str) -> Vec<u8> {
+        // Endianness, error, no flags, version 1; the body's length; this
+        // message's serial.
+        let mut message = vec![b'l', 3, 0, 1];
+        message.extend_from_slice(&u32::try_from(4 + text.len() + 1).unwrap().to_le_bytes());
+        message.extend_from_slice(&1_u32.to_le_bytes());
+        // The header fields' length, filled in below.
+        message.extend_from_slice(&[0; 4]);
+        let fields = message.len();
+        // REPLY_SERIAL (5), a `u`.
+        pad(&mut message, 8);
+        message.extend_from_slice(&[5, 1, b'u', 0]);
+        message.extend_from_slice(&serial.to_le_bytes());
+        // ERROR_NAME (4), an `s`.
+        pad(&mut message, 8);
+        message.extend_from_slice(&[4, 1, b's', 0]);
+        string(&mut message, name);
+        // SENDER (7), an `s`.
+        pad(&mut message, 8);
+        message.extend_from_slice(&[7, 1, b's', 0]);
+        string(&mut message, "org.freedesktop.DBus");
+        // SIGNATURE (8), a `g`: the body is one string.
+        pad(&mut message, 8);
+        message.extend_from_slice(&[8, 1, b'g', 0, 1, b's', 0]);
+        let length = u32::try_from(message.len() - fields).unwrap();
+        message[fields - 4..fields].copy_from_slice(&length.to_le_bytes());
+        pad(&mut message, 8);
+        string(&mut message, text);
         message
     }
 
@@ -1816,6 +1903,23 @@ mod deadline_tests {
         closed_at
             .recv_timeout(SLACK)
             .expect("zero timeout: the connection is still open");
+    }
+
+    #[test]
+    fn a_rejected_call_reports_the_errors_name() {
+        let (address, closed_at) = fake_bus_at(STEPS.len(), true);
+        let found = call_bus_at(&activate(), address, LIMIT);
+        assert!(
+            matches!(
+                &found,
+                Err(LaunchError::DBus(DBusError::Call { name: Some(name), message }))
+                    if name == "org.example.Error.No" && message == "no"
+            ),
+            "{found:?}"
+        );
+        closed_at
+            .recv_timeout(SLACK)
+            .expect("rejected: the connection is still open");
     }
 
     #[test]
