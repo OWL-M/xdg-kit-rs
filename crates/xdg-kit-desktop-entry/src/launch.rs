@@ -215,6 +215,10 @@ pub enum DBusError {
     },
     /// The bus or the application did not answer within this deadline
     /// ([`LaunchOptions::dbus_timeout`]), counted from before connecting.
+    ///
+    /// This does not prove the application did nothing: the call may have
+    /// been delivered and acted on, only the answer missing in time, so a
+    /// retry may run the activation twice.
     Timeout(std::time::Duration),
     /// The calling thread's runtime could not be set up: an operating
     /// system resource ran out.
@@ -657,8 +661,8 @@ fn percent_decode(text: &str) -> Option<Vec<u8>> {
 impl LaunchPlan {
     /// Runs the plan. Programs are started in their own process group,
     /// and their [`Child`] handles are returned: wait on them (the library
-    /// starts no threads, neither to wait nor for anything else). A D-Bus
-    /// call returns no children.
+    /// starts no threads to wait for them). A D-Bus call returns no
+    /// children.
     ///
     /// A D-Bus call blocks the calling thread, up to
     /// [`LaunchOptions::dbus_timeout`] (25 seconds by default) plus a
