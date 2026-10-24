@@ -666,12 +666,15 @@ impl LaunchPlan {
     /// handles of those started before it, which keep running), or the
     /// D-Bus call fails ([`DBusError`] says how: no bus, a connection or
     /// call failure, the deadline, or the thread's runtime being out of
-    /// resources — all reported). In the default build nothing on this
-    /// path panics. When another crate turns on zbus's `tokio` feature,
-    /// though, zbus and zruntime set runtime machinery of theirs up with
-    /// panics on operating-system resource exhaustion that cannot be
-    /// reported from here: the Tokio runtime zbus then keeps, and the
-    /// helper thread zruntime fires this call's deadline from.
+    /// resources — all reported). One limitation: the runtime machinery of
+    /// zbus and zruntime panics on operating-system resource exhaustion
+    /// this crate cannot see — the threads for blocking work the default
+    /// runtime uses for some operations (resolving a `tcp:` bus address's
+    /// host name; on Windows, connecting), and, where another crate turns
+    /// on zbus's `tokio` feature, the Tokio runtime zbus then keeps and
+    /// the helper thread zruntime fires this call's deadline from. On the
+    /// default runtime with a `unix:` bus address — the common case — this
+    /// path starts no thread and does not panic.
     pub fn spawn(&self) -> Result<Vec<Child>, LaunchError> {
         match &self.launch {
             Launch::Commands(commands) => {
@@ -738,12 +741,16 @@ fn call_dbus(call: &DBusCall) -> Result<(), LaunchError> {
 /// guarantees cleanup even on a runtime that stops being driven the moment
 /// `block_on` returns.
 ///
-/// One limit: on that `tokio` build, zbus starts its Tokio runtime and
-/// zruntime its helper thread with panics on operating-system resource
-/// exhaustion (their `expect`s), before or beside any error path here, so
-/// [`DBusError::Resource`] covers only the failure this crate can see,
-/// `SharedRuntime::current`. The default build has no such panic: this
-/// thread drives its own timer.
+/// One limit: [`DBusError::Resource`] covers only the failure this crate
+/// can see, `SharedRuntime::current`. Beyond it, zbus and zruntime panic on
+/// operating-system resource exhaustion, before or beside any error path
+/// here: zruntime's pool for blocking work, which the default runtime
+/// reaches too (zbus resolves a `tcp:` address's host name there, and on
+/// Windows connects there), and, on that `tokio` build, the Tokio runtime
+/// zbus starts and the helper thread zruntime fires the timer from (their
+/// `expect`s). On the default runtime with a `unix:` address, nothing on
+/// this path starts a thread or panics: this thread drives its own timer,
+/// and zruntime connects the socket on its own poller.
 #[cfg(feature = "dbus")]
 fn call_bus_at(
     call: &DBusCall,
