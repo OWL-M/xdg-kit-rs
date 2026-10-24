@@ -178,7 +178,56 @@ pub enum LaunchError {
         started: Vec<Child>,
     },
     /// The D-Bus call failed.
-    DBus(String),
+    DBus(DBusError),
+}
+
+/// Why a D-Bus activation failed.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum DBusError {
+    /// This build has no D-Bus support (the `dbus` feature).
+    Unsupported,
+    /// The session bus address is not known (`DBUS_SESSION_BUS_ADDRESS`).
+    NoSessionBus(String),
+    /// Connecting to the bus failed: the connection, its authentication,
+    /// or `Hello`.
+    Connect(String),
+    /// The bus or the application rejected or failed the call.
+    Call(String),
+    /// The bus or the application did not answer within this deadline,
+    /// counted from before connecting.
+    Timeout(std::time::Duration),
+    /// The calling thread's runtime could not be set up: an operating
+    /// system resource ran out.
+    Resource(io::Error),
+}
+
+impl fmt::Display for DBusError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unsupported => {
+                write!(f, "this build has no D-Bus support (the `dbus` feature)")
+            }
+            Self::NoSessionBus(err) => write!(f, "no session bus: {}", quoted_message(err)),
+            Self::Connect(err) => {
+                write!(f, "connecting to the bus failed: {}", quoted_message(err))
+            }
+            Self::Call(err) => write!(f, "{}", quoted_message(err)),
+            Self::Timeout(limit) => {
+                write!(f, "the bus or the application did not answer within {limit:?}")
+            }
+            Self::Resource(err) => write!(f, "the thread's runtime: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for DBusError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Resource(err) => Some(err),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for LaunchError {
@@ -216,7 +265,7 @@ impl fmt::Display for LaunchError {
                     shown_path(Path::new(program))
                 )
             }
-            Self::DBus(err) => write!(f, "D-Bus activation failed: {}", quoted_message(err)),
+            Self::DBus(err) => write!(f, "D-Bus activation failed: {err}"),
         }
     }
 }
@@ -226,6 +275,7 @@ impl std::error::Error for LaunchError {
         match self {
             Self::Exec(err) => Some(err),
             Self::Spawn { error, .. } => Some(error),
+            Self::DBus(err) => Some(err),
             _ => None,
         }
     }
@@ -632,7 +682,8 @@ const DBUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
 
 #[cfg(feature = "dbus")]
 fn call_dbus(call: &DBusCall) -> Result<(), LaunchError> {
-    let address = zbus::Address::session().map_err(|err| LaunchError::DBus(err.to_string()))?;
+    let address = zbus::Address::session()
+        .map_err(|err| LaunchError::DBus(DBusError::NoSessionBus(err.to_string())))?;
     call_bus_at(call, address, DBUS_TIMEOUT)
 }
 
@@ -706,7 +757,7 @@ fn call_bus_at(
     let work = async {
         connect_and_call
             .await
-            .map_err(|err: zbus::Error| LaunchError::DBus(err.to_string()))
+            .map_err(|err: zbus::Error| LaunchError::DBus(DBusError::Call(err.to_string())))
     };
     // Started before the call is first polled, so that the deadline counts
     // from before connecting.
@@ -716,11 +767,9 @@ fn call_bus_at(
         if let std::task::Poll::Ready(done) = work.as_mut().poll(cx) {
             return std::task::Poll::Ready(done);
         }
-        std::pin::Pin::new(&mut deadline).poll(cx).map(|()| {
-            Err(LaunchError::DBus(format!(
-                "the bus or the application did not answer within {limit:?}"
-            )))
-        })
+        std::pin::Pin::new(&mut deadline)
+            .poll(cx)
+            .map(|()| Err(LaunchError::DBus(DBusError::Timeout(limit))))
     }))
 }
 
@@ -783,9 +832,7 @@ impl std::future::Future for Deadline {
 
 #[cfg(not(feature = "dbus"))]
 fn call_dbus(_call: &DBusCall) -> Result<(), LaunchError> {
-    Err(LaunchError::DBus(
-        "this build has no D-Bus support (the `dbus` feature)".to_owned(),
-    ))
+    Err(LaunchError::DBus(DBusError::Unsupported))
 }
 
 #[cfg(test)]
@@ -884,8 +931,21 @@ mod tests {
     }
 
     #[test]
+    fn dbus_error_distinguishes_timeout_and_sanitizes_messages() {
+        let timeout = LaunchError::DBus(DBusError::Timeout(std::time::Duration::from_secs(25)));
+        assert!(timeout.to_string().contains("did not answer within 25s"));
+        // Control characters in a bus-supplied message are not written
+        // through.
+        let call = LaunchError::DBus(DBusError::Call("a\x1b[2J\nb".to_owned()));
+        assert!(!call.to_string().contains('\x1b'), "{call}");
+        // A local resource failure keeps its source.
+        let resource = LaunchError::DBus(DBusError::Resource(io::Error::other("no fds")));
+        assert!(std::error::Error::source(&resource).is_some());
+    }
+
+    #[test]
     fn an_error_from_d_bus_is_shown_escaped_and_cut_at_256_characters() {
-        let error = LaunchError::DBus(format!("a\x1b[2J\n{}", "b".repeat(5000)));
+        let error = LaunchError::DBus(DBusError::Call(format!("a\x1b[2J\n{}", "b".repeat(5000))));
         assert_eq!(
             error.to_string(),
             format!(
@@ -1579,7 +1639,7 @@ mod deadline_tests {
         let took = started.elapsed();
         let stage = STEPS.get(answered).map_or("the call", |step| *step);
         assert!(
-            matches!(&found, Err(LaunchError::DBus(message)) if message.contains("did not answer")),
+            matches!(&found, Err(LaunchError::DBus(DBusError::Timeout(_)))),
             "stopped at {stage}: {found:?}"
         );
         assert!(
