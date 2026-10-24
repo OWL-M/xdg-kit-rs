@@ -425,6 +425,7 @@ dependencies = [
  "xdg-kit-basedir",
  "xdg-kit-locale",
  "zbus",
+ "zruntime",
 ]
 
 [[package]]

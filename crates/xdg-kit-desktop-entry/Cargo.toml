@@ -13,7 +13,7 @@ categories = ["os::unix-apis", "parser-implementations"]
 
 [features]
 ## Launching applications through D-Bus activation (`DBusActivatable=true`).
-dbus = ["dep:zbus"]
+dbus = ["dep:zbus", "dep:zruntime"]
 # Not public API: compiles in the work counter of this crate's counted tests
 # (`work` in src/key_file.rs), for the workspace's own tests only.
 # `xdg-kit-mime-apps` turns it on in its dev-dependencies, so that its counted
@@ -26,6 +26,7 @@ rustix = { workspace = true, features = ["fs"] }
 xdg-kit-basedir.workspace = true
 xdg-kit-locale.workspace = true
 zbus = { workspace = true, optional = true }
+zruntime = { workspace = true, optional = true }
 
 # `MAXSYMLINKS`, the most links a write follows, on the systems the libc
 # crate defines it for (see `MAX_LINKS` in src/key_file.rs).

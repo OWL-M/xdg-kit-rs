@@ -24,6 +24,12 @@ xdg-kit-mime-apps = { path = "crates/xdg-kit-mime-apps", version = "0.1.0" }
 # entry crate), driven by zbus's `block_on` on its own runtime, or on the
 # Tokio runtime zbus keeps when something else turns its `tokio` feature on.
 zbus = { version = "6.1", default-features = false, features = ["default-rt"] }
+# The deadline of a D-Bus activation: a timer of the runtime zbus's
+# `block_on` drives (the same per-thread runtime), so the library starts no
+# thread for it. `helper` keeps the timer firing when some other runtime
+# (zbus's `tokio` feature, unified in by another crate) drives the call
+# instead: zruntime's own short-lived helper thread fires it then.
+zruntime = { version = "0.2.1", default-features = false, features = ["runtime", "helper"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
