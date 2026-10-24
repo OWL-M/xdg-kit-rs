@@ -21,12 +21,9 @@ xdg-kit-locale = { path = "crates/xdg-kit-locale", version = "0.1.0" }
 xdg-kit-mime = { path = "crates/xdg-kit-mime", version = "0.1.0" }
 xdg-kit-mime-apps = { path = "crates/xdg-kit-mime-apps", version = "0.1.0" }
 # D-Bus calls for `DBusActivatable` entries (`dbus` feature of the desktop
-# entry crate). zbus runs on async-io (not tokio); the crate drives the call
-# with async-io's `block_on` and bounds it with its `Timer`, racing the two
-# with futures-lite's `or`. Both are already dependencies of zbus.
-async-io = "2.6"
-futures-lite = { version = "2.6", default-features = false }
-zbus = { version = "5.19", default-features = false, features = ["async-io"] }
+# entry crate), driven by zbus's `block_on` on its own runtime, or on the
+# Tokio runtime zbus keeps when something else turns its `tokio` feature on.
+zbus = { version = "6.1", default-features = false, features = ["default-rt"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

@@ -14,7 +14,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 use xdg_kit_desktop_entry::{DesktopEntry, Launch, LaunchOptions, Target, prepare_launch};
-use zbus::zvariant::OwnedValue;
+use zbus::OwnedVariant;
 
 #[test]
 fn activation_calls_reach_the_application() {
@@ -109,7 +109,7 @@ const PRIVATE_BUS: &str = "XDG_KIT_TEST_PRIVATE_BUS";
 struct Calls(Arc<Mutex<Vec<String>>>);
 
 /// The platform data the launch passes on.
-fn token(platform_data: &HashMap<String, OwnedValue>) -> String {
+fn token(platform_data: &HashMap<String, OwnedVariant>) -> String {
     let get = |key: &str| {
         platform_data
             .get(key)
@@ -127,14 +127,14 @@ fn token(platform_data: &HashMap<String, OwnedValue>) -> String {
 #[allow(clippy::needless_pass_by_value)]
 #[zbus::interface(name = "org.freedesktop.Application")]
 impl Calls {
-    fn activate(&self, platform_data: HashMap<String, OwnedValue>) {
+    fn activate(&self, platform_data: HashMap<String, OwnedVariant>) {
         self.0
             .lock()
             .unwrap()
             .push(format!("Activate token={}", token(&platform_data)));
     }
 
-    fn open(&self, uris: Vec<String>, platform_data: HashMap<String, OwnedValue>) {
+    fn open(&self, uris: Vec<String>, platform_data: HashMap<String, OwnedVariant>) {
         self.0.lock().unwrap().push(format!(
             "Open {} token={}",
             uris.join(" "),
@@ -145,8 +145,8 @@ impl Calls {
     fn activate_action(
         &self,
         name: String,
-        parameter: Vec<OwnedValue>,
-        platform_data: HashMap<String, OwnedValue>,
+        parameter: Vec<OwnedVariant>,
+        platform_data: HashMap<String, OwnedVariant>,
     ) {
         self.0.lock().unwrap().push(format!(
             "ActivateAction {name} parameters={} token={}",
@@ -166,15 +166,25 @@ fn served_activation() {
         return;
     }
     let calls = Arc::new(Mutex::new(Vec::new()));
-    // A '-' in the name becomes '_' in the object path.
-    let _server = zbus::blocking::connection::Builder::session()
-        .unwrap()
-        .name("org.example.Foo-Bar")
-        .unwrap()
-        .serve_at("/org/example/Foo_Bar", Calls(Arc::clone(&calls)))
-        .unwrap()
-        .build()
-        .unwrap();
+    // A connection is served only while a thread runs zbus's `block_on`, so
+    // the application is served from a thread that stays in it; it ends
+    // with the test process.
+    let (served, ready) = std::sync::mpsc::channel();
+    let served_calls = Calls(Arc::clone(&calls));
+    std::thread::spawn(move || {
+        zbus::block_on(async move {
+            // A '-' in the name becomes '_' in the object path.
+            let _server = zbus::connection::Builder::session()
+                .name("org.example.Foo-Bar")
+                .serve_at("/org/example/Foo_Bar", served_calls)
+                .build()
+                .await
+                .unwrap();
+            served.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+    });
+    ready.recv().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("org.example.Foo-Bar.desktop");
     std::fs::write(

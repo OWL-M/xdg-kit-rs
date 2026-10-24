@@ -586,11 +586,9 @@ impl LaunchPlan {
     /// When a program cannot be started ([`LaunchError::Spawn`] holds the
     /// handles of those started before it, which keep running) or the D-Bus
     /// call fails, which it also does when the bus and the application have
-    /// not answered within 25 seconds from the start of connecting. A bus
-    /// whose queue of waiting connections stays full can leave a thread of
-    /// the `blocking` crate's pool (zbus on async-io, as this crate builds
-    /// it) in `connect` for each such launch, as
-    /// many as the pool's limit on threads.
+    /// not answered within 25 seconds from the start of connecting. The call
+    /// blocks the calling thread, which must not be one an async runtime
+    /// runs its tasks on: zbus's `block_on` drives it there.
     pub fn spawn(&self) -> Result<Vec<Child>, LaunchError> {
         match &self.launch {
             Launch::Commands(commands) => {
@@ -639,18 +637,14 @@ fn call_dbus(call: &DBusCall) -> Result<(), LaunchError> {
 }
 
 /// Makes `call` on the bus at `address`. Connection, authentication, `Hello`
-/// and the call run as one task with deadline `limit`. At the deadline,
-/// dropping the task closes the connection.
+/// and the call run as one future with deadline `limit`. At the deadline,
+/// dropping the future closes the connection.
 ///
 /// zbus's own `method_timeout` bounds only the call, not the steps before
 /// it, and its socket is non-blocking, so a socket timeout bounds nothing.
-/// With async-io, as this crate builds zbus, zbus runs the blocking
-/// `connect` to a Unix socket on a thread of the `blocking` crate's pool.
-/// On a bus whose queue of waiting connections stays full, that `connect`
-/// blocks: the call still fails at the deadline, but the thread stays in
-/// `connect` until it returns, so each such launch can leave one thread
-/// behind, as many as the pool's limit on threads; once it is reached,
-/// later calls wait for a thread and still fail at the deadline.
+/// zbus has no timer of its own to offer, and which runtime its `block_on`
+/// uses depends on the features other crates turn on, so the deadline is
+/// one that needs no runtime: see [`Deadline`].
 #[cfg(feature = "dbus")]
 fn call_bus_at(
     call: &DBusCall,
@@ -658,12 +652,12 @@ fn call_bus_at(
     limit: std::time::Duration,
 ) -> Result<(), LaunchError> {
     use std::collections::HashMap;
-    use zbus::zvariant::Value;
+    use zbus::Variant;
 
-    let platform_data: HashMap<&str, Value<'_>> = call
+    let platform_data: HashMap<&str, Variant<'_>> = call
         .platform_data
         .iter()
-        .map(|(key, value)| (key.as_str(), Value::from(value.as_str())))
+        .map(|(key, value)| (key.as_str(), Variant::from(value.as_str())))
         .collect();
     let (bus, path, interface) = (
         call.bus_name.as_str(),
@@ -671,7 +665,7 @@ fn call_bus_at(
         "org.freedesktop.Application",
     );
     let connect_and_call = async {
-        let connection = zbus::connection::Builder::address(address)?.build().await?;
+        let connection = zbus::connection::Builder::address(address).build().await?;
         match &call.method {
             DBusMethod::Activate => {
                 connection
@@ -702,7 +696,7 @@ fn call_bus_at(
                         path,
                         Some(interface),
                         "ActivateAction",
-                        &(name, Vec::<Value<'_>>::new(), &platform_data),
+                        &(name, Vec::<Variant<'_>>::new(), &platform_data),
                     )
                     .await
             }
@@ -714,16 +708,77 @@ fn call_bus_at(
             .await
             .map_err(|err: zbus::Error| LaunchError::DBus(err.to_string()))
     };
-    // Made before the task is first polled, so that the deadline counts
+    // Started before the call is first polled, so that the deadline counts
     // from before connecting.
-    let timer = async_io::Timer::after(limit);
-    let deadline = async {
-        timer.await;
-        Err(LaunchError::DBus(format!(
-            "the bus or the application did not answer within {limit:?}"
-        )))
-    };
-    async_io::block_on(futures_lite::future::or(work, deadline))
+    let mut deadline = Deadline::after(limit);
+    let mut work = std::pin::pin!(work);
+    zbus::block_on(std::future::poll_fn(|cx| {
+        if let std::task::Poll::Ready(done) = work.as_mut().poll(cx) {
+            return std::task::Poll::Ready(done);
+        }
+        std::pin::Pin::new(&mut deadline).poll(cx).map(|()| {
+            Err(LaunchError::DBus(format!(
+                "the bus or the application did not answer within {limit:?}"
+            )))
+        })
+    }))
+}
+
+/// A future ready once its time is up, on whatever runtime polls it: a
+/// thread of its own waits out the time and wakes it. Dropped earlier, it
+/// ends that thread at once.
+#[cfg(feature = "dbus")]
+struct Deadline {
+    /// Whether the time is up, and the waker to wake when it is.
+    shared: std::sync::Arc<std::sync::Mutex<(bool, Option<std::task::Waker>)>>,
+    /// Dropped with the deadline, which wakes the thread before its time.
+    _cancel: std::sync::mpsc::Sender<()>,
+}
+
+#[cfg(feature = "dbus")]
+impl Deadline {
+    fn after(limit: std::time::Duration) -> Self {
+        let shared = std::sync::Arc::new(std::sync::Mutex::new((false, None::<std::task::Waker>)));
+        let (cancel, cancelled) = std::sync::mpsc::channel::<()>();
+        let timer = std::sync::Arc::clone(&shared);
+        std::thread::spawn(move || {
+            // Nothing is ever sent: only the time running out, or the
+            // sender being dropped, ends the wait.
+            if cancelled.recv_timeout(limit) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
+                let mut state = timer
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state.0 = true;
+                if let Some(waker) = state.1.take() {
+                    waker.wake();
+                }
+            }
+        });
+        Self {
+            shared,
+            _cancel: cancel,
+        }
+    }
+}
+
+#[cfg(feature = "dbus")]
+impl std::future::Future for Deadline {
+    type Output = ();
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        let mut state = self
+            .shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.0 {
+            return std::task::Poll::Ready(());
+        }
+        state.1 = Some(cx.waker().clone());
+        std::task::Poll::Pending
+    }
 }
 
 #[cfg(not(feature = "dbus"))]
