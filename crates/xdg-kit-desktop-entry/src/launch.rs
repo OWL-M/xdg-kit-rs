@@ -668,7 +668,11 @@ impl LaunchPlan {
     /// [`LaunchOptions::dbus_timeout`] (25 seconds by default) plus a
     /// bounded cleanup: when it returns, the connection it made has been
     /// explicitly closed — on success, on an error and at the deadline
-    /// alike. The deadline makes the call eligible to stop; scheduling can
+    /// alike — and the peer has seen the closure. One descriptor of the
+    /// closed connection can outlive the call until the driving runtime
+    /// next runs (zbus only aborts its reader task); a later call replaces
+    /// it, so it never accumulates. The deadline makes the call eligible
+    /// to stop; scheduling can
     /// delay the actual return a little beyond it. The timer is the
     /// driving runtime's own. An async application must not call this on a
     /// thread its runtime's tasks run on: hand it to the runtime's
@@ -855,11 +859,14 @@ fn call_bus_at(
             Err(_) => Err(LaunchError::DBus(DBusError::Timeout(limit))),
         };
         // Cleanup is part of the operation: the socket is closed at once
-        // (the peer sees it), then the shutdown is awaited until the
-        // connection — reader task, buffers and all — is fully dropped,
-        // all while the runtime is still driven. The bound keeps a wedged
-        // teardown from holding the caller; past it, what remains is
-        // reclaimed when the runtime next runs.
+        // (the peer sees it), then the shutdown is awaited until no handle
+        // to the connection is left. Not everything can be waited for:
+        // zbus only aborts its socket-reader task, so the runtime reaps it
+        // — and the socket's read half with it — on its own time, which on
+        // a runtime nothing else drives is its next call. One descriptor
+        // may thus outlive the call; it is replaced then, never joined by
+        // another. The bound keeps a wedged teardown from holding the
+        // caller.
         let _ = runtime
             .timeout_at(std::time::Instant::now() + CLEANUP_TIMEOUT, async {
                 let _ = connection.clone().close().await;
@@ -883,6 +890,15 @@ fn call_error(err: zbus::Error) -> DBusError {
         zbus::Error::MethodError(name, detail, _) => DBusError::Call {
             name: Some(name.to_string()),
             message: detail.unwrap_or_default(),
+        },
+        // The standard-named error replies, which zbus turns into values
+        // of its own (`org.freedesktop.DBus.Error.ServiceUnknown` and the
+        // like).
+        zbus::Error::FDO(err) => DBusError::Call {
+            name: Some(zbus::DBusError::name(err.as_ref()).to_string()),
+            message: zbus::DBusError::description(err.as_ref())
+                .unwrap_or_default()
+                .to_owned(),
         },
         other => DBusError::Call {
             name: None,
@@ -1602,14 +1618,15 @@ mod deadline_tests {
     /// silent. The receiver gets the moment the client closed the
     /// connection, and all the client sent.
     fn fake_bus(answered: usize) -> (zbus::Address, mpsc::Receiver<(Instant, Vec<u8>)>) {
-        fake_bus_at(answered, false)
+        fake_bus_at(answered, None)
     }
 
     /// [`fake_bus`], answering the call itself (the last of [`STEPS`]) with
-    /// an error reply instead of a method return when `rejecting`.
+    /// an error reply named `error` instead of a method return, when one
+    /// is given.
     fn fake_bus_at(
         answered: usize,
-        rejecting: bool,
+        error: Option<&'static str>,
     ) -> (zbus::Address, mpsc::Receiver<(Instant, Vec<u8>)>) {
         // Unique to this run and bus: the process, the time and `answered`.
         let name = format!(
@@ -1636,7 +1653,7 @@ mod deadline_tests {
                 };
                 read.extend_from_slice(&buffer[..n]);
                 while sent < answered {
-                    let Some(answer) = answer(sent, &read, rejecting) else {
+                    let Some(answer) = answer(sent, &read, error) else {
                         break;
                     };
                     stream.write_all(&answer).unwrap();
@@ -1649,9 +1666,9 @@ mod deadline_tests {
     }
 
     /// The answer to step `step` of [`STEPS`], once what the client sent
-    /// so far, `read`, holds its request; an error reply to the call when
-    /// `rejecting`.
-    fn answer(step: usize, read: &[u8], rejecting: bool) -> Option<Vec<u8>> {
+    /// so far, `read`, holds its request; an error reply named `error` to
+    /// the call, when one is given.
+    fn answer(step: usize, read: &[u8], error: Option<&'static str>) -> Option<Vec<u8>> {
         let has = |line: &[u8]| read.windows(line.len()).any(|window| window == line);
         match step {
             0 => (has(b"AUTH EXTERNAL") && has(b"\r\n"))
@@ -1677,8 +1694,8 @@ mod deadline_tests {
                 };
                 Some(if step == 2 {
                     reply(serial, Some(":1.1"))
-                } else if rejecting {
-                    error_reply(serial, "org.example.Error.No", "no")
+                } else if let Some(name) = error {
+                    error_reply(serial, name, "no")
                 } else {
                     reply(serial, None)
                 })
@@ -1913,13 +1930,35 @@ mod deadline_tests {
 
     #[test]
     fn a_rejected_call_reports_the_errors_name() {
-        let (address, closed_at) = fake_bus_at(STEPS.len(), true);
+        let (address, closed_at) = fake_bus_at(STEPS.len(), Some("org.example.Error.No"));
         let found = call_bus_at(&activate(), address, LIMIT);
         assert!(
             matches!(
                 &found,
                 Err(LaunchError::DBus(DBusError::Call { name: Some(name), message }))
                     if name == "org.example.Error.No" && message == "no"
+            ),
+            "{found:?}"
+        );
+        closed_at
+            .recv_timeout(SLACK)
+            .expect("rejected: the connection is still open");
+    }
+
+    #[test]
+    fn a_standard_error_keeps_its_name_too() {
+        // zbus turns the standard-named error replies into values of its
+        // own (`zbus::Error::FDO`), a path apart from custom names.
+        let (address, closed_at) = fake_bus_at(
+            STEPS.len(),
+            Some("org.freedesktop.DBus.Error.ServiceUnknown"),
+        );
+        let found = call_bus_at(&activate(), address, LIMIT);
+        assert!(
+            matches!(
+                &found,
+                Err(LaunchError::DBus(DBusError::Call { name: Some(name), message }))
+                    if name == "org.freedesktop.DBus.Error.ServiceUnknown" && message == "no"
             ),
             "{found:?}"
         );

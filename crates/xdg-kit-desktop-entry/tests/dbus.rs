@@ -217,8 +217,10 @@ fn served_activation() {
     );
     options.action = Some("New".into());
     launch(&[], &options);
-    // Teardown is part of each call: every socket a call opened is closed
-    // again before its spawn returned.
+    // Teardown is part of each call: no socket accumulates across calls.
+    // (The serving thread drives the shared runtime here, so even the one
+    // descriptor the aborted reader may briefly hold is reaped; a client
+    // whose runtime nothing drives keeps that one until its next call.)
     assert_eq!(open_sockets(), baseline);
     assert_eq!(
         *calls.lock().unwrap(),
