@@ -54,7 +54,8 @@ pub struct LaunchOptions {
     /// library's default for a call). When the deadline passes, the call
     /// becomes eligible to stop and fails with [`DBusError::Timeout`];
     /// scheduling can delay its actual return a little beyond it. A zero
-    /// timeout fails the call as soon as it would first wait.
+    /// timeout fails the call as soon as it would first wait, and one too
+    /// large for the clock to represent is effectively unlimited.
     pub dbus_timeout: std::time::Duration,
 }
 
@@ -665,7 +666,12 @@ impl LaunchPlan {
     /// handles of those started before it, which keep running), or the
     /// D-Bus call fails ([`DBusError`] says how: no bus, a connection or
     /// call failure, the deadline, or the thread's runtime being out of
-    /// resources — all reported, none panicking).
+    /// resources — all reported). In the default build nothing on this
+    /// path panics. When another crate turns on zbus's `tokio` feature,
+    /// though, zbus and zruntime set runtime machinery of theirs up with
+    /// panics on operating-system resource exhaustion that cannot be
+    /// reported from here: the Tokio runtime zbus then keeps, and the
+    /// helper thread zruntime fires this call's deadline from.
     pub fn spawn(&self) -> Result<Vec<Child>, LaunchError> {
         match &self.launch {
             Launch::Commands(commands) => {
@@ -731,6 +737,13 @@ fn call_dbus(call: &DBusCall) -> Result<(), LaunchError> {
 /// either way, and closing the connection inside `block_on` is what
 /// guarantees cleanup even on a runtime that stops being driven the moment
 /// `block_on` returns.
+///
+/// One limit: on that `tokio` build, zbus starts its Tokio runtime and
+/// zruntime its helper thread with panics on operating-system resource
+/// exhaustion (their `expect`s), before or beside any error path here, so
+/// [`DBusError::Resource`] covers only the failure this crate can see,
+/// `SharedRuntime::current`. The default build has no such panic: this
+/// thread drives its own timer.
 #[cfg(feature = "dbus")]
 fn call_bus_at(
     call: &DBusCall,
@@ -751,8 +764,13 @@ fn call_bus_at(
         "org.freedesktop.Application",
     );
     // Taken before any connection work: scheduling delays shorten the wait
-    // rather than extend the documented bound.
-    let expires = std::time::Instant::now() + limit;
+    // rather than extend the documented bound. A deadline the clock cannot
+    // represent is clamped to thirty years out: effectively unlimited,
+    // which is what such a timeout asked for, rather than a panic.
+    let now = std::time::Instant::now();
+    let expires = now
+        .checked_add(limit)
+        .unwrap_or_else(|| now + std::time::Duration::from_hours(30 * 365 * 24));
     zbus::block_on(async {
         let runtime = zruntime::SharedRuntime::current()
             .map_err(|err| LaunchError::DBus(DBusError::Resource(err)))?;
@@ -1766,5 +1784,40 @@ mod deadline_tests {
         for _ in 0..3 {
             assert_given_up_at_the_deadline(3);
         }
+    }
+
+    /// The call `assert_answered_call_closes_the_connection` makes, for the
+    /// tests that give it a deadline of their own.
+    fn activate() -> DBusCall {
+        DBusCall {
+            bus_name: "org.example.Foo".to_owned(),
+            object_path: "/org/example/Foo".to_owned(),
+            method: DBusMethod::Activate,
+            platform_data: Vec::new(),
+            timeout: LIMIT,
+        }
+    }
+
+    #[test]
+    fn a_zero_timeout_fails_at_the_first_wait_and_closes_the_connection() {
+        let (address, closed_at) = fake_bus(0);
+        let found = call_bus_at(&activate(), address, Duration::ZERO);
+        assert!(
+            matches!(&found, Err(LaunchError::DBus(DBusError::Timeout(_)))),
+            "{found:?}"
+        );
+        closed_at
+            .recv_timeout(SLACK)
+            .expect("zero timeout: the connection is still open");
+    }
+
+    #[test]
+    fn an_oversized_timeout_is_effectively_unlimited_not_a_panic() {
+        let (address, closed_at) = fake_bus(STEPS.len());
+        let found = call_bus_at(&activate(), address, Duration::MAX);
+        assert!(found.is_ok(), "{found:?}");
+        closed_at
+            .recv_timeout(SLACK)
+            .expect("oversized timeout: the connection is still open");
     }
 }
