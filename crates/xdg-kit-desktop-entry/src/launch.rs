@@ -225,7 +225,10 @@ impl fmt::Display for DBusError {
             }
             Self::Call(err) => write!(f, "{}", quoted_message(err)),
             Self::Timeout(limit) => {
-                write!(f, "the bus or the application did not answer within {limit:?}")
+                write!(
+                    f,
+                    "the bus or the application did not answer within {limit:?}"
+                )
             }
             Self::Resource(err) => write!(f, "the thread's runtime: {err}"),
         }

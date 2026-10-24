@@ -43,8 +43,7 @@ pub use index::{AppEntry, AppIndex};
 pub use key_file::{EditError, KeyFile, KeyNames};
 pub use launch::{
     DBusCall, DBusError, DBusMethod, Launch, LaunchError, LaunchOptions, LaunchPlan,
-    PlannedCommand, Target,
-    prepare_launch,
+    PlannedCommand, Target, prepare_launch,
 };
 pub use limits::Limits;
 pub use validate::{Issue, Level, validate};
