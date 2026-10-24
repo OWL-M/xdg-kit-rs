@@ -49,6 +49,13 @@ pub struct LaunchOptions {
     /// default when the `dbus` feature is built; without it, entries are
     /// always launched through `Exec`.
     pub dbus: bool,
+    /// How long a D-Bus activation may take, from connecting to the bus to
+    /// the application's answer; 25 seconds by default (the reference D-Bus
+    /// library's default for a call). When the deadline passes, the call
+    /// becomes eligible to stop and fails with [`DBusError::Timeout`];
+    /// scheduling can delay its actual return a little beyond it. A zero
+    /// timeout fails the call as soon as it would first wait.
+    pub dbus_timeout: std::time::Duration,
 }
 
 impl Default for LaunchOptions {
@@ -60,6 +67,7 @@ impl Default for LaunchOptions {
             terminal: None,
             locales: Locales::untranslated(),
             dbus: cfg!(feature = "dbus"),
+            dbus_timeout: DBUS_TIMEOUT,
         }
     }
 }
@@ -108,6 +116,9 @@ pub struct DBusCall {
     /// The `platform-data` entries (`activation-token`,
     /// `desktop-startup-id`).
     pub platform_data: Vec<(String, String)>,
+    /// How long the whole call may take, from connecting to the answer
+    /// ([`LaunchOptions::dbus_timeout`]).
+    pub timeout: std::time::Duration,
 }
 
 /// How an application is launched.
@@ -194,8 +205,8 @@ pub enum DBusError {
     Connect(String),
     /// The bus or the application rejected or failed the call.
     Call(String),
-    /// The bus or the application did not answer within this deadline,
-    /// counted from before connecting.
+    /// The bus or the application did not answer within this deadline
+    /// ([`LaunchOptions::dbus_timeout`]), counted from before connecting.
     Timeout(std::time::Duration),
     /// The calling thread's runtime could not be set up: an operating
     /// system resource ran out.
@@ -356,6 +367,7 @@ fn dbus_plan(
             object_path,
             method,
             platform_data,
+            timeout: options.dbus_timeout,
         }),
         targets_ignored,
     })
@@ -673,18 +685,17 @@ impl LaunchPlan {
     }
 }
 
-/// How long a D-Bus activation may take, from connecting to the bus to the
-/// application's answer: the reference D-Bus library's default for a call.
-/// A bus or application that stops answering at any step would otherwise
-/// block the caller for ever.
-#[cfg(feature = "dbus")]
+/// How long a D-Bus activation may take by default, from connecting to the
+/// bus to the application's answer: the reference D-Bus library's default
+/// for a call. A bus or application that stops answering at any step would
+/// otherwise block the caller for ever.
 const DBUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
 
 #[cfg(feature = "dbus")]
 fn call_dbus(call: &DBusCall) -> Result<(), LaunchError> {
     let address = zbus::Address::session()
         .map_err(|err| LaunchError::DBus(DBusError::NoSessionBus(err.to_string())))?;
-    call_bus_at(call, address, DBUS_TIMEOUT)
+    call_bus_at(call, address, call.timeout)
 }
 
 /// Makes `call` on the bus at `address`. Connection, authentication, `Hello`
@@ -1313,6 +1324,13 @@ mod tests {
             [("activation-token".to_owned(), "t".to_owned())]
         );
         assert_eq!(call(&[], &options).method, DBusMethod::Activate);
+        // The call's deadline comes from the options; 25 s by default.
+        assert_eq!(open.timeout, std::time::Duration::from_secs(25));
+        options.dbus_timeout = std::time::Duration::from_secs(3);
+        assert_eq!(
+            call(&[], &options).timeout,
+            std::time::Duration::from_secs(3)
+        );
         options.action = Some("New".into());
         assert_eq!(
             call(&[], &options).method,
@@ -1633,6 +1651,7 @@ mod deadline_tests {
             object_path: "/org/example/Foo".to_owned(),
             method: DBusMethod::Activate,
             platform_data: Vec::new(),
+            timeout: LIMIT,
         };
         let started = Instant::now();
         let found = call_bus_at(&call, address, LIMIT);
