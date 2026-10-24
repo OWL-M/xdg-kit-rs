@@ -641,16 +641,28 @@ fn percent_decode(text: &str) -> Option<Vec<u8>> {
 impl LaunchPlan {
     /// Runs the plan. Programs are started in their own process group,
     /// and their [`Child`] handles are returned: wait on them (the library
-    /// starts no threads to do it). A D-Bus call returns no children.
+    /// starts no threads, neither to wait nor for anything else). A D-Bus
+    /// call returns no children.
+    ///
+    /// A D-Bus call blocks the calling thread, up to
+    /// [`LaunchOptions::dbus_timeout`] (25 seconds by default) plus a
+    /// bounded cleanup: when it returns, the connection it made has been
+    /// explicitly closed — on success, on an error and at the deadline
+    /// alike. The deadline makes the call eligible to stop; scheduling can
+    /// delay the actual return a little beyond it. The timer is the
+    /// driving runtime's own. An async application must not call this on a
+    /// thread its runtime's tasks run on: hand it to the runtime's
+    /// blocking-work facility (such as `tokio::task::spawn_blocking` or
+    /// `smol::unblock`) instead, as zbus's `block_on` drives the call
+    /// there.
     ///
     /// # Errors
     ///
     /// When a program cannot be started ([`LaunchError::Spawn`] holds the
-    /// handles of those started before it, which keep running) or the D-Bus
-    /// call fails, which it also does when the bus and the application have
-    /// not answered within 25 seconds from the start of connecting. The call
-    /// blocks the calling thread, which must not be one an async runtime
-    /// runs its tasks on: zbus's `block_on` drives it there.
+    /// handles of those started before it, which keep running), or the
+    /// D-Bus call fails ([`DBusError`] says how: no bus, a connection or
+    /// call failure, the deadline, or the thread's runtime being out of
+    /// resources — all reported, none panicking).
     pub fn spawn(&self) -> Result<Vec<Child>, LaunchError> {
         match &self.launch {
             Launch::Commands(commands) => {
