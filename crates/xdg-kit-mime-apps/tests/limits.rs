@@ -64,7 +64,7 @@ fn the_entries_a_cache_walk_lists_can_be_set_or_unlimited() {
     assert!(write_mimeinfo_cache_with(dir.path(), &limits).is_err());
     assert!(!dir.path().join("mimeinfo.cache").exists());
     limits.max_listed = None;
-    write_mimeinfo_cache_with(dir.path(), &limits).unwrap();
+    let _ = write_mimeinfo_cache_with(dir.path(), &limits).unwrap();
     assert_eq!(
         fs::read_to_string(dir.path().join("mimeinfo.cache")).unwrap(),
         all

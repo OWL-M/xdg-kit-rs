@@ -596,6 +596,70 @@ mod listing_and_linearity {
     use crate::{Locales, themes};
 
     #[test]
+    fn a_fallback_hit_does_not_pay_for_the_unexplored_chain() {
+        // The chain is generated lazily: when the full name hits, the
+        // work is linear in the name, however many segments it could
+        // have been shortened by. (An eager chain would copy every
+        // shrinking prefix first: quadratic in the segment count.)
+        crate::work::assert_linear(
+            // Doubled, the icon's file name stays within NAME_MAX.
+            24,
+            |n| {
+                let home = tempfile::tempdir().unwrap();
+                let data = tempfile::tempdir().unwrap();
+                let dir = theme(
+                    data.path(),
+                    "t",
+                    "[Icon Theme]\nName=T\nDirectories=16\n[16]\nSize=16\nType=Fixed\n",
+                );
+                let name = format!("{}-symbolic", vec!["seg"; n].join("-"));
+                icon(&dir, "16", &format!("{name}.png"));
+                let base = base(home.path(), data.path());
+                let loaded = IconThemes::load(&base, "t");
+                let (hit, steps) =
+                    crate::work::steps(|| loaded.lookup_with_fallbacks(&name, &request(16, 1)));
+                assert_eq!(hit.unwrap().matched_name(), name);
+                (steps, name.len())
+            },
+            // The split, one styled copy, one hashed probe: a few passes
+            // over the name.
+            |_, bytes| 2 * (8 * bytes + 16),
+        );
+    }
+
+    #[test]
+    fn a_fallback_miss_is_linear_in_the_name() {
+        // A miss walks the alternatives but hashes only those no longer
+        // than anything indexed: doubling a hyphen-rich missing name
+        // doubles the work. (Probing every alternative would quadruple
+        // it: the summed prefix lengths.)
+        crate::work::assert_linear(
+            512,
+            |n| {
+                let home = tempfile::tempdir().unwrap();
+                let data = tempfile::tempdir().unwrap();
+                let dir = theme(
+                    data.path(),
+                    "t",
+                    "[Icon Theme]\nName=T\nDirectories=16\n[16]\nSize=16\nType=Fixed\n",
+                );
+                icon(&dir, "16", "indexed-icon.png");
+                let name = vec!["seg"; n].join("-");
+                let base = base(home.path(), data.path());
+                let loaded = IconThemes::load(&base, "t");
+                let (missed, steps) =
+                    crate::work::steps(|| loaded.lookup_with_fallbacks(&name, &request(16, 1)));
+                assert!(missed.is_none());
+                (steps, name.len())
+            },
+            // The split, the alternatives walked in the theme and the
+            // unthemed pass, and a few probes of up to the longest
+            // indexed name each.
+            |n, bytes| 2 * (4 * bytes + 8 * n + 256),
+        );
+    }
+
+    #[test]
     fn installed_themes_list_with_their_picker_fields() {
         let home = tempfile::tempdir().unwrap();
         let data = tempfile::tempdir().unwrap();
@@ -956,10 +1020,12 @@ mod seventh_round_regressions {
             LoadOptions::default(),
         );
         assert!(
-            themes
-                .diagnostics()
-                .iter()
-                .any(|d| d.message.contains("table past the file")),
+            themes.diagnostics().iter().any(|d| {
+                // On 32-bit targets the checked offset arithmetic refuses
+                // the count before the table-span check can.
+                d.message.contains("table past the file")
+                    || d.message.contains("past addressable memory")
+            }),
             "{:?}",
             themes.diagnostics()
         );

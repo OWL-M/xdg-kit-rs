@@ -155,6 +155,67 @@ pub struct MimeAppsList {
     /// every edit, so that an edit finds a type's keys without looking at
     /// the group's other keys.
     keys: KeyIndex,
+    /// The bytes as read (or last written): what the destination must
+    /// still hold for [`MimeAppsList::write`] to commit.
+    source: Vec<u8>,
+    /// The destination's identity when `source` was read.
+    baseline: Baseline,
+    /// The limits the file was opened within; writing checks the result
+    /// against them, so this very list could read back what it writes.
+    limits: Limits,
+}
+
+/// What the destination must still look like for a write to commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Baseline {
+    /// Parsed from bytes: no file, no write.
+    Detached,
+    /// The file was absent at open; a write installs without replacing.
+    Absent,
+    /// The file's identity when exactly the source bytes were read.
+    Stamped(xdg_kit_basedir::FileStamp),
+    /// A write committed, but the committed file's identity could not be
+    /// read; the next checked write reports a conflict rather than guess.
+    Unknown,
+}
+
+/// Why a write did not complete.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum WriteError {
+    /// This list was parsed from bytes and has no file.
+    NoFile,
+    /// The file changed since it was opened: someone else wrote it. The
+    /// pending edits are kept; reopen, reapply and retry (or
+    /// [`MimeAppsList::write_overwriting`] deliberately).
+    Conflict,
+    /// The serialized bytes are over [`Limits::max_file_len`]: this very
+    /// list could not read back what it wrote. Nothing was replaced; the
+    /// pending edits stay.
+    OverLimits,
+    /// Reading back the destination for the conflict check, or writing,
+    /// failed; nothing was replaced.
+    Io(io::Error),
+}
+
+impl fmt::Display for WriteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoFile => write!(f, "this list was not read from a file"),
+            Self::Conflict => write!(f, "the file changed since it was opened"),
+            Self::OverLimits => write!(f, "the result would be over the size limit"),
+            Self::Io(err) => write!(f, "cannot write the file: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for WriteError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(err) => Some(err),
+            Self::NoFile | Self::Conflict | Self::OverLimits => None,
+        }
+    }
 }
 
 impl MimeAppsList {
@@ -206,19 +267,24 @@ impl MimeAppsList {
         // Each byte of the path copied.
         work::count(path.as_os_str().len());
         let desktop_specific = path.file_name().is_some_and(|name| name != MIMEAPPS_LIST);
-        let file = match KeyFile::read_with_limits(&path, KeyNames::Any, &limits.for_entries()) {
-            Ok(file) => file,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                KeyFile::parse_with(b"", KeyNames::Any)
+        // The bytes paired with the identity of the very file they came
+        // from: the baseline a later write revalidates against.
+        let (source, baseline) = match xdg_kit_basedir::read_stamped(&path, limits.max_file_len)? {
+            None => (Vec::new(), Baseline::Absent),
+            Some(read) => {
+                work::count(read.bytes.len());
+                (read.bytes, Baseline::Stamped(read.stamp))
             }
-            Err(err) => return Err(err),
         };
         Ok(Self {
-            file,
+            file: KeyFile::parse_with(&source, KeyNames::Any),
             path: Some(path),
             desktop_specific,
             database: None,
             keys: KeyIndex::new(),
+            source,
+            baseline,
+            limits: *limits,
         }
         .indexed())
     }
@@ -233,6 +299,9 @@ impl MimeAppsList {
             desktop_specific,
             database: None,
             keys: KeyIndex::new(),
+            source: Vec::new(),
+            baseline: Baseline::Detached,
+            limits: Limits::default(),
         }
         .indexed()
     }
@@ -645,19 +714,79 @@ impl MimeAppsList {
         self.file.to_bytes()
     }
 
-    /// Writes the list back to its file, atomically, creating missing
-    /// parent folders with mode `0700`.
+    /// Writes the list back, atomically, unless someone else changed the
+    /// file since it was opened. The replacement is fully prepared and
+    /// synced first; immediately before committing, the destination's
+    /// identity **and bytes** are compared against what was opened (equal
+    /// stamps cannot distinguish same-sized writes within one timestamp
+    /// tick, so the bytes are always compared). A file that was absent at
+    /// open is installed without replacing, so a competing creator is a
+    /// conflict too, never silently overwritten. The check and the rename
+    /// are still two steps, not one atomic operation: another writer can
+    /// slip between them, or overwrite the result afterwards — this does
+    /// not serialize applications that do not cooperate.
+    ///
+    /// After a committed write —
+    /// [`Durability::NotSynced`](xdg_kit_basedir::Durability::NotSynced)
+    /// included, since the replacement happened — the list moves forward:
+    /// the output becomes its source and the committed file's identity
+    /// (taken through the written file's own descriptor, never the
+    /// pathname) becomes the next baseline, so editing and writing again
+    /// needs no reopen. Missing parent folders are created with mode
+    /// `0700`. A fresh file gets mode `0644`; an existing file keeps its
+    /// permission bits (only those — ownership, ACLs and extended
+    /// attributes do not survive replacement). A symlink means the target
+    /// is replaced, the link kept.
     ///
     /// # Errors
     ///
-    /// When writing fails, or the list was parsed from bytes and has no file.
-    pub fn write(&self) -> io::Result<()> {
-        let Some(path) = &self.path else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "this list was not read from a file",
-            ));
+    /// [`WriteError::NoFile`] before anything is prepared;
+    /// [`WriteError::Conflict`] when the check fails (the destination is
+    /// untouched and the pending edits stay — reopen, reapply, retry);
+    /// [`WriteError::OverLimits`] when the result is over
+    /// [`Limits::max_file_len`]; [`WriteError::Io`] for everything the
+    /// filesystem refuses before a replacement.
+    pub fn write(&mut self) -> Result<xdg_kit_basedir::Durability, WriteError> {
+        self.write_checked(true)
+    }
+
+    /// Writes like [`MimeAppsList::write`], skipping the baseline check:
+    /// the explicitly named last-writer-wins operation. Whatever the file
+    /// holds now is replaced (or it is created). The post-write state
+    /// advances the same way.
+    ///
+    /// # Errors
+    ///
+    /// As [`MimeAppsList::write`], without the conflict outcome.
+    pub fn write_overwriting(&mut self) -> Result<xdg_kit_basedir::Durability, WriteError> {
+        self.write_checked(false)
+    }
+
+    fn write_checked(&mut self, check: bool) -> Result<xdg_kit_basedir::Durability, WriteError> {
+        use xdg_kit_basedir::{
+            CreateMode, Durability, PreparedWrite, SymlinkPolicy, WriteFileError, WriteOptions,
         };
+        const OPTIONS: WriteOptions = WriteOptions {
+            create: CreateMode::Exact(0o644),
+            preserve_mode: true,
+            symlinks: SymlinkPolicy::FollowTarget,
+        };
+        let Some(path) = self.path.clone() else {
+            return Err(WriteError::NoFile);
+        };
+        let bytes = self.to_bytes();
+        if check && self.baseline == Baseline::Absent && bytes.is_empty() {
+            // Nothing to say: an empty list is what a reader of the
+            // absent file already sees.
+            return Ok(Durability::Synced);
+        }
+        // The result must obey the list's own limits — otherwise this
+        // very list (or the next open) could not read back what it wrote.
+        if let Some(max) = self.limits.max_file_len
+            && bytes.len() as u64 > max
+        {
+            return Err(WriteError::OverLimits);
+        }
         if let Some(parent) = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty() && !parent.exists())
@@ -665,9 +794,84 @@ impl MimeAppsList {
             DirBuilder::new()
                 .recursive(true)
                 .mode(0o700)
-                .create(parent)?;
+                .create(parent)
+                .map_err(WriteError::Io)?;
         }
-        self.file.write(path)
+        let prepared = PreparedWrite::new(&path, &bytes, &OPTIONS).map_err(|err| match err {
+            WriteFileError::Before(err) => WriteError::Io(err),
+            // Links are followed; no-replace comes later.
+            other => WriteError::Io(io::Error::other(other.to_string())),
+        })?;
+        // Revalidation, after all the write latency and immediately
+        // before the rename.
+        let install_fresh = match (&self.baseline, check) {
+            (Baseline::Detached, _) => return Err(WriteError::NoFile),
+            (Baseline::Unknown, true) => return Err(WriteError::Conflict),
+            (Baseline::Absent, true) => {
+                // Follow links, as opening did: a dangling symlink means
+                // the target is still absent, and the install replaces
+                // the target, not the link.
+                if std::fs::metadata(&path).is_ok() {
+                    return Err(WriteError::Conflict);
+                }
+                true
+            }
+            (Baseline::Stamped(stamp), true) => {
+                self.revalidate(&path, &stamp.clone())?;
+                false
+            }
+            // Overwriting: no check; plain rename both creates and
+            // replaces.
+            (_, false) => false,
+        };
+        let committed = if install_fresh {
+            prepared.commit_unless_exists()
+        } else {
+            prepared.commit()
+        }
+        .map_err(|err| match err {
+            WriteFileError::Exists => WriteError::Conflict,
+            WriteFileError::Before(err) => WriteError::Io(err),
+            other => WriteError::Io(io::Error::other(other.to_string())),
+        })?;
+        // The write happened (durable or not): the list moves forward
+        // onto its own output.
+        self.source = bytes;
+        self.baseline = committed.stamp.map_or(Baseline::Unknown, Baseline::Stamped);
+        Ok(committed.durability)
+    }
+
+    /// Whether the destination still holds exactly what was opened.
+    /// Equal stamps cannot tell same-sized writes within one timestamp
+    /// tick apart, so the bytes are always compared — reading no more
+    /// than what could still match.
+    fn revalidate(
+        &self,
+        path: &Path,
+        stamp: &xdg_kit_basedir::FileStamp,
+    ) -> Result<(), WriteError> {
+        // Gone, no longer a regular file (a FIFO put in the way must
+        // neither hang this nor pass it), or grown past the opened size
+        // is changed.
+        let read = match xdg_kit_basedir::read_stamped(path, Some(self.source.len() as u64)) {
+            Ok(Some(read)) => read,
+            Ok(None) => return Err(WriteError::Conflict),
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::InvalidInput | io::ErrorKind::FileTooLarge
+                ) =>
+            {
+                return Err(WriteError::Conflict);
+            }
+            Err(err) => return Err(WriteError::Io(err)),
+        };
+        work::count(read.bytes.len());
+        if read.stamp == *stamp && read.bytes == self.source {
+            Ok(())
+        } else {
+            Err(WriteError::Conflict)
+        }
     }
 
     /// Writes `ids` as `group`'s entry for `pattern`, under the first key
@@ -1354,7 +1558,7 @@ mod tests {
         let mut list = MimeAppsList::open(&path).unwrap();
         assert!(!list.is_desktop_specific());
         list.set_default(&p("text/plain"), "a.desktop").unwrap();
-        list.write().unwrap();
+        let _ = list.write().unwrap();
         let mode = std::fs::metadata(dir.path().join("new"))
             .unwrap()
             .permissions()
@@ -1368,5 +1572,156 @@ mod tests {
                 .is_desktop_specific()
         );
         assert!(MimeAppsList::parse(b"", false).write().is_err());
+    }
+
+    #[test]
+    fn concurrent_unrelated_edits_are_a_conflict_not_a_silent_loss() {
+        use xdg_kit_basedir::Durability;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(MIMEAPPS_LIST);
+        std::fs::write(&path, "[Default Applications]\n").unwrap();
+        let mut a = MimeAppsList::open(&path).unwrap();
+        let mut b = MimeAppsList::open(&path).unwrap();
+        a.set_default(&p("text/plain"), "editor.desktop").unwrap();
+        b.set_default(&p("image/png"), "viewer.desktop").unwrap();
+        let _ = a.write().unwrap();
+        // B's snapshot never saw A's default: committing it would erase it.
+        assert!(matches!(b.write(), Err(WriteError::Conflict)));
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(on_disk.contains("editor.desktop"), "{on_disk}");
+        // The pending edit is kept: reopen, reapply, retry.
+        assert_eq!(
+            b.ids(Group::Defaults, &p("image/png")),
+            ["viewer.desktop"],
+            "the conflicting write keeps the edits"
+        );
+        let mut retried = MimeAppsList::open(&path).unwrap();
+        retried
+            .set_default(&p("image/png"), "viewer.desktop")
+            .unwrap();
+        assert!(matches!(retried.write().unwrap(), Durability::Synced));
+        let settled = MimeAppsList::open(&path).unwrap();
+        assert_eq!(
+            settled.ids(Group::Defaults, &p("text/plain")),
+            ["editor.desktop"]
+        );
+        assert_eq!(
+            settled.ids(Group::Defaults, &p("image/png")),
+            ["viewer.desktop"]
+        );
+        // The named escape hatch replaces regardless.
+        assert!(matches!(b.write_overwriting().unwrap(), Durability::Synced));
+        let flattened = std::fs::read_to_string(&path).unwrap();
+        assert!(!flattened.contains("editor.desktop"), "{flattened}");
+        assert!(flattened.contains("viewer.desktop"), "{flattened}");
+    }
+
+    #[test]
+    fn a_same_sized_external_change_is_caught_by_the_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(MIMEAPPS_LIST);
+        std::fs::write(&path, "[Default Applications]\ntext/plain=a.desktop\n").unwrap();
+        let mut list = MimeAppsList::open(&path).unwrap();
+        list.set_default(&p("image/png"), "viewer.desktop").unwrap();
+        // Same length, same-second mtime: only the bytes can tell.
+        std::fs::write(&path, "[Default Applications]\ntext/plain=b.desktop\n").unwrap();
+        assert!(matches!(list.write(), Err(WriteError::Conflict)));
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("b.desktop"),
+            "the destination is untouched"
+        );
+    }
+
+    #[test]
+    fn a_competing_creator_is_a_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(MIMEAPPS_LIST);
+        let mut list = MimeAppsList::open(&path).unwrap();
+        list.set_default(&p("text/plain"), "a.desktop").unwrap();
+        std::fs::write(&path, "[Default Applications]\ntext/plain=theirs.desktop\n").unwrap();
+        assert!(matches!(list.write(), Err(WriteError::Conflict)));
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("theirs.desktop")
+        );
+    }
+
+    #[test]
+    fn repeated_writes_advance_the_baseline_without_reopening() {
+        use xdg_kit_basedir::Durability;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(MIMEAPPS_LIST);
+        let mut list = MimeAppsList::open(&path).unwrap();
+        list.set_default(&p("text/plain"), "a.desktop").unwrap();
+        assert!(matches!(list.write().unwrap(), Durability::Synced));
+        list.set_default(&p("image/png"), "b.desktop").unwrap();
+        assert!(matches!(list.write().unwrap(), Durability::Synced));
+        let settled = MimeAppsList::open(&path).unwrap();
+        assert_eq!(
+            settled.ids(Group::Defaults, &p("text/plain")),
+            ["a.desktop"]
+        );
+        assert_eq!(settled.ids(Group::Defaults, &p("image/png")), ["b.desktop"]);
+    }
+
+    #[test]
+    fn an_unedited_absent_file_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(MIMEAPPS_LIST);
+        let mut list = MimeAppsList::open(&path).unwrap();
+        let _ = list.write().unwrap();
+        assert!(!path.exists(), "an empty list needs no file");
+    }
+
+    #[test]
+    fn a_symlinked_list_keeps_the_link_and_replaces_the_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.list");
+        let link = dir.path().join(MIMEAPPS_LIST);
+        std::fs::write(&real, "[Default Applications]\n").unwrap();
+        std::os::unix::fs::symlink("real.list", &link).unwrap();
+        let mut list = MimeAppsList::open(&link).unwrap();
+        list.set_default(&p("text/plain"), "a.desktop").unwrap();
+        let _ = list.write().unwrap();
+        assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
+        assert!(
+            std::fs::read_to_string(&real)
+                .unwrap()
+                .contains("a.desktop")
+        );
+        // A dangling link is an absent target: created behind the link.
+        let dangling = dir.path().join("gnome-mimeapps.list");
+        std::os::unix::fs::symlink("made.list", &dangling).unwrap();
+        let mut fresh = MimeAppsList::open(&dangling).unwrap();
+        fresh.set_default(&p("text/plain"), "a.desktop").unwrap();
+        let _ = fresh.write().unwrap();
+        assert!(std::fs::symlink_metadata(&dangling).unwrap().is_symlink());
+        assert!(
+            std::fs::read_to_string(dir.path().join("made.list"))
+                .unwrap()
+                .contains("a.desktop")
+        );
+    }
+
+    #[test]
+    fn a_result_over_the_lists_own_limits_is_refused_before_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(MIMEAPPS_LIST);
+        let tight = Limits {
+            max_file_len: Some(16),
+            ..Limits::default()
+        };
+        let mut list = MimeAppsList::open_with(&path, &tight).unwrap();
+        list.set_default(&p("text/plain"), "a.desktop").unwrap();
+        assert!(matches!(list.write(), Err(WriteError::OverLimits)));
+        assert!(!path.exists(), "nothing was written");
+        assert_eq!(
+            list.ids(Group::Defaults, &p("text/plain")),
+            ["a.desktop"],
+            "the edit is kept"
+        );
     }
 }

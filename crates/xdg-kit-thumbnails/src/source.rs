@@ -8,11 +8,21 @@ use std::time::SystemTime;
 use crate::{md5, work};
 
 /// What a thumbnail is of: a local file, or any other resource by URI.
+///
+/// Built only through [`ThumbnailSource::local`] (which makes the path
+/// absolute) and [`ThumbnailSource::remote`] (which validates the URI),
+/// so every constructible source satisfies its documented invariants;
+/// [`ThumbnailSource::path`] and [`ThumbnailSource::remote_uri`] inspect
+/// which it is.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ThumbnailSource {
-    /// A local file, by its absolute path (a relative one is made
-    /// absolute by [`ThumbnailSource::local`]). Its canonical URI
-    /// derives from the path.
+pub struct ThumbnailSource {
+    inner: Inner,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Inner {
+    /// A local file, by its absolute path. Its canonical URI derives
+    /// from the path.
     Local(PathBuf),
     /// Any other resource, by its absolute URI. There is no local path
     /// to stat, to check for readability, or to hand to a thumbnailer's
@@ -28,7 +38,9 @@ impl ThumbnailSource {
     ///
     /// When the path cannot be made absolute (it is empty).
     pub fn local(path: impl AsRef<Path>) -> std::io::Result<Self> {
-        Ok(Self::Local(std::path::absolute(path)?))
+        Ok(Self {
+            inner: Inner::Local(std::path::absolute(path)?),
+        })
     }
 
     /// A remote source. The URI must look like one: a scheme before a
@@ -48,7 +60,9 @@ impl ThumbnailSource {
         if !named || uri.bytes().any(|byte| byte <= b' ' || byte == 0x7F) {
             return Err(InvalidUri);
         }
-        Ok(Self::Remote(uri))
+        Ok(Self {
+            inner: Inner::Remote(uri),
+        })
     }
 
     /// The canonical URI the cache is keyed by: for a local file,
@@ -56,22 +70,32 @@ impl ThumbnailSource {
     /// the URI as given.
     #[must_use]
     pub fn uri(&self) -> String {
-        match self {
-            Self::Local(path) => {
+        match &self.inner {
+            Inner::Local(path) => {
                 let mut uri = String::from("file://");
                 uri.push_str(&encode_uri_path(path.as_os_str().as_bytes()));
                 uri
             }
-            Self::Remote(uri) => uri.clone(),
+            Inner::Remote(uri) => uri.clone(),
         }
     }
 
     /// The local path, when there is one.
     #[must_use]
     pub fn path(&self) -> Option<&Path> {
-        match self {
-            Self::Local(path) => Some(path),
-            Self::Remote(_) => None,
+        match &self.inner {
+            Inner::Local(path) => Some(path),
+            Inner::Remote(_) => None,
+        }
+    }
+
+    /// The URI as given to [`ThumbnailSource::remote`]; `None` for a
+    /// local source, whose canonical URI [`ThumbnailSource::uri`] builds.
+    #[must_use]
+    pub fn remote_uri(&self) -> Option<&str> {
+        match &self.inner {
+            Inner::Local(_) => None,
+            Inner::Remote(uri) => Some(uri),
         }
     }
 
@@ -279,8 +303,14 @@ mod tests {
         let remote = ThumbnailSource::remote("sftp://host/x").unwrap();
         assert_eq!(remote.uri(), "sftp://host/x");
         assert_eq!(remote.path(), None);
+        assert_eq!(remote.remote_uri(), Some("sftp://host/x"));
         let local = ThumbnailSource::local("relative.png").unwrap();
         assert!(local.path().unwrap().is_absolute());
+        assert_eq!(local.remote_uri(), None);
+        // The constructors are the only way in, so no source carries a
+        // relative path or an unvalidated URI; an empty path cannot be
+        // made absolute.
+        assert!(ThumbnailSource::local("").is_err());
     }
 
     #[test]

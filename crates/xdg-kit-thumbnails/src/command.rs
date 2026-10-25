@@ -122,7 +122,7 @@ impl Thumbnailer {
 /// `"`, `\`, `` ` ``, `$` and newline; a bare `\` escapes the next
 /// character, and a backslash before a newline is a line continuation
 /// (both removed); a `#` at the start of a token comments out the rest.
-fn split(line: &str) -> Result<Vec<String>, CommandError> {
+pub(crate) fn split(line: &str) -> Result<Vec<String>, CommandError> {
     work::count(line.len());
     // The separators GLib tokenizes on: space, tab, newline — not the
     // rest of Unicode whitespace, which stays inside a token.

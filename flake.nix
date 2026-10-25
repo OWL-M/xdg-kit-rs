@@ -266,7 +266,7 @@
                 rustfmt --check --edition 2024 fuzz/fuzz_targets/*.rs
                 # The fuzzing entry points exist only under `--cfg fuzzing`.
                 CARGO_TARGET_DIR=target/fuzzing-lint RUSTFLAGS="--cfg fuzzing" \
-                  cargo clippy -p xdg-kit-mime -p xdg-kit-desktop-entry -p xdg-kit-mime-apps --all-targets --all-features --offline -- -D warnings
+                  cargo clippy --workspace --all-targets --all-features --offline -- -D warnings
                 runHook postBuild
               '';
               installPhase = ''

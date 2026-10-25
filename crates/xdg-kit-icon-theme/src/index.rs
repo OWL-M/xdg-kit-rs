@@ -63,6 +63,9 @@ pub(crate) struct LoadedTheme {
     pub definition: ThemeFile,
     /// Icon name → candidates, ordered by (dir, root).
     pub names: Map<Str<Counted>, Vec<Candidate>>,
+    /// The longest indexed icon name: a generated fallback alternative
+    /// longer than this cannot match, and is skipped without hashing.
+    pub longest_name: usize,
 }
 
 /// An unthemed fallback file: which fallback directory, which formats.
@@ -82,6 +85,8 @@ pub struct IconThemes {
     /// pixmaps) and their files.
     pub(crate) fallback_dirs: Vec<PathBuf>,
     pub(crate) fallback: Map<Str<Counted>, Vec<Unthemed>>,
+    /// The longest name in `fallback`, bounding generated alternatives.
+    pub(crate) fallback_longest: usize,
     pub(crate) stamps: Vec<(PathBuf, FileStamp)>,
     /// Directories whose stamp moved must be scanned on the next load,
     /// never served from a cache that still passes its own check.
@@ -140,6 +145,7 @@ impl IconThemes {
             chain: Vec::new(),
             fallback_dirs: Vec::new(),
             fallback: Map::new(),
+            fallback_longest: 0,
             stamps: Vec::new(),
             distrust,
             distrusted,
@@ -330,6 +336,7 @@ impl IconThemes {
             .map(|root| self.theme_cache(&root.join(id), &file.dirs))
             .collect();
         let mut names = Map::<Str<Counted>, Vec<Candidate>>::new();
+        let mut longest = 0usize;
         let dirs = file.dirs.clone();
         for (dir_at, dir) in dirs.iter().enumerate() {
             for (root_at, root) in self.roots.clone().iter().enumerate() {
@@ -348,7 +355,7 @@ impl IconThemes {
                             work::count(1);
                             let granted = self.charge(*formats);
                             if granted != 0 {
-                                push_candidate(&mut names, name, candidate, granted);
+                                push_candidate(&mut names, name, candidate, granted, &mut longest);
                             }
                             if granted != *formats {
                                 self.truncated(&path);
@@ -356,7 +363,7 @@ impl IconThemes {
                             }
                         }
                     }
-                    None => self.enumerate(&path, candidate, &mut names),
+                    None => self.enumerate(&path, candidate, &mut names, &mut longest),
                 }
             }
         }
@@ -365,6 +372,7 @@ impl IconThemes {
             dirs,
             definition: file,
             names,
+            longest_name: longest,
         });
     }
 
@@ -434,6 +442,7 @@ impl IconThemes {
         dir: &Path,
         candidate: Candidate,
         names: &mut Map<Str<Counted>, Vec<Candidate>>,
+        longest: &mut usize,
     ) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
@@ -452,7 +461,7 @@ impl IconThemes {
                 return;
             }
             self.icons_indexed += 1;
-            push_candidate(names, stem, candidate, format);
+            push_candidate(names, stem, candidate, format, longest);
         }
     }
 
@@ -512,6 +521,7 @@ impl IconThemes {
                     return;
                 }
                 self.icons_indexed += 1;
+                self.fallback_longest = self.fallback_longest.max(stem.len());
                 let lookup = self.fallback.lookup(stem);
                 if let Some(found) = self.fallback.get_mut_at(&lookup) {
                     // Fallback directories are visited in order too.
@@ -545,7 +555,9 @@ fn push_candidate(
     stem: &str,
     candidate: Candidate,
     format: u8,
+    longest: &mut usize,
 ) {
+    *longest = (*longest).max(stem.len());
     // The name hashed and, when new, copied (counted by the map).
     work::count(1);
     let lookup = names.lookup(stem);

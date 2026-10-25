@@ -127,5 +127,25 @@ printf 'a/b; c=d; C=e;' > "$out/media_type/repeated"
 printf 'a/b; q="caf\303\251"' > "$out/media_type/obs-text"
 printf 'text/plain; a = b' > "$out/media_type/spaced"
 printf 'text/plain; a="b' > "$out/media_type/unclosed"
+# An XBEL document with the shapes the editor cares about.
+mkdir -p "$out/bookmarks_xbel"
+printf '<?xml version="1.0" encoding="UTF-8"?>\n<xbel version="1.0"\n      xmlns:bookmark="http://www.freedesktop.org/standards/desktop-bookmarks"\n      xmlns:mime="http://www.freedesktop.org/standards/shared-mime-info">\n  <bookmark href="file:///a" added="2024-01-02T03:04:05Z" modified="2024-01-02T03:04:05Z" visited="2024-01-02T03:04:05Z">\n    <info><metadata owner="http://freedesktop.org">\n      <mime:mime-type type="text/plain"/>\n      <bookmark:applications><bookmark:application name="viewer" exec="&apos;viewer %%u&apos;" modified="2024-01-02T03:04:05Z" count="2"/></bookmark:applications>\n    </metadata></info>\n  </bookmark>\n</xbel>\n' > "$out/bookmarks_xbel/seed"
+# The real GTK cache the tests pin, as the cache seed.
+mkdir -p "$out/icon_theme_cache"
+cp ../crates/xdg-kit-icon-theme/tests/fixtures/gtk-icon-theme.cache "$out/icon_theme_cache/seed"
+# Icon names with the shapes the fallback generator shortens.
+mkdir -p "$out/icon_name_lookup"
+printf 'network-wired-disconnected-symbolic' > "$out/icon_name_lookup/symbolic"
+printf 'folder' > "$out/icon_name_lookup/bare"
+# A minimal valid PNG carrying a Thumb::URI tEXt chunk.
+mkdir -p "$out/thumbnail_png"
+printf '\211\120\116\107\015\012\032\012\000\000\000\015\111\110\104\122\000\000\000\001\000\000\000\001\010\000\000\000\000\072\176\233\125\000\000\000\027\164\105\130\164\124\150\165\155\142\072\072\125\122\111\000\146\151\154\145\072\057\057\057\163\145\145\144\062\062\245\070\000\000\000\012\111\104\101\124\170\234\143\150\000\000\000\202\000\201\167\315\162\266\000\000\000\000\111\105\116\104\256\102\140\202' > "$out/thumbnail_png/seed"
+# Thumbnailer Exec lines: quotes, comments, field codes, escapes.
+mkdir -p "$out/thumbnailer_command"
+printf 'ffmpegthumbnailer -i %%i -o %%o -s %%s' > "$out/thumbnailer_command/plain"
+printf 'sh -c "convert \\"%%u\\" #not-a-comment" %%o' > "$out/thumbnailer_command/quoted"
+# user-dirs.dirs: the reference shapes, and lines the parser must skip.
+mkdir -p "$out/user_dirs"
+printf '# comment\nXDG_DESKTOP_DIR="$HOME/Desktop"\nXDG_DOWNLOAD_DIR="/abs/down"\nXDG_MUSIC_DIR="relative"\nXDG_ODD_DIR="$HOME/unclosed\nnot a line\n' > "$out/user_dirs/seed"
 rm -rf seeds
 mv "$out" seeds

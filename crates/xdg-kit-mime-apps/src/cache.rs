@@ -163,10 +163,13 @@ fn escape(id: &str, out: &mut Vec<u8>) {
 /// These failures, and failures to write, sync or rename the new file,
 /// leave an existing `mimeinfo.cache` unchanged.
 ///
-/// If opening or syncing the folder fails after the rename, the error is
-/// still returned. The new `mimeinfo.cache` is already in place, but may
-/// not survive a crash.
-pub fn write_mimeinfo_cache(folder: &Path) -> io::Result<()> {
+/// The returned [`Durability`](xdg_kit_basedir::Durability) says whether
+/// the completed replacement is known to survive a crash:
+/// [`Durability::NotSynced`](xdg_kit_basedir::Durability::NotSynced)
+/// means the new `mimeinfo.cache` *is* in place but syncing the folder
+/// afterwards failed — an outcome, not an error, since redoing the write
+/// would overwrite whatever happened since.
+pub fn write_mimeinfo_cache(folder: &Path) -> io::Result<xdg_kit_basedir::Durability> {
     write_mimeinfo_cache_with(folder, &Limits::default())
 }
 
@@ -176,9 +179,12 @@ pub fn write_mimeinfo_cache(folder: &Path) -> io::Result<()> {
 /// # Errors
 ///
 /// As [`write_mimeinfo_cache`].
-pub fn write_mimeinfo_cache_with(folder: &Path, limits: &Limits) -> io::Result<()> {
+pub fn write_mimeinfo_cache_with(
+    folder: &Path,
+    limits: &Limits,
+) -> io::Result<xdg_kit_basedir::Durability> {
     use xdg_kit_basedir::{
-        CreateMode, Durability, SymlinkPolicy, WriteFileError, WriteOptions, write_regular_file,
+        CreateMode, SymlinkPolicy, WriteFileError, WriteOptions, write_regular_file,
     };
     let bytes = mimeinfo_cache_with(folder, limits)?;
     let committed = write_regular_file(
@@ -197,10 +203,7 @@ pub fn write_mimeinfo_cache_with(folder: &Path, limits: &Limits) -> io::Result<(
         // semantics, so nothing else arises.
         other => io::Error::other(other.to_string()),
     })?;
-    match committed.durability {
-        Durability::Synced => Ok(()),
-        Durability::NotSynced(err) => Err(err),
-    }
+    Ok(committed.durability)
 }
 
 /// The most folder handles the walk keeps open at a time, one being opened
@@ -1345,7 +1348,7 @@ mod tests {
             String::from_utf8(mimeinfo_cache(dir.path()).unwrap()).unwrap(),
             "[MIME Cache]\nimage/*=b.desktop;\ntext/plain=b.desktop;kde-a.desktop;\n"
         );
-        write_mimeinfo_cache(dir.path()).unwrap();
+        let _ = write_mimeinfo_cache(dir.path()).unwrap();
         assert_eq!(
             fs::read(dir.path().join("mimeinfo.cache")).unwrap(),
             mimeinfo_cache(dir.path()).unwrap()
@@ -1368,7 +1371,7 @@ mod tests {
             write_mimeinfo_cache(dir.path())
         }));
         rustix::process::umask(before);
-        written.unwrap().unwrap();
+        let _ = written.unwrap().unwrap();
         let mode = fs::metadata(dir.path().join("mimeinfo.cache"))
             .unwrap()
             .permissions()
@@ -1557,7 +1560,7 @@ mod tests {
         fs::write(dir.path().join("a.desktop"), ENTRY).unwrap();
         fs::create_dir_all(dir.path().join("sub/deeper")).unwrap();
         fs::write(dir.path().join("sub/deeper/b.desktop"), ENTRY).unwrap();
-        write_mimeinfo_cache(dir.path()).unwrap();
+        let _ = write_mimeinfo_cache(dir.path()).unwrap();
         let cache = dir.path().join("mimeinfo.cache");
         let before = fs::read(&cache).unwrap();
         assert_eq!(
@@ -1586,7 +1589,7 @@ mod tests {
                 "{unlistable}"
             );
             assert_eq!(
-                written.map_err(|err| err.raw_os_error()),
+                written.map(|_| ()).map_err(|err| err.raw_os_error()),
                 Err(Some(Errno::IO.raw_os_error())),
                 "{unlistable}"
             );
@@ -1616,7 +1619,7 @@ mod tests {
         fs::write(dir.path().join("a.desktop"), ENTRY).unwrap();
         fs::create_dir_all(dir.path().join("sub/deeper")).unwrap();
         fs::write(dir.path().join("sub/deeper/b.desktop"), ENTRY).unwrap();
-        write_mimeinfo_cache(dir.path()).unwrap();
+        let _ = write_mimeinfo_cache(dir.path()).unwrap();
         let cache = dir.path().join("mimeinfo.cache");
         let before = fs::read(&cache).unwrap();
         let files_before = listed(dir.path());
@@ -1663,7 +1666,7 @@ mod tests {
             fs::write(path.join("e.desktop"), ENTRY).unwrap();
             path.push("d");
         }
-        write_mimeinfo_cache(dir.path()).unwrap();
+        let _ = write_mimeinfo_cache(dir.path()).unwrap();
         let cache = dir.path().join("mimeinfo.cache");
         let before = fs::read(&cache).unwrap();
         let files_before = listed(dir.path());
@@ -2353,7 +2356,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ext = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("a.desktop"), ENTRY).unwrap();
-        write_mimeinfo_cache(dir.path()).unwrap();
+        let _ = write_mimeinfo_cache(dir.path()).unwrap();
         let before = fs::read(dir.path().join("mimeinfo.cache")).unwrap();
         let levels = 17;
         for level in 1..=levels {
@@ -2596,7 +2599,7 @@ mod tests {
         fs::create_dir_all(dir.path().join("sub/deeper")).unwrap();
         fs::write(dir.path().join("sub/b.desktop"), ENTRY).unwrap();
         fs::write(dir.path().join("sub/deeper/c.desktop"), ENTRY).unwrap();
-        write_mimeinfo_cache(dir.path()).unwrap();
+        let _ = write_mimeinfo_cache(dir.path()).unwrap();
         assert_eq!(
             fs::read_to_string(dir.path().join("mimeinfo.cache")).unwrap(),
             "[MIME Cache]\ntext/plain=a.desktop;sub-b.desktop;sub-deeper-c.desktop;\n"
@@ -2758,7 +2761,7 @@ mod tests {
         // A component longer than any system's name limit: looking it up
         // gives `ENAMETOOLONG`, every time.
         std::os::unix::fs::symlink("a".repeat(300), dir.path().join("sub/long.desktop")).unwrap();
-        write_mimeinfo_cache(dir.path()).unwrap();
+        let _ = write_mimeinfo_cache(dir.path()).unwrap();
         assert_eq!(
             fs::read_to_string(dir.path().join("mimeinfo.cache")).unwrap(),
             "[MIME Cache]\ntext/plain=a.desktop;sub-b.desktop;sub-deeper-c.desktop;\n"

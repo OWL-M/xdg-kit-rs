@@ -731,6 +731,16 @@ fn parse_matchlet(cursor: &mut Cursor<'_>) -> Result<Matchlet, Skip> {
     let mut word_size = 1;
     if cursor.eat(b'~') {
         word_size = cursor.number().ok_or(Skip::Line)?;
+        // The sizes that can be byte-swapped are 0 (unset), 1, 2 and 4,
+        // a multi-byte one dividing the value. Anything else is refused,
+        // as the reference parser (GLib's xdgmime) refuses it — never
+        // installed as an unswapped rule that matches where the
+        // reference matches nothing.
+        if !matches!(word_size, 0 | 1 | 2 | 4)
+            || (word_size > 1 && !value.len().is_multiple_of(word_size as usize))
+        {
+            return Err(Skip::Line);
+        }
     }
     let mut range = 1;
     if cursor.eat(b'+') {
@@ -1251,6 +1261,38 @@ mod tests {
         let (folder, diagnostics) = folder_from("magic", b"not magic");
         assert_eq!(folder.magic, []);
         assert_eq!(diagnostics.len(), 1);
+    }
+
+    #[test]
+    fn magic_word_sizes_outside_the_format_are_refused() {
+        // Verified against GLib 2.88.3 (gio/xdgmime/xdgmimemagic.c): the
+        // accepted word sizes are 0, 1, 2 and 4, and a multi-byte size
+        // must divide the value; anything else errors the line. A rule
+        // installed unswapped would match where the reference matches
+        // nothing.
+        let bytes = b"MIME-Magic\0\n[50:a/b]\n\
+            >0=\x00\x03abc~3\n\
+            >0=\x00\x03abc~2\n\
+            >0=\x00\x04abcd~8\n\
+            >0=\x00\x04abcd~0\n\
+            >0=\x00\x04abcd~4\n";
+        let (folder, diagnostics) = folder_from("magic", bytes);
+        assert!(!folder.magic.is_empty(), "{diagnostics:?}");
+        let values: Vec<&[u8]> = folder.magic[0]
+            .matchlets
+            .iter()
+            .map(|matchlet| matchlet.value.as_slice())
+            .collect();
+        assert_eq!(values, [&b"abcd"[..], b"abcd"], "only ~0 and ~4 remain");
+        assert_eq!(
+            folder.magic[0].matchlets[0].word_size, 0,
+            "size zero stays accepted"
+        );
+        assert_eq!(diagnostics.len(), 3, "{diagnostics:?}");
+        // A refused parent fails its children closed, like any skipped line.
+        let nested = b"MIME-Magic\0\n[50:a/b]\n>0=\x00\x03abc~3\n1>0=\x00\x01Z\n";
+        let (folder, _) = folder_from("magic", nested);
+        assert_eq!(folder.magic, [], "the orphaned child is not kept");
     }
 
     #[test]

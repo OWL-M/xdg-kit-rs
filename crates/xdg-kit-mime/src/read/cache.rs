@@ -521,6 +521,16 @@ fn read_matchlets(
         else {
             continue;
         };
+        // The word sizes that can be byte-swapped: 0 (unset), 1, 2 and 4,
+        // a multi-byte one dividing the value. Anything else cannot mean
+        // what the format says and is refused, as the reference text
+        // parser refuses the lines such a record would come from.
+        if !matches!(word_size, 0 | 1 | 2 | 4)
+            || (word_size > 1 && !(value_len as usize).is_multiple_of(word_size as usize))
+        {
+            reader.report(at, "matchlet word size unusable, skipped");
+            continue;
+        }
         // A length that overflows is more than any budget.
         let copied = copied_len(value_len as usize, mask_at != 0).unwrap_or(usize::MAX);
         if !reader.charge(at, copied) {
@@ -661,6 +671,51 @@ mod tests {
         assert_eq!(folder.aliases.len(), 1);
         assert_eq!(folder.namespaces.len(), 1);
         assert_eq!(folder.generic_icons.len(), 1);
+    }
+
+    #[test]
+    fn a_cache_matchlet_with_an_unusable_word_size_is_skipped() {
+        // The matchlet record is [start, range, word_size, value_len,
+        // value_at, mask_at, n_children, children_at]; find the "TEST"
+        // matchlet's record through its value.
+        let bytes = cache_bytes();
+        let value_at = u32::try_from(
+            bytes
+                .windows(4)
+                .position(|window| window == b"TEST")
+                .unwrap(),
+        )
+        .unwrap();
+        let field =
+            |bytes: &[u8], at: usize| u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap());
+        let record = (0..bytes.len() - 20)
+            .step_by(4)
+            .find(|&at| {
+                field(&bytes, at + 8) == 1 // word_size
+                    && field(&bytes, at + 12) == 4 // value_len
+                    && field(&bytes, at + 16) == value_at
+            })
+            .expect("the matchlet record");
+        // A word size the format cannot mean: the matchlet (and with it
+        // the rule) is skipped, with a diagnostic, never installed as an
+        // unswappable rule.
+        let mut poked = bytes.clone();
+        poked[record + 8..record + 12].copy_from_slice(&3u32.to_be_bytes());
+        let (result, folder, diagnostics) = decode(&poked);
+        assert!(result.is_ok());
+        assert_eq!(folder.magic, [], "the rule lost its only matchlet");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("word size unusable")),
+            "{diagnostics:?}"
+        );
+        // A usable multi-byte size that divides the value stays.
+        let mut poked = bytes.clone();
+        poked[record + 8..record + 12].copy_from_slice(&2u32.to_be_bytes());
+        let (result, folder, diagnostics) = decode(&poked);
+        assert!(result.is_ok() && diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(folder.magic[0].matchlets[0].word_size, 2);
     }
 
     #[test]

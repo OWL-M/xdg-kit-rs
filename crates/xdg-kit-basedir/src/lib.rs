@@ -42,7 +42,9 @@ mod write;
 
 pub use base_dirs::{BaseDirs, ReadFile};
 pub use error::{Diagnostic, DiagnosticSource, Error};
-pub use read::{Limits, MAX_FILE_LEN, read_regular_file, read_regular_file_with};
+pub use read::{
+    Limits, MAX_FILE_LEN, StampedRead, read_regular_file, read_regular_file_with, read_stamped,
+};
 pub use runtime::RuntimeDirProblem;
 pub use stamp::FileStamp;
 pub use user_dirs::{UserDirKind, UserDirs};

@@ -46,9 +46,19 @@ pub use cache::{
 };
 pub use error::Diagnostic;
 pub use limits::Limits;
-pub use list::{EditError, Group, MIMEAPPS_LIST, MimeAppsList};
-pub use open::{OpenError, open_plan};
+pub use list::{EditError, Group, MIMEAPPS_LIST, MimeAppsList, WriteError};
+pub use open::{LinkPolicy, OpenError, open_plan, open_plan_with};
 pub use pattern::{MediaType, TypePattern};
+pub use xdg_kit_basedir::Durability;
+
+// Snapshots and lists are shared between threads; keep them that way.
+const _: fn() = || {
+    fn shareable<T: Send + Sync>() {}
+    shareable::<MimeApps>();
+    shareable::<MimeAppsList>();
+    shareable::<TypePattern>();
+    shareable::<Limits>();
+};
 
 /// Steps of work, counted in tests so that they can show the work grows
 /// linearly with the input. A step is an item visited (a key, an ID, an

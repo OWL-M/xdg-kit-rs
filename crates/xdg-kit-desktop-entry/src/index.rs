@@ -60,11 +60,20 @@ impl AppEntry {
         self.entry.no_display()
     }
 
-    /// Whether `TryExec` indicates that the application is installed.
+    /// Whether `TryExec` indicates that the application is installed,
+    /// checked as `GLib` 2.88 checks it (`g_find_program_for_path`).
     /// Returns true if the key is missing or names an executable file.
-    /// Absolute paths are checked directly. All other paths are looked up
-    /// in the caller's `PATH`-style `search_path`, as the spec requires.
-    /// An empty component of `search_path` means the current folder.
+    ///
+    /// An absolute path is checked directly, and only directly. Any other
+    /// name is first checked as the direct candidate it names — resolved
+    /// against the entry's `Path=` working folder when set, the process's
+    /// otherwise — when it contains a `/` or `Path=` makes it absolute;
+    /// then, direct candidate or not, it is searched in the caller's
+    /// `PATH`-style `search_path`: the whole name joined onto each
+    /// component, an empty component meaning the current folder, every
+    /// relative candidate again resolved against `Path=`. The spec's
+    /// letter sends every non-absolute name only to `$PATH`; the direct
+    /// probe on top of that follows the reference, deliberately.
     #[must_use]
     pub fn try_exec(&self, search_path: &OsStr) -> bool {
         let Some(program) = self.entry.try_exec() else {
@@ -74,10 +83,26 @@ impl AppEntry {
             fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
                 && rustix::fs::access(path, rustix::fs::Access::EXEC_OK).is_ok()
         };
-        if Path::new(&program).is_absolute() {
-            return executable(Path::new(&program));
+        // A relative candidate is resolved where a launch would run the
+        // program: in the entry's `Path=` working folder when set.
+        let base = self.entry.working_dir().map(PathBuf::from);
+        let resolved = |path: &Path| match &base {
+            Some(base) if path.is_relative() => executable(&base.join(path)),
+            _ => executable(path),
+        };
+        let program = Path::new(&program);
+        if program.is_absolute() {
+            return executable(program);
         }
-        search_dirs(search_path).any(|dir| executable(&dir.join(&program)))
+        // The direct candidate: the name as a path, when it looks like
+        // one. A miss falls back to the search below.
+        if (base.as_ref().is_some_and(|base| base.is_absolute())
+            || program.as_os_str().as_bytes().contains(&b'/'))
+            && resolved(program)
+        {
+            return true;
+        }
+        search_dirs(search_path).any(|dir| resolved(&dir.join(program)))
     }
 }
 
@@ -3126,11 +3151,62 @@ mod tests {
         assert!(index.get("yes.desktop").unwrap().try_exec(&search));
         assert!(!index.get("no.desktop").unwrap().try_exec(&search));
         assert!(index.get("abs.desktop").unwrap().try_exec(OsStr::new("")));
-        with_try("relative.desktop", "sub/tool");
+        // GLib 2.88's TryExec resolution (g_find_program_for_path,
+        // reproduced against installed GIO): the direct candidate first —
+        // the name against `Path=` when set, or as the relative path a
+        // slash-containing name spells — then, for any non-absolute name,
+        // the search path, the whole name joined onto each component.
         fs::create_dir(bin.path().join("sub")).unwrap();
         fs::copy(&tool, bin.path().join("sub/tool")).unwrap();
+        let with_path = |id: &str, try_exec: &str, path: &Path| {
+            write(
+                &root.path().join(id),
+                &format!(
+                    "[Desktop Entry]\nType=Application\nName=x\nExec=x\nTryExec={try_exec}\nPath={}\n",
+                    crate::key_file::escape(path.to_str().unwrap(), false)
+                ),
+            );
+        };
+        with_try("relative.desktop", "sub/tool");
+        with_path("anchored.desktop", "sub/tool", bin.path());
+        with_path("bare-anchored.desktop", "present-tool", bin.path());
+        with_try("abs-missing.desktop", "/nonexistent/tool");
         let index = AppIndex::from_dirs([root.path()]);
-        assert!(index.get("relative.desktop").unwrap().try_exec(&search));
+        assert!(
+            index.get("relative.desktop").unwrap().try_exec(&search),
+            "missing at the working folder, found beneath a search dir"
+        );
+        assert!(
+            !index
+                .get("relative.desktop")
+                .unwrap()
+                .try_exec(OsStr::new("/nonexistent")),
+            "and nowhere else"
+        );
+        assert!(
+            index
+                .get("anchored.desktop")
+                .unwrap()
+                .try_exec(OsStr::new("/nonexistent")),
+            "the direct candidate resolves against Path="
+        );
+        assert!(
+            index
+                .get("bare-anchored.desktop")
+                .unwrap()
+                .try_exec(OsStr::new("/nonexistent")),
+            "a bare name in the Path= folder is found without the search path"
+        );
+        assert!(
+            !index.get("abs-missing.desktop").unwrap().try_exec(&search),
+            "an absolute path never falls back to the search"
+        );
+        // An empty search-path component means the current folder — a
+        // relative folder, so it too resolves against `Path=` (GLib
+        // resolves every relative candidate against the working folder).
+        with_path("dot.desktop", "present-tool", bin.path());
+        let index = AppIndex::from_dirs([root.path()]);
+        assert!(index.get("dot.desktop").unwrap().try_exec(OsStr::new("")));
         assert!(index.get("none.desktop").unwrap().try_exec(OsStr::new("")));
     }
 

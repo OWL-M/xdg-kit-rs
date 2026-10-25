@@ -18,6 +18,10 @@ libfuzzer-sys = "0.4"
 xdg-kit-desktop-entry = { path = "../crates/xdg-kit-desktop-entry" }
 xdg-kit-mime = { path = "../crates/xdg-kit-mime" }
 xdg-kit-mime-apps = { path = "../crates/xdg-kit-mime-apps" }
+xdg-kit-basedir = { path = "../crates/xdg-kit-basedir" }
+xdg-kit-bookmarks = { path = "../crates/xdg-kit-bookmarks" }
+xdg-kit-icon-theme = { path = "../crates/xdg-kit-icon-theme" }
+xdg-kit-thumbnails = { path = "../crates/xdg-kit-thumbnails" }
 
 [[bin]]
 name = "mime_cache"
@@ -106,6 +110,48 @@ bench = false
 [[bin]]
 name = "media_type"
 path = "fuzz_targets/media_type.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bookmarks_xbel"
+path = "fuzz_targets/bookmarks_xbel.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "icon_theme_cache"
+path = "fuzz_targets/icon_theme_cache.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "icon_name_lookup"
+path = "fuzz_targets/icon_name_lookup.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "thumbnail_png"
+path = "fuzz_targets/thumbnail_png.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "thumbnailer_command"
+path = "fuzz_targets/thumbnailer_command.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "user_dirs"
+path = "fuzz_targets/user_dirs.rs"
 test = false
 doc = false
 bench = false

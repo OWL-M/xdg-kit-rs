@@ -47,6 +47,9 @@ compile_error!("xdg-kit-icon-theme supports Unix systems only");
 
 mod cache;
 mod error;
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub mod fuzzing;
 mod index;
 mod limits;
 mod lookup;

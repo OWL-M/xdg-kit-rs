@@ -484,8 +484,11 @@ impl ThumbnailCache {
         info: &SourceInfo,
         size: ThumbnailSize,
     ) -> io::Result<(PathBuf, Durability)> {
-        let file = std::path::absolute(file)?;
-        let source = ThumbnailSource::Local(file.clone());
+        let source = ThumbnailSource::local(file)?;
+        let Some(file) = source.path().map(Path::to_owned) else {
+            // A local source always has one; the type cannot say so.
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "no local path"));
+        };
         self.writable(&source)?;
         let (Some(dir), Some(name)) = (file.parent(), file.file_name()) else {
             return Err(io::Error::new(

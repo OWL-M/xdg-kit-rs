@@ -30,6 +30,9 @@ pub enum OpenError {
     NoApplication(MimeType),
     /// A `Type=Link` desktop entry without a `URL`.
     LinkWithoutUrl(PathBuf),
+    /// A `Type=Link` desktop entry under [`LinkPolicy::Refuse`]: the
+    /// caller decides what to do with it before anything is planned.
+    LinkRefused(PathBuf),
     /// A `Type=Link` desktop entry in an `Encoding` that is not supported
     /// ([`DesktopEntry::supports_encoding`]), such as `Legacy-Mixed`: the
     /// spec says to ignore it, so its `URL` is not followed.
@@ -49,6 +52,9 @@ impl fmt::Display for OpenError {
             // A type has only safe characters, and is short.
             Self::NoApplication(mime) => write!(f, "no application opens {mime}"),
             Self::LinkWithoutUrl(path) => write!(f, "{}: a link without URL", shown_path(path)),
+            Self::LinkRefused(path) => {
+                write!(f, "{}: a link, refused by policy", shown_path(path))
+            }
             Self::UnsupportedEncoding(path) => {
                 write!(f, "{}: a link in an unsupported encoding", shown_path(path))
             }
@@ -67,13 +73,38 @@ impl std::error::Error for OpenError {
     }
 }
 
+/// What a `Type=Link` desktop entry means when it is the thing being
+/// opened. This is opening policy, deliberately separate from the
+/// command-launch configuration in
+/// [`LaunchOptions`](xdg_kit_desktop_entry::LaunchOptions): what to do
+/// with a link is the caller's trust decision, not a property of how
+/// commands are spawned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LinkPolicy {
+    /// Follow the entry to its `URL` and plan for that instead — the
+    /// desktop's usual behavior, and the default ([`open_plan`]). A
+    /// link's target is never followed as a link again, so a chain of
+    /// links ends after one step.
+    #[default]
+    Follow,
+    /// Treat the entry as an ordinary file of its own type: the plan
+    /// opens the `.desktop` file itself with whatever handles that type.
+    AsFile,
+    /// Refuse it ([`OpenError::LinkRefused`]): for a caller that wants to
+    /// decide itself — inspect, prompt — before anything is planned for a
+    /// URL the file's author chose.
+    Refuse,
+}
+
 /// How to open `target` with its default application, without launching
 /// anything: [`LaunchPlan::spawn`] does that.
 ///
 /// - A file's type comes from the MIME database (by name and contents); a
 ///   desktop entry of `Type=Link` is followed to its `URL`, unless it is
 ///   larger than `apps`' [`Limits::max_file_len`](crate::Limits::max_file_len).
-///   A link in an unsupported `Encoding` is an error.
+///   A link in an unsupported `Encoding` is an error. [`open_plan_with`]
+///   makes that following a caller policy ([`LinkPolicy`]); this uses
+///   [`LinkPolicy::Follow`].
 /// - A URI without a scheme or with a raw NUL is refused first
 ///   ([`OpenError::BadUri`]). A `file:` URI is a file; any other URI has
 ///   the type `x-scheme-handler/<scheme>`.
@@ -88,17 +119,33 @@ pub fn open_plan(
     apps: &MimeApps,
     options: &LaunchOptions,
 ) -> Result<LaunchPlan, OpenError> {
-    plan(target, apps, options, true)
+    plan(target, apps, options, LinkPolicy::Follow)
+}
+
+/// [`open_plan`] under `links`: whether a `Type=Link` desktop entry is
+/// followed to its `URL`, opened as a file of its own type, or refused
+/// for the caller to decide.
+///
+/// # Errors
+///
+/// See [`OpenError`].
+pub fn open_plan_with(
+    target: &Target,
+    apps: &MimeApps,
+    options: &LaunchOptions,
+    links: LinkPolicy,
+) -> Result<LaunchPlan, OpenError> {
+    plan(target, apps, options, links)
 }
 
 fn plan(
     target: &Target,
     apps: &MimeApps,
     options: &LaunchOptions,
-    follow_links: bool,
+    links: LinkPolicy,
 ) -> Result<LaunchPlan, OpenError> {
     let mime = match target {
-        Target::Path(path) => match file(path, apps, options, follow_links)? {
+        Target::Path(path) => match file(path, apps, options, links)? {
             Ok(mime) => mime,
             Err(link) => return Ok(link),
         },
@@ -112,7 +159,7 @@ fn plan(
                 .ok_or_else(|| OpenError::BadUri(uri.clone()))?;
             if scheme == "file" {
                 let path = file_uri_path(uri).ok_or_else(|| OpenError::BadUri(uri.clone()))?;
-                match file(&path, apps, options, follow_links)? {
+                match file(&path, apps, options, links)? {
                     Ok(mime) => mime,
                     Err(link) => return Ok(link),
                 }
@@ -128,24 +175,27 @@ fn plan(
     prepare_launch(app.entry(), std::slice::from_ref(target), options).map_err(OpenError::Launch)
 }
 
-/// A local file's type; or, for a desktop entry of `Type=Link` when links
-/// are followed, the plan for its `URL`.
+/// A local file's type; or, for a desktop entry of `Type=Link` under
+/// [`LinkPolicy::Follow`], the plan for its `URL`.
 fn file(
     path: &Path,
     apps: &MimeApps,
     options: &LaunchOptions,
-    follow_links: bool,
+    links: LinkPolicy,
 ) -> Result<Result<MimeType, LaunchPlan>, OpenError> {
     let mime = type_of_file(apps, path)?;
     // Detection gives canonical types: the database may make this an alias.
     let desktop_entry = apps
         .mime_database()
         .canonical(&MimeType::APPLICATION_X_DESKTOP);
-    if follow_links
+    if links != LinkPolicy::AsFile
         && mime == desktop_entry
         && let Ok(entry) = DesktopEntry::read_with_limits(path, &apps.limits().for_entries())
         && entry.entry_type() == Some(EntryType::Link)
     {
+        if links == LinkPolicy::Refuse {
+            return Err(OpenError::LinkRefused(path.to_owned()));
+        }
         // Checked for links only: another entry in such an encoding is still
         // a file of its type.
         if !entry.supports_encoding() {
@@ -154,7 +204,8 @@ fn file(
         let url = entry
             .url()
             .ok_or_else(|| OpenError::LinkWithoutUrl(path.to_owned()))?;
-        return plan(&Target::Uri(url), apps, options, false).map(Err);
+        // The target of a link is never followed as a link again.
+        return plan(&Target::Uri(url), apps, options, LinkPolicy::AsFile).map(Err);
     }
     Ok(Ok(mime))
 }

@@ -160,6 +160,14 @@ pub struct PreparedWrite {
 impl PreparedWrite {
     /// Prepares writing `bytes` to `path` under `options`.
     ///
+    /// A relative `path` is anchored to the working directory *now*: the
+    /// commit replaces the file this call selected, not whatever the
+    /// path would name after a working-directory change in between. The
+    /// anchor is the absolute pathname, not a directory handle, so a
+    /// rename of an ancestor directory between preparing and committing
+    /// still redirects the commit — a caller that must survive that holds
+    /// the ancestors still itself.
+    ///
     /// # Errors
     ///
     /// [`WriteFileError::Before`] for any failure (the target is
@@ -167,6 +175,10 @@ impl PreparedWrite {
     /// [`WriteFileError::SymlinkRefused`] under that policy.
     pub fn new(path: &Path, bytes: &[u8], options: &WriteOptions) -> Result<Self, WriteFileError> {
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        // Anchored before anything is created, so the temporary file and
+        // the rename can never disagree about which directory they are in.
+        let path = std::path::absolute(path).map_err(WriteFileError::Before)?;
+        let path = path.as_path();
         let target = match options.symlinks {
             SymlinkPolicy::FollowTarget => follow(path).map_err(WriteFileError::Before)?,
             SymlinkPolicy::ReplaceLink => path.to_owned(),

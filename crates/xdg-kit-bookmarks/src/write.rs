@@ -3,7 +3,7 @@
 //! object carries forward after a committed write.
 
 use std::fs;
-use std::io::{self, Read as _};
+use std::io;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 
@@ -46,9 +46,6 @@ const OPTIONS: WriteOptions = WriteOptions {
     symlinks: SymlinkPolicy::FollowTarget,
 };
 
-/// How often a load retries when the file changes in place mid-read.
-const READ_RETRIES: usize = 3;
-
 impl BookmarkFile {
     /// Reads the user's recently-used list,
     /// `$XDG_DATA_HOME/recently-used.xbel`, with the default [`Limits`]. A
@@ -85,11 +82,16 @@ impl BookmarkFile {
 
     /// [`BookmarkFile::read`] within `limits`.
     ///
+    /// A relative `path` is anchored to the working directory *now*:
+    /// [`BookmarkFile::refresh`] and the writes keep addressing the file
+    /// this call read, not whatever the path would name after a
+    /// working-directory change.
+    ///
     /// # Errors
     ///
     /// As [`BookmarkFile::load_recently_used`].
     pub fn read_with(path: impl Into<PathBuf>, limits: &Limits) -> io::Result<Self> {
-        let path = path.into();
+        let path = std::path::absolute(path.into())?;
         let (bytes, baseline) = load(&path, limits)?;
         let mut file = Self::from_bytes_with(&bytes, limits);
         file.path = Some(path);
@@ -226,31 +228,28 @@ impl BookmarkFile {
     }
 
     /// Whether the destination still holds exactly what was loaded.
+    /// Equal stamps cannot tell same-sized writes within one timestamp
+    /// tick apart, so the bytes are always compared — reading no more
+    /// than what could still match.
     fn revalidate(&self, path: &Path, stamp: &FileStamp) -> Result<(), WriteError> {
-        // Gone, or no longer a regular file, is changed; a FIFO put in
-        // the way must neither hang this nor pass it.
-        let mut file = match open_regular(path) {
-            Ok(Some(file)) => file,
+        // Gone, no longer a regular file (a FIFO put in the way must
+        // neither hang this nor pass it), or grown past the loaded size
+        // is changed.
+        let read = match xdg_kit_basedir::read_stamped(path, Some(self.source.len() as u64)) {
+            Ok(Some(read)) => read,
             Ok(None) => return Err(WriteError::Conflict),
-            Err(err) if err.kind() == io::ErrorKind::InvalidInput => {
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::InvalidInput | io::ErrorKind::FileTooLarge
+                ) =>
+            {
                 return Err(WriteError::Conflict);
             }
             Err(err) => return Err(WriteError::Io(err)),
         };
-        if FileStamp::of_file(&file).map_err(WriteError::Io)? != *stamp {
-            return Err(WriteError::Conflict);
-        }
-        // Equal stamps cannot tell same-sized writes within one timestamp
-        // tick apart: compare the bytes, always — reading no more than
-        // what could still match.
-        let same = read_bounded(
-            &mut file,
-            self.source.len() as u64,
-            Some(self.source.len() as u64),
-        )
-        .map_err(WriteError::Io)?
-        .is_some_and(|current| current == self.source);
-        if same {
+        work::count(read.bytes.len());
+        if read.stamp == *stamp && read.bytes == self.source {
             Ok(())
         } else {
             Err(WriteError::Conflict)
@@ -277,82 +276,17 @@ impl BookmarkFile {
     }
 }
 
-/// Reads `path` whole, pairing the bytes with the identity of the very
-/// file they came from: the stamp is taken from the open descriptor
-/// before and after reading, and a mismatch — the file changed in place
-/// mid-read — retries, so stale contents are never paired with a newer
-/// identity. An absent file is the canonical empty document.
+/// Reads `path` whole through [`xdg_kit_basedir::read_stamped`], pairing
+/// the bytes with the identity of the very file they came from. An absent
+/// file is the canonical empty document.
 fn load(path: &Path, limits: &Limits) -> io::Result<(Vec<u8>, Baseline)> {
-    for _ in 0..READ_RETRIES {
-        let Some(mut file) = open_regular(path)? else {
-            return Ok((EMPTY.as_bytes().to_vec(), Baseline::Absent));
-        };
-        let before = FileStamp::of_file(&file)?;
-        let hint = file.metadata()?.len();
-        let Some(bytes) = read_bounded(&mut file, hint, limits.max_file_len)? else {
-            return Err(io::Error::new(
-                io::ErrorKind::FileTooLarge,
-                "larger than the size limit",
-            ));
-        };
-        if FileStamp::of_file(&file)? == before {
-            return Ok((bytes, Baseline::Stamped(before)));
+    match xdg_kit_basedir::read_stamped(path, limits.max_file_len)? {
+        None => Ok((EMPTY.as_bytes().to_vec(), Baseline::Absent)),
+        Some(read) => {
+            work::count(read.bytes.len());
+            Ok((read.bytes, Baseline::Stamped(read.stamp)))
         }
     }
-    Err(io::Error::new(
-        io::ErrorKind::Interrupted,
-        "the file kept changing while being read",
-    ))
-}
-
-/// Opens `path` without blocking — a FIFO must not hang the caller — and
-/// only as a regular file; `None` when nothing is there. The nonblocking
-/// flag does not affect reads of the regular file it turns out to be.
-fn open_regular(path: &Path) -> io::Result<Option<fs::File>> {
-    use rustix::fs::{Mode, OFlags};
-    let fd = match rustix::fs::open(
-        path,
-        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
-        Mode::empty(),
-    ) {
-        Ok(fd) => fd,
-        Err(rustix::io::Errno::NOENT) => return Ok(None),
-        Err(err) => return Err(err.into()),
-    };
-    let file = fs::File::from(fd);
-    // The path may have been replaced; check the file actually opened.
-    if file.metadata()?.is_file() {
-        Ok(Some(file))
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "not a regular file",
-        ))
-    }
-}
-
-/// Reads `file` whole, but never more than `max` bytes — the limit bounds
-/// the read itself, not a size the file reported before (`/proc` files
-/// report zero, and a regular file can grow mid-read). `None` when the
-/// limit is passed.
-fn read_bounded(file: &mut fs::File, hint: u64, max: Option<u64>) -> io::Result<Option<Vec<u8>>> {
-    let Some(max) = max else {
-        let mut bytes = Vec::with_capacity(usize::try_from(hint).unwrap_or(0));
-        file.read_to_end(&mut bytes)?;
-        work::count(bytes.len());
-        return Ok(Some(bytes));
-    };
-    if hint > max {
-        return Ok(None);
-    }
-    // One byte over the limit tells growth from an exactly-full read.
-    let mut bytes = Vec::with_capacity(usize::try_from(hint.min(max)).unwrap_or(0));
-    std::io::Read::take(file, max.saturating_add(1)).read_to_end(&mut bytes)?;
-    work::count(bytes.len());
-    if bytes.len() as u64 > max {
-        return Ok(None);
-    }
-    Ok(Some(bytes))
 }
 
 #[cfg(test)]

@@ -106,6 +106,12 @@ impl MimeApps {
     /// place and its desktop files counted at its data place. `apps` should
     /// be [`AppIndex::load`] of the same `base_dirs`, so that its folders
     /// are the data levels' `applications` folders.
+    ///
+    /// The legacy `defaults.list` (`GLib`'s own pre-spec file, which its
+    /// builds still read) is deliberately not read: it is in no spec, and
+    /// distributions ship it only for `GLib`'s sake. On a system whose
+    /// defaults live only there, [`MimeApps::default_for`] can differ from
+    /// `gio mime` until a `mimeapps.list` states the default.
     #[must_use]
     pub fn load(
         base_dirs: &BaseDirs,

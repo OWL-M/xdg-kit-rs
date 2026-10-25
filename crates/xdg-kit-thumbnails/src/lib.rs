@@ -47,6 +47,9 @@ mod cache;
 mod command;
 mod crc32;
 mod error;
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub mod fuzzing;
 mod limits;
 mod md5;
 mod png;

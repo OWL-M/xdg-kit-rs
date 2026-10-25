@@ -77,6 +77,14 @@ pub fn read_regular_file_with(path: impl AsRef<Path>, max_len: Option<u64>) -> i
 }
 
 fn read_at_most(path: &Path, max_len: Option<u64>) -> io::Result<Vec<u8>> {
+    read_opened(&open_regular(path)?, max_len)
+}
+
+/// Opens the regular file at `path` without blocking — a FIFO must not
+/// hang the caller — refusing anything else before opening it (to avoid
+/// device side effects) and again on the opened descriptor (the path may
+/// have been replaced).
+fn open_regular(path: &Path) -> io::Result<File> {
     let not_regular = || io::Error::new(io::ErrorKind::InvalidInput, "not a regular file");
     if !fs::metadata(path)?.is_file() {
         return Err(not_regular());
@@ -88,14 +96,20 @@ fn read_at_most(path: &Path, max_len: Option<u64>) -> io::Result<Vec<u8>> {
     )?;
     let file = File::from(fd);
     // The path may have been replaced; check the file we actually opened.
-    let metadata = file.metadata()?;
-    if !metadata.is_file() {
-        return Err(not_regular());
+    if file.metadata()?.is_file() {
+        Ok(file)
+    } else {
+        Err(not_regular())
     }
+}
+
+/// Reads an already-opened regular file whole, within `max_len`.
+fn read_opened(file: &File, max_len: Option<u64>) -> io::Result<Vec<u8>> {
+    let metadata = file.metadata()?;
     let too_large = || io::Error::new(io::ErrorKind::FileTooLarge, "larger than the size limit");
     let Some(max_len) = max_len else {
         let mut bytes = buffer(metadata.len())?;
-        read_rest(&mut &file, &mut bytes, grow)?;
+        read_rest(&mut &*file, &mut bytes, grow)?;
         return Ok(bytes);
     };
     if metadata.len() > max_len {
@@ -108,6 +122,61 @@ fn read_at_most(path: &Path, max_len: Option<u64>) -> io::Result<Vec<u8>> {
         return Err(too_large());
     }
     Ok(bytes)
+}
+
+/// A regular file's bytes paired with the identity of the very file they
+/// came from, from [`read_stamped`].
+#[derive(Debug)]
+pub struct StampedRead {
+    /// The file's contents.
+    pub bytes: Vec<u8>,
+    /// The identity of the file the bytes were read from, taken through
+    /// the open descriptor before and after reading, so these bytes are
+    /// never paired with a newer file's identity.
+    pub stamp: crate::FileStamp,
+}
+
+/// How often [`read_stamped`] retries when the file changes in place
+/// mid-read.
+const READ_RETRIES: usize = 3;
+
+/// Reads the regular file at `path` as [`read_regular_file_with`] does,
+/// pairing the bytes with the identity of the very file they came from:
+/// the stamp is taken from the open descriptor before and after reading,
+/// and a mismatch — the file changed in place mid-read — retries, so
+/// stale contents are never paired with a newer identity. `None` when
+/// nothing is there: the baseline for a caller that will create the file.
+///
+/// This is the read half of a conflict-checked write: load through this,
+/// then write back through [`PreparedWrite`](crate::PreparedWrite) only
+/// after revalidating that the destination still matches the snapshot.
+///
+/// # Errors
+///
+/// As [`read_regular_file_with`] — except that an absent file is
+/// `Ok(None)`, not an error — plus [`io::ErrorKind::Interrupted`] when
+/// the file kept changing in place through every retry.
+pub fn read_stamped(
+    path: impl AsRef<Path>,
+    max_len: Option<u64>,
+) -> io::Result<Option<StampedRead>> {
+    let path = path.as_ref();
+    for _ in 0..READ_RETRIES {
+        let file = match open_regular(path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        let stamp = crate::FileStamp::of_file(&file)?;
+        let bytes = read_opened(&file, max_len)?;
+        if crate::FileStamp::of_file(&file)? == stamp {
+            return Ok(Some(StampedRead { bytes, stamp }));
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::Interrupted,
+        "the file kept changing while being read",
+    ))
 }
 
 /// Appends data from `reader` to `bytes` until EOF, retrying reads interrupted

@@ -127,7 +127,11 @@ fn format_mask(flags: u16) -> u8 {
 }
 
 /// Parses the cache bytes into per-directory listings.
-fn parse(bytes: &[u8], declared: &[ThemeDir], limits: &Limits) -> Result<ThemeCache, String> {
+pub(crate) fn parse(
+    bytes: &[u8],
+    declared: &[ThemeDir],
+    limits: &Limits,
+) -> Result<ThemeCache, String> {
     // All offsets come from untrusted 32-bit fields: every sum is
     // checked, so a hostile value is a refusal on 32-bit targets too,
     // never an overflow.

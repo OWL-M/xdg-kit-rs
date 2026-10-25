@@ -139,8 +139,10 @@ impl Icon {
 
 impl IconThemes {
     /// Looks one exact name up: the spec's algorithm — each theme of the
-    /// chain in turn (exact size match first, then the closest by the
-    /// spec's distance), then the unthemed fallback.
+    /// chain in turn (exact size match first, then the closest by
+    /// [`SizingRule::distance`], whose formulas are this crate's stated
+    /// interpretation: the spec's published pseudocode is unreliable in
+    /// its threshold branch), then the unthemed fallback.
     #[must_use]
     pub fn lookup(&self, name: &str, request: &IconRequest) -> Option<Icon> {
         self.lookup_names(&[name], request)
@@ -183,11 +185,46 @@ impl IconThemes {
     /// here; a caller wanting GIO's behavior (opposite-style
     /// alternatives appended after the chain) builds that list and calls
     /// `lookup_names`.
+    /// The chain is generated lazily — borrowed prefixes of the name, one
+    /// reusable buffer when a `-symbolic` suffix must be re-appended — so
+    /// a hit stops the generation and nothing is allocated per
+    /// alternative. An alternative longer than anything a theme indexed
+    /// is skipped without hashing or copying, so a miss on a name of many
+    /// segments costs, per theme, one walk over the name plus probes
+    /// bounded by the theme's longest icon name — never work quadratic in
+    /// the segment count.
     #[must_use]
     pub fn lookup_with_fallbacks(&self, name: &str, request: &IconRequest) -> Option<Icon> {
-        let chain = fallback_chain(name);
-        let refs: Vec<&str> = chain.iter().map(String::as_str).collect();
-        self.lookup_names(&refs, request)
+        let mask = request.formats.mask();
+        if mask == 0 {
+            return None;
+        }
+        let (base, symbolic) = split_symbolic(name);
+        let suffix = if symbolic { "-symbolic".len() } else { 0 };
+        let mut buffer = String::new();
+        for theme in &self.chain {
+            for prefix in prefixes(base) {
+                work::count(1);
+                if prefix.len() + suffix > theme.longest_name {
+                    continue;
+                }
+                let name = styled(&mut buffer, prefix, symbolic);
+                if let Some(icon) = self.in_theme(theme, name, request, mask) {
+                    return Some(icon);
+                }
+            }
+        }
+        for prefix in prefixes(base) {
+            work::count(1);
+            if prefix.len() + suffix > self.fallback_longest {
+                continue;
+            }
+            let name = styled(&mut buffer, prefix, symbolic);
+            if let Some(icon) = self.unthemed(name, mask) {
+                return Some(icon);
+            }
+        }
+        None
     }
 
     /// The spec's two passes over one theme's candidates for one name.
@@ -269,33 +306,52 @@ impl IconThemes {
     }
 }
 
-/// The Icon Naming spec's specificity chain for `name`, most specific
-/// first, a `-symbolic` suffix preserved while shortening.
-pub(crate) fn fallback_chain(name: &str) -> Vec<String> {
+/// The name split into the base the specificity chain shortens and
+/// whether a `-symbolic` suffix must be preserved while shortening.
+fn split_symbolic(name: &str) -> (&str, bool) {
     work::count(name.len());
-    let (base, symbolic) = match name.strip_suffix("-symbolic") {
+    match name.strip_suffix("-symbolic") {
         Some(base) if !base.is_empty() => (base, true),
         _ => (name, false),
-    };
-    let mut chain = Vec::new();
-    let mut rest = base;
-    loop {
-        chain.push(if symbolic {
-            format!("{rest}-symbolic")
-        } else {
-            rest.to_owned()
-        });
-        match rest.rsplit_once('-') {
-            Some((shorter, _)) if !shorter.is_empty() => rest = shorter,
-            _ => break,
-        }
     }
-    chain
+}
+
+/// The Icon Naming spec's specificity chain for `base`, most specific
+/// first: `base`, then each hyphen-shortened prefix, borrowed.
+fn prefixes(base: &str) -> impl Iterator<Item = &str> {
+    std::iter::successors(Some(base), |rest| match rest.rsplit_once('-') {
+        Some((shorter, _)) if !shorter.is_empty() => Some(shorter),
+        _ => None,
+    })
+}
+
+/// `prefix` with the style suffix re-appended when it was split off,
+/// built in the caller's reusable buffer; `prefix` itself otherwise.
+fn styled<'n>(buffer: &'n mut String, prefix: &'n str, symbolic: bool) -> &'n str {
+    if !symbolic {
+        return prefix;
+    }
+    // The copied bytes.
+    work::count(prefix.len());
+    buffer.clear();
+    buffer.push_str(prefix);
+    buffer.push_str("-symbolic");
+    buffer
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The generated alternatives, collected (the lookup itself never
+    /// collects them).
+    fn fallback_chain(name: &str) -> Vec<String> {
+        let (base, symbolic) = split_symbolic(name);
+        let mut buffer = String::new();
+        prefixes(base)
+            .map(|prefix| styled(&mut buffer, prefix, symbolic).to_owned())
+            .collect()
+    }
 
     #[test]
     fn fallback_chains_shorten_and_keep_the_style() {

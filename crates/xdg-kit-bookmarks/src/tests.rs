@@ -882,3 +882,64 @@ fn self_closing_containers_are_expanded() {
         "a visit adds no type to an existing entry"
     );
 }
+
+#[test]
+fn bulk_insertion_is_linear_including_removed_slots() {
+    // The entry count is maintained, never recounted, so inserting n
+    // entries — some removed and reinserted along the way — does work
+    // linear in n, not quadratic.
+    crate::work::assert_linear(
+        1_000,
+        |n| {
+            let mut file = BookmarkFile::from_bytes(b"<xbel>\n</xbel>\n");
+            let ((), steps) = crate::work::steps(|| {
+                for at in 0..n {
+                    let uri = format!("file:///{at}");
+                    file.open(&uri, &opened()).unwrap();
+                    // Every fourth entry is removed and reinserted: the
+                    // dead slot must not break the count or the budget.
+                    if at % 4 == 0 {
+                        assert!(file.remove(&uri).unwrap());
+                        file.open(&uri, &opened()).unwrap();
+                    }
+                }
+            });
+            assert_eq!(file.bookmarks().count(), n);
+            let bytes: usize = (0..n).map(|at| format!("file:///{at}").len()).sum();
+            (steps, bytes)
+        },
+        // Per insertion: the URI validated, hashed and copied a few
+        // times (the find, the index, the owned entry), the application
+        // record copied; the removed quarter pays once more.
+        |n, bytes| 2 * (40 * n + 16 * bytes),
+    );
+}
+
+#[test]
+fn the_bookmark_budget_follows_edits_exactly() {
+    let limits = crate::Limits {
+        max_bookmarks: 2,
+        ..crate::Limits::default()
+    };
+    let mut file = BookmarkFile::from_bytes_with(b"<xbel>\n</xbel>\n", &limits);
+    file.open("file:///a", &opened()).unwrap();
+    file.open("file:///b", &opened()).unwrap();
+    assert!(matches!(
+        file.open("file:///c", &opened()),
+        Err(EditError::TooManyBookmarks)
+    ));
+    // Removing frees the budget; a dead insertion slot does not count.
+    assert!(file.remove("file:///a").unwrap());
+    file.open("file:///c", &opened()).unwrap();
+    assert!(matches!(
+        file.open("file:///d", &opened()),
+        Err(EditError::TooManyBookmarks)
+    ));
+    // Clearing frees everything.
+    file.clear().unwrap();
+    file.open("file:///d", &opened()).unwrap();
+    assert_eq!(file.bookmarks().count(), 1);
+    // Updating an existing entry needs no budget.
+    file.open("file:///d", &opened()).unwrap();
+    assert_eq!(file.bookmarks().count(), 1);
+}

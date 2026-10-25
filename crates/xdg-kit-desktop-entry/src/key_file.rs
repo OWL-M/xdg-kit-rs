@@ -15,9 +15,11 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::hash::{BuildHasher, Hash};
 use std::io;
+
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use xdg_kit_basedir::Durability;
 
 use xdg_kit_basedir::__hashed as hashed;
 use xdg_kit_locale::Locales;
@@ -2191,15 +2193,19 @@ impl KeyFile {
     /// system counts the links of the whole path; this counts only those of
     /// its last part.
     ///
+    /// The returned [`Durability`] says whether the completed replacement
+    /// is known to survive a crash: [`Durability::NotSynced`] means the
+    /// file *was* replaced but syncing the folder afterwards failed —
+    /// redoing the write would overwrite whatever happened since, so it
+    /// is an outcome, not an error.
+    ///
     /// # Errors
     ///
     /// When one more link follows (`ELOOP`, as reading reports), the folder
-    /// cannot be written or the rename fails, and `path` is then unchanged;
-    /// or when syncing the folder after the rename fails, and `path`
-    /// already holds the new contents.
-    pub fn write(&self, path: impl AsRef<Path>) -> io::Result<()> {
+    /// cannot be written or the rename fails; `path` is then unchanged.
+    pub fn write(&self, path: impl AsRef<Path>) -> io::Result<Durability> {
         use xdg_kit_basedir::{
-            CreateMode, Durability, SymlinkPolicy, WriteFileError, WriteOptions, write_regular_file,
+            CreateMode, SymlinkPolicy, WriteFileError, WriteOptions, write_regular_file,
         };
         let committed = write_regular_file(
             path.as_ref(),
@@ -2216,10 +2222,7 @@ impl KeyFile {
             // semantics, so nothing else arises.
             other => io::Error::other(other.to_string()),
         })?;
-        match committed.durability {
-            Durability::Synced => Ok(()),
-            Durability::NotSynced(err) => Err(err),
-        }
+        Ok(committed.durability)
     }
 }
 
@@ -4524,16 +4527,16 @@ mod tests {
     fn long_names_and_dangling_links_can_be_written() {
         let dir = tempfile::tempdir().unwrap();
         let long = dir.path().join(format!("{}.desktop", "n".repeat(240)));
-        KeyFile::parse(SAMPLE.as_bytes()).write(&long).unwrap();
+        let _ = KeyFile::parse(SAMPLE.as_bytes()).write(&long).unwrap();
         assert_eq!(fs::read_to_string(&long).unwrap(), SAMPLE);
         let emoji = dir
             .path()
             .join(format!("{}.desktop", "\u{1f600}".repeat(61)));
-        KeyFile::parse(SAMPLE.as_bytes()).write(&emoji).unwrap();
+        let _ = KeyFile::parse(SAMPLE.as_bytes()).write(&emoji).unwrap();
         assert_eq!(fs::read_to_string(&emoji).unwrap(), SAMPLE);
         let link = dir.path().join("link.desktop");
         std::os::unix::fs::symlink("not-yet.desktop", &link).unwrap();
-        KeyFile::parse(SAMPLE.as_bytes()).write(&link).unwrap();
+        let _ = KeyFile::parse(SAMPLE.as_bytes()).write(&link).unwrap();
         assert!(
             fs::symlink_metadata(&link)
                 .unwrap()
@@ -4556,7 +4559,7 @@ mod tests {
         std::os::unix::fs::symlink(&path, &link).unwrap();
         let mut file = KeyFile::read(&link).unwrap();
         file.set_string("Desktop Entry", "Name", "Changed").unwrap();
-        file.write(&link).unwrap();
+        let _ = file.write(&link).unwrap();
         assert!(
             fs::symlink_metadata(&link)
                 .unwrap()
@@ -4575,7 +4578,7 @@ mod tests {
         let leftovers: Vec<_> = fs::read_dir(dir.path()).unwrap().flatten().collect();
         assert_eq!(leftovers.len(), 2, "no temporary file left behind");
         let fresh = dir.path().join("new.desktop");
-        KeyFile::new().write(&fresh).unwrap();
+        let _ = KeyFile::new().write(&fresh).unwrap();
         assert_eq!(fs::read(&fresh).unwrap(), b"");
     }
 

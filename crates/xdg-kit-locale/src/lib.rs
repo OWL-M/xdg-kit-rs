@@ -157,6 +157,13 @@ fn once_each<T: Hash + Eq>(items: impl Iterator<Item = T>, len: impl Fn(&T) -> u
     kept
 }
 
+// Locale lists travel with shared snapshots; keep them shareable.
+const _: fn() = || {
+    fn shareable<T: Send + Sync>() {}
+    shareable::<Locale>();
+    shareable::<Locales>();
+};
+
 /// The user's languages, most preferred first.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Locales {
@@ -324,6 +331,11 @@ mod tests {
         }
         let locales = from(&[("LANG", "en_US.UTF-8"), ("LANGUAGE", "Ca:de")]);
         assert_eq!(keys(&locales), ["Ca", "de"], "Ca is not C");
+        // gettext's guess_category_value stops on "C", "C.<encoding>" and
+        // exactly "POSIX" — not on "POSIX.<encoding>", which is merely not
+        // a usable name. The asymmetry is deliberate; keep it.
+        let locales = from(&[("LANG", "en_US.UTF-8"), ("LANGUAGE", "fr:POSIX.UTF-8:de")]);
+        assert_eq!(keys(&locales), ["fr", "de"], "POSIX.UTF-8 does not stop");
     }
 
     #[test]

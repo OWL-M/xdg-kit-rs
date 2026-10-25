@@ -83,6 +83,9 @@ pub(crate) struct Edits {
     pub removed: std::collections::HashSet<usize>,
     /// Entries inserted; `None` where one was removed again.
     pub inserted: Vec<Option<OwnedBookmark>>,
+    /// How many of `inserted` are live (`Some`), kept in step by every
+    /// insertion and removal, so the bookmark count is never recounted.
+    pub inserted_live: usize,
 }
 
 impl Edits {
@@ -185,10 +188,11 @@ impl BookmarkFile {
                 set_app(&mut owned.apps, opened, count.saturating_add(1));
             }
             None => {
-                if self.bookmarks().count() >= self.limits.max_bookmarks {
+                if self.live_bookmarks() >= self.limits.max_bookmarks {
                     return Err(EditError::TooManyBookmarks);
                 }
                 let at = self.edits.inserted.len();
+                self.edits.inserted_live += 1;
                 self.edits.inserted.push(Some(OwnedBookmark {
                     href: uri.to_owned(),
                     added: opened.when,
@@ -260,6 +264,7 @@ impl BookmarkFile {
         work::count(1);
         if let Some(&at) = self.inserted_index.get(uri) {
             if self.edits.inserted[at].take().is_some() {
+                self.edits.inserted_live -= 1;
                 removed = true;
             }
             self.inserted_index.remove(uri);
@@ -280,8 +285,17 @@ impl BookmarkFile {
             self.edits.removed.insert(at);
         }
         self.edits.inserted.clear();
+        self.edits.inserted_live = 0;
         self.inserted_index.clear();
         Ok(())
+    }
+
+    /// How many entries are live right now, from maintained counts: the
+    /// source's, less the removed, plus the live insertions — never a
+    /// recount of the entries themselves.
+    fn live_bookmarks(&self) -> usize {
+        work::count(1);
+        self.parsed.bookmarks.len() - self.edits.removed.len() + self.edits.inserted_live
     }
 
     fn editable(&self) -> Result<(), EditError> {

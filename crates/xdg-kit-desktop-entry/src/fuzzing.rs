@@ -147,7 +147,7 @@ pub fn entry(bytes: &[u8]) {
     ];
     let mut options = LaunchOptions::default();
     let _ = prepare_launch(&entry, &targets, &options);
-    options.terminal = Some(vec!["term".into(), "--".into()]);
+    options.terminal = vec!["term".into(), "--".into()];
     let _ = prepare_launch(&entry, &targets, &options);
     for id in entry.action_ids().into_iter().take(4) {
         options.action = Some(id);

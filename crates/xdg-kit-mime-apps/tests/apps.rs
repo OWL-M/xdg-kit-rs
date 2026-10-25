@@ -10,7 +10,9 @@ use std::sync::Arc;
 use common::Fixture;
 use xdg_kit_desktop_entry::{AppIndex, Launch, LaunchOptions, Target};
 use xdg_kit_mime::{MimeDatabase, MimeType};
-use xdg_kit_mime_apps::{Matched, MediaType, MimeAppsList, OpenError, TypePattern, open_plan};
+use xdg_kit_mime_apps::{
+    LinkPolicy, Matched, MediaType, MimeAppsList, OpenError, TypePattern, open_plan, open_plan_with,
+};
 
 fn m(text: &str) -> MimeType {
     MimeType::new(text).unwrap()
@@ -564,7 +566,7 @@ fn edits_show_after_a_refresh() {
     let pattern = TypePattern::parse("text/x-xkt-plain").unwrap();
     let mut list = MimeAppsList::for_user(&fixture.base_dirs()).unwrap();
     list.set_default(&pattern, "xkt-b.desktop").unwrap();
-    list.write().unwrap();
+    let _ = list.write().unwrap();
     let apps = apps
         .refresh(&index, &mime)
         .expect("the user's file appeared");
@@ -576,7 +578,7 @@ fn edits_show_after_a_refresh() {
 
     let mut list = MimeAppsList::for_user(&fixture.base_dirs()).unwrap();
     list.remove_association(&pattern, "xkt-a.desktop").unwrap();
-    list.write().unwrap();
+    let _ = list.write().unwrap();
     let apps = apps
         .refresh(&index, &mime)
         .expect("the user's file changed");
@@ -729,6 +731,75 @@ fn a_url_scheme_has_only_its_own_handlers() {
 }
 
 #[test]
+fn link_following_is_a_caller_policy() {
+    let fixture = Fixture::new();
+    fixture.add_types(
+        "aliased",
+        r#"<?xml version="1.0"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-xkt-desktop">
+    <alias type="application/x-desktop"/>
+    <glob pattern="*.desktop"/>
+  </mime-type>
+</mime-info>
+"#,
+    );
+    fixture.write(
+        "share1/applications/xkt-web.desktop",
+        "[Desktop Entry]\nType=Application\nName=Web\nExec=true %u\nMimeType=x-scheme-handler/xkt-web;\n",
+    );
+    fixture.write(
+        "share1/applications/xkt-editor.desktop",
+        "[Desktop Entry]\nType=Application\nName=Edit\nExec=true %f\nMimeType=application/x-xkt-desktop;\n",
+    );
+    fixture.write(
+        "files/site.desktop",
+        "[Desktop Entry]\nType=Link\nName=Site\nURL=xkt-web://example.org/\n",
+    );
+    let apps = fixture.mime_apps();
+    let target = Target::Path(fixture.path("files/site.desktop"));
+    let options = LaunchOptions::default();
+    let commands = |plan: xdg_kit_desktop_entry::LaunchPlan| match plan.launch {
+        Launch::Commands(commands) => commands,
+        other => panic!("{other:?}"),
+    };
+    // The default follows, as the desktop does.
+    let followed = commands(open_plan(&target, &apps, &options).unwrap());
+    assert_eq!(followed[0].args, ["xkt-web://example.org/"]);
+    let followed = commands(open_plan_with(&target, &apps, &options, LinkPolicy::Follow).unwrap());
+    assert_eq!(followed[0].args, ["xkt-web://example.org/"]);
+    // As a file: the .desktop file itself goes to its type's handler.
+    let as_file = commands(open_plan_with(&target, &apps, &options, LinkPolicy::AsFile).unwrap());
+    assert!(
+        as_file[0].args[0]
+            .to_string_lossy()
+            .ends_with("site.desktop"),
+        "{as_file:?}"
+    );
+    // Refused: the caller decides before anything is planned for the URL.
+    assert!(matches!(
+        open_plan_with(&target, &apps, &options, LinkPolicy::Refuse),
+        Err(OpenError::LinkRefused(_))
+    ));
+    // The policy concerns links only: an ordinary file opens under every
+    // policy.
+    fixture.write(
+        "files/plain.desktop",
+        "[Desktop Entry]\nType=Application\nName=A\nExec=true\n",
+    );
+    let plain = Target::Path(fixture.path("files/plain.desktop"));
+    for policy in [LinkPolicy::Follow, LinkPolicy::AsFile, LinkPolicy::Refuse] {
+        let planned = commands(open_plan_with(&plain, &apps, &options, policy).unwrap());
+        assert!(
+            planned[0].args[0]
+                .to_string_lossy()
+                .ends_with("plain.desktop"),
+            "{policy:?}: {planned:?}"
+        );
+    }
+}
+
+#[test]
 fn a_link_is_followed_when_desktop_entries_are_an_alias() {
     // Detection gives the canonical type, which the database may name
     // differently.
@@ -837,7 +908,7 @@ fn edits_reach_keys_spelled_as_aliases() {
         .resolving_aliases(Arc::clone(&database));
     let src = TypePattern::parse("text/x-xkt-src").unwrap();
     list.set_default(&src, "xkt-b.desktop").unwrap();
-    list.write().unwrap();
+    let _ = list.write().unwrap();
     let text = fs::read_to_string(fixture.path("config/mimeapps.list")).unwrap();
     assert_eq!(
         text,

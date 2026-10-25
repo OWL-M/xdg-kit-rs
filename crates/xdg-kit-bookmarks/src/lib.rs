@@ -45,6 +45,9 @@ mod bookmark;
 mod document;
 mod edit;
 mod error;
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub mod fuzzing;
 mod limits;
 mod lock;
 mod serialize;

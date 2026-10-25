@@ -29,6 +29,23 @@ impl Diagnostic {
     }
 }
 
+/// Shows external text in a message: control characters escaped, cut.
+pub(crate) fn shown(text: &str) -> String {
+    let mut out = String::new();
+    for c in text.chars().take(64) {
+        if c.is_control() {
+            use std::fmt::Write as _;
+            let _ = write!(out, "\\u{{{:x}}}", c as u32);
+        } else {
+            out.push(c);
+        }
+    }
+    if text.chars().count() > 64 {
+        out.push('\u{2026}');
+    }
+    out
+}
+
 /// Why a thumbnailer command cannot be built.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]

@@ -1,8 +1,9 @@
 # xdg-kit-rs
 
 Freedesktop.org XDG specifications for Rust: MIME types, default
-applications, desktop entries, base directories and the user's languages.
-Pure Rust, no `unsafe` code.
+applications, desktop entries, base directories, the user's languages,
+recently-used bookmarks, thumbnails and icon themes. Pure Rust, no
+`unsafe` code.
 
 ## Crates
 
@@ -54,6 +55,9 @@ re-export it.
 | `locale` | yes | `xdg_kit::locale`: the user's languages, for translated values | |
 | `mime` | yes | `xdg_kit::mime`: the Shared MIME-info database | `basedir` |
 | `mime-apps` | yes | `xdg_kit::mime_apps`: applications for MIME types: defaults, associations, `mimeapps.list`, opening files and URIs | `desktop-entry`, `mime`, `basedir` |
+| `bookmarks` | yes | `xdg_kit::bookmarks`: `recently-used.xbel`, read leniently, edited losslessly, written with conflict detection | `basedir`, `mime` |
+| `thumbnails` | yes | `xdg_kit::thumbnails`: thumbnailer discovery and commands, the thumbnail cache and the shared repositories | `desktop-entry`, `mime`, `basedir` |
+| `icon-theme` | yes | `xdg_kit::icon_theme`: icon lookup over theme inheritance, from GTK caches or directory scans | `desktop-entry`, `locale`, `basedir` |
 | `desktop-entry-dbus` | no | D-Bus activation when launching `DBusActivatable` applications | `desktop-entry` |
 
 When using the crates directly, enable `dbus` on `xdg-kit-desktop-entry`
@@ -153,6 +157,52 @@ for mut child in plan.spawn()? {
     child.wait()?;
 }
 # Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Recording a visit in the recently-used list, losslessly:
+
+```rust
+use xdg_kit::bookmarks::{BookmarkFile, Opened};
+use xdg_kit::mime::MimeType;
+
+let mut recent = BookmarkFile::from_bytes(
+    b"<?xml version=\"1.0\"?>\n<xbel version=\"1.0\">\n</xbel>\n",
+);
+recent.open("file:///home/u/notes.txt", &Opened {
+    name: "viewer".into(),
+    exec: "'viewer %u'".into(),
+    mime: MimeType::new("text/plain").unwrap(),
+    groups: Vec::new(),
+    private: false,
+    when: std::time::SystemTime::now(),
+})?;
+assert!(recent.get("file:///home/u/notes.txt").is_some());
+# Ok::<(), xdg_kit::bookmarks::EditError>(())
+```
+
+The thumbnail cache key for a file, as every generator names it:
+
+```rust
+use xdg_kit::thumbnails::ThumbnailSource;
+
+let source = ThumbnailSource::local("/home/u/photos/cat.png")?;
+assert_eq!(source.uri(), "file:///home/u/photos/cat.png");
+assert!(source.cache_name().ends_with(".png"));
+# Ok::<(), std::io::Error>(())
+```
+
+An icon from the user's theme, at a size and scale:
+
+```rust,no_run
+use xdg_kit::basedir::BaseDirs;
+use xdg_kit::icon_theme::{IconRequest, IconThemes, Formats};
+
+let themes = IconThemes::load(&BaseDirs::from_env()?, "Adwaita");
+let request = IconRequest { size: 48, scale: 2, formats: Formats::default() };
+if let Some(icon) = themes.lookup_with_fallbacks("folder-music", &request) {
+    println!("{}", icon.path().display());
+}
+# Ok::<(), xdg_kit::basedir::Error>(())
 ```
 
 Each crate's documentation has more.

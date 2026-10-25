@@ -40,9 +40,10 @@ pub struct LaunchOptions {
     /// `DESKTOP_STARTUP_ID` or the D-Bus `desktop-startup-id`.
     pub startup_id: Option<String>,
     /// The command that runs a program in a terminal (such as
-    /// `["foot", "--"]`), needed for `Terminal=true`. An empty one counts
-    /// as none.
-    pub terminal: Option<Vec<OsString>>,
+    /// `["foot", "--"]`), needed for `Terminal=true`. Empty means none is
+    /// available: a `Terminal=true` entry then fails with
+    /// [`LaunchError::NeedsTerminal`].
+    pub terminal: Vec<OsString>,
     /// The languages for `%c` (the translated name) and `%i`.
     pub locales: Locales,
     /// Use D-Bus activation for `DBusActivatable=true` entries. On by
@@ -65,7 +66,7 @@ impl Default for LaunchOptions {
             action: None,
             activation_token: None,
             startup_id: None,
-            terminal: None,
+            terminal: Vec::new(),
             locales: Locales::untranslated(),
             dbus: cfg!(feature = "dbus"),
             dbus_timeout: DBUS_TIMEOUT,
@@ -273,10 +274,16 @@ impl fmt::Display for LaunchError {
             ),
             Self::NotAnApplication(Some(EntryType::Other(name))) => write!(
                 f,
-                "the entry is not an application (Some(Other(\"{}\")))",
+                "the entry is not an application but a \"{}\"",
                 quoted(name)
             ),
-            Self::NotAnApplication(kind) => write!(f, "the entry is not an application ({kind:?})"),
+            Self::NotAnApplication(Some(EntryType::Directory)) => {
+                write!(f, "the entry is not an application but a menu directory")
+            }
+            Self::NotAnApplication(None) => {
+                write!(f, "the entry is not an application (it has no Type)")
+            }
+            Self::NotAnApplication(_) => write!(f, "the entry is not an application"),
             Self::NoSuchAction(id) => write!(f, "the entry has no action \"{}\"", quoted(id)),
             Self::NoExec => write!(f, "the entry has no Exec to run"),
             Self::Exec(err) => write!(f, "Exec cannot be used: {err}"),
@@ -430,13 +437,10 @@ fn exec_plan(
     work::count(location.len());
     // Read once: each read looks through the value's trailing spaces.
     let terminal = if entry.terminal() {
-        Some(
-            options
-                .terminal
-                .as_ref()
-                .filter(|terminal| !terminal.is_empty())
-                .ok_or(LaunchError::NeedsTerminal)?,
-        )
+        if options.terminal.is_empty() {
+            return Err(LaunchError::NeedsTerminal);
+        }
+        Some(&options.terminal)
     } else {
         None
     };
@@ -1205,7 +1209,7 @@ mod tests {
             Err(LaunchError::NeedsTerminal)
         ));
         let options = LaunchOptions {
-            terminal: Some(vec!["foot".into(), "--".into()]),
+            terminal: vec!["foot".into(), "--".into()],
             ..LaunchOptions::default()
         };
         let found = prepare_launch(&entry("Exec=top\nTerminal=true"), &[], &options).unwrap();
@@ -1250,9 +1254,9 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_terminal_command_is_no_terminal() {
+    fn an_empty_terminal_command_is_none_available() {
         let options = LaunchOptions {
-            terminal: Some(Vec::new()),
+            terminal: Vec::new(),
             ..LaunchOptions::default()
         };
         assert!(matches!(
@@ -1339,7 +1343,7 @@ mod tests {
     #[test]
     fn a_field_code_as_the_program_cannot_launch() {
         let terminal = LaunchOptions {
-            terminal: Some(vec!["foot".into(), "--".into()]),
+            terminal: vec!["foot".into(), "--".into()],
             ..LaunchOptions::default()
         };
         let mut launched = Vec::new();
@@ -1650,7 +1654,7 @@ mod tests {
     #[test]
     fn each_command_gets_what_expanding_each_argument_gives() {
         let terminal = LaunchOptions {
-            terminal: Some(vec!["foot".into(), "--".into()]),
+            terminal: vec!["foot".into(), "--".into()],
             ..LaunchOptions::default()
         };
         let target_sets = [

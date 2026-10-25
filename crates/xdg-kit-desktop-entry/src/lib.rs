@@ -47,7 +47,20 @@ pub use launch::{
 };
 pub use limits::Limits;
 pub use validate::{Issue, Level, validate};
+pub use xdg_kit_basedir::Durability;
 pub use xdg_kit_locale::Locales;
+
+// Snapshots and parsed entries are shared between threads; keep them
+// that way.
+const _: fn() = || {
+    fn shareable<T: Send + Sync>() {}
+    shareable::<AppIndex>();
+    shareable::<AppEntry>();
+    shareable::<DesktopEntry>();
+    shareable::<KeyFile>();
+    shareable::<LaunchPlan>();
+    shareable::<Limits>();
+};
 
 /// Not public API: the work counter of this crate's counted tests, compiled
 /// in by the hidden `__count-work` feature for the workspace's own tests
