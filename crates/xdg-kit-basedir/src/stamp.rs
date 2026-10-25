@@ -1,6 +1,7 @@
 //! File metadata for detecting later changes.
 
 use std::fs;
+use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::time::SystemTime;
@@ -45,13 +46,32 @@ impl FileStamp {
     /// The stamp of `path` now.
     #[must_use]
     pub fn of(path: impl AsRef<Path>) -> Self {
-        Self(fs::metadata(path).ok().map(|metadata| Parts {
+        Self(fs::metadata(path).ok().map(|metadata| Parts::of(&metadata)))
+    }
+
+    /// The stamp of an opened file. Unlike [`FileStamp::of`], this reports
+    /// a `stat` failure instead of folding it into absence, and the stamp
+    /// belongs to the file that was opened — not to whatever its path
+    /// names later. Use it to build a baseline for detecting changes to
+    /// what was actually read.
+    ///
+    /// # Errors
+    ///
+    /// Any error of reading the open file's metadata.
+    pub fn of_file(file: &fs::File) -> io::Result<Self> {
+        Ok(Self(Some(Parts::of(&file.metadata()?))))
+    }
+}
+
+impl Parts {
+    fn of(metadata: &fs::Metadata) -> Self {
+        Self {
             modified: metadata.modified().ok(),
             changed: (metadata.ctime(), metadata.ctime_nsec()),
             len: metadata.len(),
             dev: metadata.dev(),
             ino: metadata.ino(),
-        }))
+        }
     }
 }
 
@@ -84,6 +104,24 @@ mod tests {
         assert_ne!(FileStamp::of(&path), mode, "replaced by another file");
         fs::remove_file(&path).unwrap();
         assert_eq!(FileStamp::of(&path), absent, "gone");
+    }
+
+    #[test]
+    fn a_files_stamp_matches_its_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        fs::write(&path, "a").unwrap();
+        let file = fs::File::open(&path).unwrap();
+        let of_file = FileStamp::of_file(&file).unwrap();
+        assert_eq!(of_file, FileStamp::of(&path));
+        // The stamp follows the opened file when the path moves on (the
+        // replaced file's own stamp moves too: losing its name is a
+        // status change).
+        let other = dir.path().join("g");
+        fs::write(&other, "bb").unwrap();
+        fs::rename(&other, &path).unwrap();
+        assert_ne!(FileStamp::of(&path), FileStamp::of_file(&file).unwrap());
+        assert_ne!(FileStamp::of(&path), of_file);
     }
 
     /// Flips a permission bit of `path` until `stat` shows a new status

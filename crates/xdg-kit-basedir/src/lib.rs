@@ -38,6 +38,7 @@ mod stamp;
 mod testing;
 pub mod user_dirs;
 mod work;
+mod write;
 
 pub use base_dirs::{BaseDirs, ReadFile};
 pub use error::{Diagnostic, DiagnosticSource, Error};
@@ -45,6 +46,10 @@ pub use read::{Limits, MAX_FILE_LEN, read_regular_file, read_regular_file_with};
 pub use runtime::RuntimeDirProblem;
 pub use stamp::FileStamp;
 pub use user_dirs::{UserDirKind, UserDirs};
+pub use write::{
+    CreateMode, Durability, PreparedWrite, SymlinkPolicy, WriteFileError, WriteOptions,
+    write_regular_file,
+};
 
 // Values are shared between threads; keep them that way.
 const _: fn() = || {

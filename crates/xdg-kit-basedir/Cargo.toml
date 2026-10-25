@@ -21,6 +21,11 @@ __count-work = []
 [dependencies]
 rustix = { workspace = true, features = ["fs"] }
 
+# `MAXSYMLINKS`, the most links a write follows, on the systems the libc
+# crate defines it for (see `MAX_LINKS` in src/write.rs).
+[target.'cfg(any(target_os = "freebsd", target_os = "aix"))'.dependencies]
+libc.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true
 

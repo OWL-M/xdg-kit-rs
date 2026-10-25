@@ -13,14 +13,11 @@
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fmt;
-use std::fs::{self, OpenOptions};
 use std::hash::{BuildHasher, Hash};
-use std::io::{self, Write};
+use std::io;
 use std::marker::PhantomData;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use xdg_kit_basedir::__hashed as hashed;
 use xdg_kit_locale::Locales;
@@ -2201,7 +2198,28 @@ impl KeyFile {
     /// or when syncing the folder after the rename fails, and `path`
     /// already holds the new contents.
     pub fn write(&self, path: impl AsRef<Path>) -> io::Result<()> {
-        write_atomic(path.as_ref(), &self.to_bytes())
+        use xdg_kit_basedir::{
+            CreateMode, Durability, SymlinkPolicy, WriteFileError, WriteOptions, write_regular_file,
+        };
+        let committed = write_regular_file(
+            path.as_ref(),
+            &self.to_bytes(),
+            &WriteOptions {
+                create: CreateMode::Exact(0o644),
+                preserve_mode: true,
+                symlinks: SymlinkPolicy::FollowTarget,
+            },
+        )
+        .map_err(|err| match err {
+            WriteFileError::Before(err) => err,
+            // Links are followed and nothing is installed with no-replace
+            // semantics, so nothing else arises.
+            other => io::Error::other(other.to_string()),
+        })?;
+        match committed.durability {
+            Durability::Synced => Ok(()),
+            Durability::NotSynced(err) => Err(err),
+        }
     }
 }
 
@@ -2394,111 +2412,6 @@ impl Line {
     }
 }
 
-/// Most links followed when resolving the path to write: the system's
-/// `MAXSYMLINKS`, which the `libc` crate defines for FreeBSD (32) and AIX
-/// (20).
-#[cfg(any(target_os = "freebsd", target_os = "aix"))]
-const MAX_LINKS: usize = libc::MAXSYMLINKS.unsigned_abs() as usize;
-
-/// Most links followed when resolving the path to write: the Linux kernel's
-/// `MAXSYMLINKS` (`fs/namei.c`), which the `libc` crate does not define for
-/// Linux or Android.
-#[cfg(any(target_os = "linux", target_os = "android"))]
-const MAX_LINKS: usize = 40;
-
-/// Most links followed when resolving the path to write, where the `libc`
-/// crate defines no `MAXSYMLINKS` (NetBSD, OpenBSD, `DragonFly`, illumos,
-/// Solaris, Apple systems, …): 40, as on Linux, a fallback not verified on
-/// those systems that may differ from their own limit.
-#[cfg(not(any(
-    target_os = "freebsd",
-    target_os = "aix",
-    target_os = "linux",
-    target_os = "android"
-)))]
-const MAX_LINKS: usize = 40;
-
-/// The file a write to `path` replaces: `path`, or the target its symbolic
-/// links lead to, whether or not that exists yet. Up to [`MAX_LINKS`]
-/// links are followed (the system's limit: `MAXSYMLINKS` where the `libc`
-/// crate defines it, 40 on Linux and Android, else an unverified fallback
-/// of 40); one more fails with `ELOOP`, as reading does. The system counts
-/// the links of the whole path; these are only the links of its last part,
-/// one after another (the folders on the way are left to the system).
-fn write_target(path: &Path) -> io::Result<PathBuf> {
-    let mut current = path.to_owned();
-    let mut followed = 0;
-    loop {
-        match fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                if followed == MAX_LINKS {
-                    return Err(rustix::io::Errno::LOOP.into());
-                }
-                followed += 1;
-                let link = fs::read_link(&current)?;
-                current = match current.parent() {
-                    Some(dir) if link.is_relative() => dir.join(link),
-                    _ => link,
-                };
-            }
-            _ => return Ok(current),
-        }
-    }
-}
-
-/// Writes `bytes` to `path` through a temporary file in the same folder.
-pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    static COUNTER: AtomicUsize = AtomicUsize::new(0);
-    let target = write_target(path)?;
-    let name = target
-        .file_name()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no file name"))?
-        .to_string_lossy()
-        .into_owned();
-    // Short enough that the temporary name stays within NAME_MAX.
-    let mut end = name.len().min(64);
-    while !name.is_char_boundary(end) {
-        end -= 1;
-    }
-    let stem = &name[..end];
-    let dir = target
-        .parent()
-        .filter(|dir| !dir.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    let mode = match fs::metadata(&target) {
-        Ok(metadata) => metadata.permissions().mode() & 0o7777,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => 0o644,
-        Err(err) => return Err(err),
-    };
-    let (temp, mut file) = loop {
-        let count = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let temp = dir.join(format!(".{stem}.{}.{count}.tmp", std::process::id()));
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(mode)
-            .open(&temp)
-        {
-            Ok(file) => break (temp, file),
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(err) => return Err(err),
-        }
-    };
-    let written = (|| {
-        file.write_all(bytes)?;
-        // The umask may have narrowed the mode at creation.
-        file.set_permissions(fs::Permissions::from_mode(mode))?;
-        file.sync_all()?;
-        fs::rename(&temp, &target)
-    })();
-    if written.is_err() {
-        let _ = fs::remove_file(&temp);
-        return written;
-    }
-    // The rename itself is made durable by syncing the folder.
-    fs::File::open(dir)?.sync_all()
-}
-
 /// Steps of work, counted in tests so that they can show the work grows
 /// linearly with the input. A step is an item visited (a line, entry,
 /// block, group, key, list item or argument) or a character looked at.
@@ -2629,6 +2542,8 @@ pub(crate) mod work {
 mod tests {
     use super::*;
     use std::borrow::Borrow;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::time::{Duration, Instant};
 
     use xdg_kit_basedir::__hashed::{UseCached, View};
@@ -4662,75 +4577,6 @@ mod tests {
         let fresh = dir.path().join("new.desktop");
         KeyFile::new().write(&fresh).unwrap();
         assert_eq!(fs::read(&fresh).unwrap(), b"");
-    }
-
-    // Only where the limit is known: on other systems `MAX_LINKS` is an
-    // unverified fallback.
-    #[cfg(any(
-        target_os = "linux",
-        target_os = "android",
-        target_os = "freebsd",
-        target_os = "aix"
-    ))]
-    /// Makes `links` symbolic links in `dir`, each to the next, the last
-    /// to `real.desktop`, which holds `old`. Returns the first link.
-    fn link_chain(dir: &Path, links: usize) -> PathBuf {
-        fs::write(dir.join("real.desktop"), "old").unwrap();
-        let mut next = PathBuf::from("real.desktop");
-        for at in (0..links).rev() {
-            let link = PathBuf::from(format!("l{at}"));
-            std::os::unix::fs::symlink(&next, dir.join(&link)).unwrap();
-            next = link;
-        }
-        dir.join(next)
-    }
-
-    // Only where the limit is known: on other systems `MAX_LINKS` is an
-    // unverified fallback.
-    #[cfg(any(
-        target_os = "linux",
-        target_os = "android",
-        target_os = "freebsd",
-        target_os = "aix"
-    ))]
-    #[test]
-    fn writing_follows_as_many_links_as_reading() {
-        // The folder without links on the way, so that only the chain counts
-        // toward the system's limit when reading.
-        let folder = |dir: &tempfile::TempDir| dir.path().canonicalize().unwrap();
-        for links in [MAX_LINKS - 1, MAX_LINKS] {
-            let dir = tempfile::tempdir().unwrap();
-            let first = link_chain(&folder(&dir), links);
-            KeyFile::read(&first).unwrap();
-            KeyFile::parse(SAMPLE.as_bytes()).write(&first).unwrap();
-            assert!(
-                fs::symlink_metadata(&first)
-                    .unwrap()
-                    .file_type()
-                    .is_symlink()
-            );
-            assert_eq!(
-                fs::read_to_string(dir.path().join("real.desktop")).unwrap(),
-                SAMPLE,
-                "{links} links"
-            );
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let first = link_chain(&folder(&dir), MAX_LINKS + 1);
-        let read = KeyFile::read(&first).unwrap_err();
-        let write = KeyFile::parse(SAMPLE.as_bytes()).write(&first).unwrap_err();
-        assert_eq!(
-            read.raw_os_error(),
-            Some(rustix::io::Errno::LOOP.raw_os_error())
-        );
-        assert_eq!(
-            (write.kind(), write.raw_os_error()),
-            (read.kind(), read.raw_os_error())
-        );
-        assert_eq!(
-            fs::read_to_string(dir.path().join("real.desktop")).unwrap(),
-            "old"
-        );
     }
 
     /// Makes a FIFO at `path`.

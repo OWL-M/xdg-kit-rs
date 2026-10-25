@@ -28,11 +28,6 @@ xdg-kit-locale.workspace = true
 zbus = { workspace = true, optional = true }
 zruntime = { workspace = true, optional = true }
 
-# `MAXSYMLINKS`, the most links a write follows, on the systems the libc
-# crate defines it for (see `MAX_LINKS` in src/key_file.rs).
-[target.'cfg(any(target_os = "freebsd", target_os = "aix"))'.dependencies]
-libc.workspace = true
-
 [dev-dependencies]
 tempfile.workspace = true
 # The hidden `__count-work` feature (not public API): the bytes fed to the

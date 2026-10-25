@@ -6,12 +6,11 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ffi::{OsStr, OsString};
-use std::fs::{self, OpenOptions};
-use std::io::{self, Read, Write};
+use std::fs;
+use std::io::{self, Read};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags};
 use rustix::io::Errno;
@@ -178,36 +177,30 @@ pub fn write_mimeinfo_cache(folder: &Path) -> io::Result<()> {
 ///
 /// As [`write_mimeinfo_cache`].
 pub fn write_mimeinfo_cache_with(folder: &Path, limits: &Limits) -> io::Result<()> {
-    static COUNTER: AtomicUsize = AtomicUsize::new(0);
-    let bytes = mimeinfo_cache_with(folder, limits)?;
-    // A name left over from a crashed writer is skipped, not an error.
-    let (temporary, mut file) = loop {
-        let temporary = folder.join(format!(
-            ".mimeinfo.cache.{}.{}",
-            std::process::id(),
-            COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-        {
-            Ok(file) => break (temporary, file),
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(err) => return Err(err),
-        }
+    use xdg_kit_basedir::{
+        CreateMode, Durability, SymlinkPolicy, WriteFileError, WriteOptions, write_regular_file,
     };
-    let written = (|| {
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        fs::rename(&temporary, folder.join("mimeinfo.cache"))?;
-        // The rename itself is durable once the folder is synced.
-        fs::File::open(folder)?.sync_all()
-    })();
-    if written.is_err() {
-        let _ = fs::remove_file(&temporary);
+    let bytes = mimeinfo_cache_with(folder, limits)?;
+    let committed = write_regular_file(
+        &folder.join("mimeinfo.cache"),
+        &bytes,
+        &WriteOptions {
+            // The default permissions: `0666` as the umask leaves it.
+            create: CreateMode::Masked(0o666),
+            preserve_mode: false,
+            symlinks: SymlinkPolicy::ReplaceLink,
+        },
+    )
+    .map_err(|err| match err {
+        WriteFileError::Before(err) => err,
+        // Links are replaced and nothing is installed with no-replace
+        // semantics, so nothing else arises.
+        other => io::Error::other(other.to_string()),
+    })?;
+    match committed.durability {
+        Durability::Synced => Ok(()),
+        Durability::NotSynced(err) => Err(err),
     }
-    written
 }
 
 /// The most folder handles the walk keeps open at a time, one being opened
@@ -1036,6 +1029,7 @@ fn buffer(len: u64) -> io::Result<Vec<u8>> {
 )]
 mod tests {
     use std::cell::{Cell, RefCell};
+    use std::io::Write;
 
     use super::*;
 
@@ -1357,6 +1351,30 @@ mod tests {
             mimeinfo_cache(dir.path()).unwrap()
         );
         assert!(mimeinfo_cache(&dir.path().join("missing")).is_err());
+    }
+
+    #[test]
+    fn the_cache_respects_the_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("a.desktop"),
+            "[Desktop Entry]\nType=Application\nName=A\nExec=a\nMimeType=text/plain;\n",
+        )
+        .unwrap();
+        // The umask is process-global, hence the restore however it ends.
+        let before = rustix::process::umask(rustix::fs::Mode::from_bits_truncate(0o077));
+        let written = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            write_mimeinfo_cache(dir.path())
+        }));
+        rustix::process::umask(before);
+        written.unwrap().unwrap();
+        let mode = fs::metadata(dir.path().join("mimeinfo.cache"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "0666 as the umask leaves it");
     }
 
     /// Opens the folder `name` in `dir`.
