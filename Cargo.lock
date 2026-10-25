@@ -403,6 +403,7 @@ dependencies = [
  "xdg-kit-basedir",
  "xdg-kit-bookmarks",
  "xdg-kit-desktop-entry",
+ "xdg-kit-icon-theme",
  "xdg-kit-locale",
  "xdg-kit-mime",
  "xdg-kit-mime-apps",
@@ -439,6 +440,17 @@ dependencies = [
  "xdg-kit-locale",
  "zbus",
  "zruntime",
+]
+
+[[package]]
+name = "xdg-kit-icon-theme"
+version = "0.1.0"
+dependencies = [
+ "rustix",
+ "tempfile",
+ "xdg-kit-basedir",
+ "xdg-kit-desktop-entry",
+ "xdg-kit-locale",
 ]
 
 [[package]]

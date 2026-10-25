@@ -14,7 +14,16 @@ keywords = ["xdg", "freedesktop", "mime", "desktop-entry", "mimeapps"]
 categories = ["os::unix-apis", "filesystem", "parser-implementations", "config"]
 
 [features]
-default = ["basedir", "bookmarks", "desktop-entry", "locale", "mime", "mime-apps", "thumbnails"]
+default = [
+    "basedir",
+    "bookmarks",
+    "desktop-entry",
+    "icon-theme",
+    "locale",
+    "mime",
+    "mime-apps",
+    "thumbnails",
+]
 ## The XDG Base Directory spec and user folders.
 basedir = ["dep:xdg-kit-basedir"]
 ## The Desktop Bookmark spec: recently-used.xbel.
@@ -24,6 +33,8 @@ bookmarks = ["dep:xdg-kit-bookmarks", "basedir", "mime"]
 desktop-entry = ["dep:xdg-kit-desktop-entry", "basedir"]
 ## D-Bus activation when launching `DBusActivatable` applications.
 desktop-entry-dbus = ["desktop-entry", "xdg-kit-desktop-entry/dbus"]
+## The Icon Theme spec: themed icon lookup.
+icon-theme = ["dep:xdg-kit-icon-theme", "desktop-entry", "locale", "basedir"]
 ## The user's languages, for translated values.
 locale = ["dep:xdg-kit-locale"]
 ## The Shared MIME-info database.
@@ -38,6 +49,7 @@ mime-apps = ["dep:xdg-kit-mime-apps", "desktop-entry", "mime", "basedir"]
 xdg-kit-basedir = { workspace = true, optional = true }
 xdg-kit-bookmarks = { workspace = true, optional = true }
 xdg-kit-desktop-entry = { workspace = true, optional = true }
+xdg-kit-icon-theme = { workspace = true, optional = true }
 xdg-kit-locale = { workspace = true, optional = true }
 xdg-kit-mime = { workspace = true, optional = true }
 xdg-kit-mime-apps = { workspace = true, optional = true }

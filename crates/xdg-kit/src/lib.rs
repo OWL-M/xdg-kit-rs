@@ -5,7 +5,8 @@
 //! provide types used by their APIs: `desktop-entry` and `mime` enable
 //! `basedir`; `mime-apps` enables `desktop-entry`, `mime` and `basedir`;
 //! `bookmarks` enables `mime` and `basedir`; `thumbnails` enables
-//! `desktop-entry`, `mime` and `basedir`.
+//! `desktop-entry`, `mime` and `basedir`; `icon-theme` enables
+//! `desktop-entry`, `locale` and `basedir`.
 //! The exception is `locale`: `desktop-entry` and `mime` use only `Locales`
 //! from that crate and re-export it.
 //!
@@ -17,6 +18,8 @@ pub use xdg_kit_basedir as basedir;
 pub use xdg_kit_bookmarks as bookmarks;
 #[cfg(feature = "desktop-entry")]
 pub use xdg_kit_desktop_entry as desktop_entry;
+#[cfg(feature = "icon-theme")]
+pub use xdg_kit_icon_theme as icon_theme;
 #[cfg(feature = "locale")]
 pub use xdg_kit_locale as locale;
 #[cfg(feature = "mime")]
@@ -32,6 +35,7 @@ pub use xdg_kit_thumbnails as thumbnails;
     feature = "basedir",
     feature = "bookmarks",
     feature = "desktop-entry",
+    feature = "icon-theme",
     feature = "locale",
     feature = "mime",
     feature = "mime-apps",

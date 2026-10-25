@@ -16,6 +16,7 @@ Pure Rust, no `unsafe` code.
 | [`xdg-kit-mime-apps`](https://docs.rs/xdg-kit-mime-apps) | The MIME Applications Associations spec (version 1.0.1): applications and defaults for a MIME type from every `mimeapps.list` and the installed desktop entries, editing `mimeapps.list` without losing its contents or formatting, writing `mimeinfo.cache`, and plans for opening a file or URI. |
 | [`xdg-kit-bookmarks`](https://docs.rs/xdg-kit-bookmarks) | The Desktop Bookmark spec: `recently-used.xbel`, read leniently and edited losslessly — everything other applications put in the file survives byte for byte — with atomic, conflict-detecting writes. |
 | [`xdg-kit-thumbnails`](https://docs.rs/xdg-kit-thumbnails) | The Thumbnail Managing Standard: `.thumbnailer` discovery and commands, the thumbnail cache with its keys, freshness and failure markers, and the shared per-directory repositories. |
+| [`xdg-kit-icon-theme`](https://docs.rs/xdg-kit-icon-theme) | The Icon Theme spec: `index.theme` inheritance, the exact lookup algorithm over an in-memory index (built from validated GTK caches or directory scans), and the Icon Naming spec's fallback chains. |
 
 ## Installing
 
@@ -166,8 +167,9 @@ read only on Linux, Android, Hurd and Apple's systems.
 These fallbacks have not been built or tested on any system but Linux.
 
 `xdg-kit-basedir`, `xdg-kit-bookmarks`, `xdg-kit-desktop-entry`,
-`xdg-kit-mime`, `xdg-kit-mime-apps` and `xdg-kit-thumbnails` stop with a
-compile error on systems that are not Unix.
+`xdg-kit-icon-theme`, `xdg-kit-mime`, `xdg-kit-mime-apps` and
+`xdg-kit-thumbnails` stop with a compile error on systems that are not
+Unix.
 `xdg-kit-locale` uses only the standard library and has no such check.
 
 ## Tests
