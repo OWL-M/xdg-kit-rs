@@ -14,9 +14,11 @@ keywords = ["xdg", "freedesktop", "mime", "desktop-entry", "mimeapps"]
 categories = ["os::unix-apis", "filesystem", "parser-implementations", "config"]
 
 [features]
-default = ["basedir", "desktop-entry", "locale", "mime", "mime-apps"]
+default = ["basedir", "bookmarks", "desktop-entry", "locale", "mime", "mime-apps"]
 ## The XDG Base Directory spec and user folders.
 basedir = ["dep:xdg-kit-basedir"]
+## The Desktop Bookmark spec: recently-used.xbel.
+bookmarks = ["dep:xdg-kit-bookmarks", "basedir", "mime"]
 ## Desktop entries: reading, writing, validation, installed entries by
 ## desktop file ID, launching.
 desktop-entry = ["dep:xdg-kit-desktop-entry", "basedir"]
@@ -32,6 +34,7 @@ mime-apps = ["dep:xdg-kit-mime-apps", "desktop-entry", "mime", "basedir"]
 
 [dependencies]
 xdg-kit-basedir = { workspace = true, optional = true }
+xdg-kit-bookmarks = { workspace = true, optional = true }
 xdg-kit-desktop-entry = { workspace = true, optional = true }
 xdg-kit-locale = { workspace = true, optional = true }
 xdg-kit-mime = { workspace = true, optional = true }

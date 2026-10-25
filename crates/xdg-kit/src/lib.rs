@@ -3,7 +3,8 @@
 //! Each specification has its own crate, re-exported here through a Cargo
 //! feature enabled by default. Features also enable the features that
 //! provide types used by their APIs: `desktop-entry` and `mime` enable
-//! `basedir`; `mime-apps` enables `desktop-entry`, `mime` and `basedir`.
+//! `basedir`; `mime-apps` enables `desktop-entry`, `mime` and `basedir`;
+//! `bookmarks` enables `mime` and `basedir`.
 //! The exception is `locale`: `desktop-entry` and `mime` use only `Locales`
 //! from that crate and re-export it.
 //!
@@ -11,6 +12,8 @@
 
 #[cfg(feature = "basedir")]
 pub use xdg_kit_basedir as basedir;
+#[cfg(feature = "bookmarks")]
+pub use xdg_kit_bookmarks as bookmarks;
 #[cfg(feature = "desktop-entry")]
 pub use xdg_kit_desktop_entry as desktop_entry;
 #[cfg(feature = "locale")]
@@ -24,6 +27,7 @@ pub use xdg_kit_mime_apps as mime_apps;
 #[cfg(all(
     doctest,
     feature = "basedir",
+    feature = "bookmarks",
     feature = "desktop-entry",
     feature = "locale",
     feature = "mime",

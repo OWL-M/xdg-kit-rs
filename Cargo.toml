@@ -16,6 +16,7 @@ quick-xml = "0.42"
 rustix = { version = "1.1", default-features = false, features = ["std", "process"] }
 tempfile = "3"
 xdg-kit-basedir = { path = "crates/xdg-kit-basedir", version = "0.1.0" }
+xdg-kit-bookmarks = { path = "crates/xdg-kit-bookmarks", version = "0.1.0" }
 xdg-kit-desktop-entry = { path = "crates/xdg-kit-desktop-entry", version = "0.1.0" }
 xdg-kit-locale = { path = "crates/xdg-kit-locale", version = "0.1.0" }
 xdg-kit-mime = { path = "crates/xdg-kit-mime", version = "0.1.0" }

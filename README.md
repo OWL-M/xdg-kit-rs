@@ -14,6 +14,7 @@ Pure Rust, no `unsafe` code.
 | [`xdg-kit-desktop-entry`](https://docs.rs/xdg-kit-desktop-entry) | Implements the Desktop Entry spec (version 1.5, with the latest text of xdg-specs). Reads and writes `.desktop` and `.directory` files without losing contents or formatting. Supports typed keys, translations, actions, validation, lookup by desktop file ID, and application launching. |
 | [`xdg-kit-mime`](https://docs.rs/xdg-kit-mime) | The Shared MIME-info database (spec version 0.22, whose text still calls itself 0.21): file types from names, content and file kinds, their relationships, icons and descriptions, and content types of mounted volumes. |
 | [`xdg-kit-mime-apps`](https://docs.rs/xdg-kit-mime-apps) | The MIME Applications Associations spec (version 1.0.1): applications and defaults for a MIME type from every `mimeapps.list` and the installed desktop entries, editing `mimeapps.list` without losing its contents or formatting, writing `mimeinfo.cache`, and plans for opening a file or URI. |
+| [`xdg-kit-bookmarks`](https://docs.rs/xdg-kit-bookmarks) | The Desktop Bookmark spec: `recently-used.xbel`, read leniently and edited losslessly — everything other applications put in the file survives byte for byte — with atomic, conflict-detecting writes. |
 
 ## Installing
 
@@ -163,8 +164,9 @@ systems fall back to portable calls or fixed values: `fstat` instead of
 read only on Linux, Android, Hurd and Apple's systems.
 These fallbacks have not been built or tested on any system but Linux.
 
-`xdg-kit-basedir`, `xdg-kit-desktop-entry`, `xdg-kit-mime` and
-`xdg-kit-mime-apps` stop with a compile error on systems that are not Unix.
+`xdg-kit-basedir`, `xdg-kit-bookmarks`, `xdg-kit-desktop-entry`,
+`xdg-kit-mime` and `xdg-kit-mime-apps` stop with a compile error on systems
+that are not Unix.
 `xdg-kit-locale` uses only the standard library and has no such check.
 
 ## Tests
