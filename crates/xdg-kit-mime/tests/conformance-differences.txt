@@ -6,3 +6,4 @@
 data	test.cdx.xml	application/vnd.cyclonedx+xml	XML root element matched in XMLnamespaces (spec "root-XML"); xdgmime does no root-element detection
 data	test.gpx	application/gpx+xml	XML root element matched in XMLnamespaces (spec "root-XML"); xdgmime does no root-element detection
 data	test10.gpx	application/gpx+xml	XML root element matched in XMLnamespaces (spec "root-XML"); xdgmime does no root-element detection
+name	../../.editorconfig	text/x-editorconfig	glob matching looks only at the part after the last "/" (the documented contract of type_for_name); xdgmime compares the whole given string

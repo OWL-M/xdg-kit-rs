@@ -45,7 +45,7 @@ pub fn gtk_cache(bytes: &[u8]) {
                     for (name, formats) in
                         cache.by_dir.get(&dir.path).map_or(&[][..], Vec::as_slice)
                     {
-                        assert!(!name.is_empty());
+                        assert_ne!(name.as_str(), "");
                         assert_eq!(*formats & !7, 0, "only the three format bits");
                     }
                 }

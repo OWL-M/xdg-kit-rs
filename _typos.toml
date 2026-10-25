@@ -25,6 +25,12 @@ extend-ignore-re = [
     'Ein PNG-Bild',
 ]
 
+[default.extend-words]
+# The Thumbnail Managing Standard's term: `.thumbnailer` files, installed
+# in `thumbnailers/` directories.
+thumbnailer = "thumbnailer"
+thumbnailers = "thumbnailers"
+
 [default.extend-identifiers]
 # A desktop name the Desktop Menu spec registers.
 EDE = "EDE"

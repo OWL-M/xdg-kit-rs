@@ -24,11 +24,11 @@
         "rust-analyzer-src": "rust-analyzer-src"
       },
       "locked": {
-        "lastModified": 1791291961,
-        "narHash": "sha256-z5Mff3AcQ/oa2OskKN7vpU7J4h7nsn4IP2YUgEwdx0Q=",
+        "lastModified": 1792926139,
+        "narHash": "sha256-uLMpwLKdV5U1966bkbe5DzC+5Gp8O6g+wjydKmih7zQ=",
         "owner": "nix-community",
         "repo": "fenix",
-        "rev": "eff70f371f14fef5af78d58ace7c7f6bb60f3da8",
+        "rev": "44ec3e059cf1631403a0faca34106be5fdb17631",
         "type": "github"
       },
       "original": {
@@ -39,11 +39,11 @@
     },
     "nixpkgs": {
       "locked": {
-        "lastModified": 1791260994,
-        "narHash": "sha256-Miqqk/ammqnTUxaoCyvtwoPeLbI1ksFyLxi/CazZpWY=",
+        "lastModified": 1792773339,
+        "narHash": "sha256-rZLrzrC6i+jnTAlvPZHogKDulY7WWDEv9hJeHieO7Zw=",
         "owner": "NixOS",
         "repo": "nixpkgs",
-        "rev": "151fa4e8ddfdd8dd25d945ad94ed54a13de9f6e4",
+        "rev": "3ec636362e1816bc2f0888fa0fa2c69f1bc9e504",
         "type": "github"
       },
       "original": {
@@ -66,11 +66,11 @@
     "rust-analyzer-src": {
       "flake": false,
       "locked": {
-        "lastModified": 1791221318,
-        "narHash": "sha256-Qjdu1LEaFlYt1Ghkt8ToGJdlHu00R8fHYm7Z9lKlJVg=",
+        "lastModified": 1792691653,
+        "narHash": "sha256-3/DMV3Lpmthk6OV2b7bJSJ5Okouyvl755YZENyLwllo=",
         "owner": "rust-lang",
         "repo": "rust-analyzer",
-        "rev": "ce37b245369ade4e2a18063ae4d60a17606c6d26",
+        "rev": "0c4d74686b21f2b3bd8872b6d3cf36ad2e740d49",
         "type": "github"
       },
       "original": {
@@ -83,11 +83,11 @@
     "shared-mime-info": {
       "flake": false,
       "locked": {
-        "lastModified": 1789070972,
-        "narHash": "sha256-qxuIBRSnt728rD0QmmmkT6ex5Bl7LBhe0Twqne+azFc=",
+        "lastModified": 1792595800,
+        "narHash": "sha256-rx16SwNNImIfmeC5aMCGtco9GXiYJCenneozqXTE2ys=",
         "ref": "refs/heads/master",
-        "rev": "433be9a1d72c142fe85d741674a1d74b58ff3de2",
-        "revCount": 2200,
+        "rev": "93706a8b92311c1694f767b86aa53cecab2f53ba",
+        "revCount": 2211,
         "type": "git",
         "url": "https://gitlab.freedesktop.org/xdg/shared-mime-info.git"
       },
@@ -114,11 +114,11 @@
     "xdg-specs": {
       "flake": false,
       "locked": {
-        "lastModified": 1790954144,
-        "narHash": "sha256-21dhZyUDuNSZrCxQZZHALqW/MqMSoM8XyrzWAArI89E=",
+        "lastModified": 1792430908,
+        "narHash": "sha256-3NgI1AJE8Vn7AxLkf5vqsK7K658/AiccYkN/vjO5Dmc=",
         "ref": "refs/heads/master",
-        "rev": "1e7f4cefd7fe02201c77c1b5c8eed284b88d4142",
-        "revCount": 559,
+        "rev": "a0eaad5cc900684519030ceb568f7053dc315fe6",
+        "revCount": 573,
         "type": "git",
         "url": "https://gitlab.freedesktop.org/xdg/xdg-specs.git"
       },
