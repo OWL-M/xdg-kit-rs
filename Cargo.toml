@@ -20,6 +20,7 @@ xdg-kit-bookmarks = { path = "crates/xdg-kit-bookmarks", version = "0.1.0" }
 xdg-kit-desktop-entry = { path = "crates/xdg-kit-desktop-entry", version = "0.1.0" }
 xdg-kit-locale = { path = "crates/xdg-kit-locale", version = "0.1.0" }
 xdg-kit-mime = { path = "crates/xdg-kit-mime", version = "0.1.0" }
+xdg-kit-thumbnails = { path = "crates/xdg-kit-thumbnails", version = "0.1.0" }
 xdg-kit-mime-apps = { path = "crates/xdg-kit-mime-apps", version = "0.1.0" }
 # D-Bus calls for `DBusActivatable` entries (`dbus` feature of the desktop
 # entry crate), driven by zbus's `block_on` on its own runtime, or on the

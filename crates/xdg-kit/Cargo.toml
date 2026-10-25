@@ -14,7 +14,7 @@ keywords = ["xdg", "freedesktop", "mime", "desktop-entry", "mimeapps"]
 categories = ["os::unix-apis", "filesystem", "parser-implementations", "config"]
 
 [features]
-default = ["basedir", "bookmarks", "desktop-entry", "locale", "mime", "mime-apps"]
+default = ["basedir", "bookmarks", "desktop-entry", "locale", "mime", "mime-apps", "thumbnails"]
 ## The XDG Base Directory spec and user folders.
 basedir = ["dep:xdg-kit-basedir"]
 ## The Desktop Bookmark spec: recently-used.xbel.
@@ -28,6 +28,8 @@ desktop-entry-dbus = ["desktop-entry", "xdg-kit-desktop-entry/dbus"]
 locale = ["dep:xdg-kit-locale"]
 ## The Shared MIME-info database.
 mime = ["dep:xdg-kit-mime", "basedir"]
+## The Thumbnail Managing Standard: thumbnailers and the thumbnail cache.
+thumbnails = ["dep:xdg-kit-thumbnails", "desktop-entry", "mime", "basedir"]
 ## Applications for MIME types: defaults, associations, `mimeapps.list`,
 ## opening files and URIs.
 mime-apps = ["dep:xdg-kit-mime-apps", "desktop-entry", "mime", "basedir"]
@@ -39,6 +41,7 @@ xdg-kit-desktop-entry = { workspace = true, optional = true }
 xdg-kit-locale = { workspace = true, optional = true }
 xdg-kit-mime = { workspace = true, optional = true }
 xdg-kit-mime-apps = { workspace = true, optional = true }
+xdg-kit-thumbnails = { workspace = true, optional = true }
 
 [lints]
 workspace = true

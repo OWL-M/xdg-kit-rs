@@ -406,6 +406,7 @@ dependencies = [
  "xdg-kit-locale",
  "xdg-kit-mime",
  "xdg-kit-mime-apps",
+ "xdg-kit-thumbnails",
 ]
 
 [[package]]
@@ -461,6 +462,17 @@ name = "xdg-kit-mime-apps"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "rustix",
+ "tempfile",
+ "xdg-kit-basedir",
+ "xdg-kit-desktop-entry",
+ "xdg-kit-mime",
+]
+
+[[package]]
+name = "xdg-kit-thumbnails"
+version = "0.1.0"
+dependencies = [
  "rustix",
  "tempfile",
  "xdg-kit-basedir",

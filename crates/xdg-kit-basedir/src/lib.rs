@@ -47,7 +47,7 @@ pub use runtime::RuntimeDirProblem;
 pub use stamp::FileStamp;
 pub use user_dirs::{UserDirKind, UserDirs};
 pub use write::{
-    CreateMode, Durability, PreparedWrite, SymlinkPolicy, WriteFileError, WriteOptions,
+    Committed, CreateMode, Durability, PreparedWrite, SymlinkPolicy, WriteFileError, WriteOptions,
     write_regular_file,
 };
 

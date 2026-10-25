@@ -4,7 +4,8 @@
 //! feature enabled by default. Features also enable the features that
 //! provide types used by their APIs: `desktop-entry` and `mime` enable
 //! `basedir`; `mime-apps` enables `desktop-entry`, `mime` and `basedir`;
-//! `bookmarks` enables `mime` and `basedir`.
+//! `bookmarks` enables `mime` and `basedir`; `thumbnails` enables
+//! `desktop-entry`, `mime` and `basedir`.
 //! The exception is `locale`: `desktop-entry` and `mime` use only `Locales`
 //! from that crate and re-export it.
 //!
@@ -22,6 +23,8 @@ pub use xdg_kit_locale as locale;
 pub use xdg_kit_mime as mime;
 #[cfg(feature = "mime-apps")]
 pub use xdg_kit_mime_apps as mime_apps;
+#[cfg(feature = "thumbnails")]
+pub use xdg_kit_thumbnails as thumbnails;
 
 /// The examples of the workspace's README, run as doctests.
 #[cfg(all(
@@ -31,7 +34,8 @@ pub use xdg_kit_mime_apps as mime_apps;
     feature = "desktop-entry",
     feature = "locale",
     feature = "mime",
-    feature = "mime-apps"
+    feature = "mime-apps",
+    feature = "thumbnails"
 ))]
 #[doc = include_str!("../README.md")]
 pub struct ReadmeDoctests;

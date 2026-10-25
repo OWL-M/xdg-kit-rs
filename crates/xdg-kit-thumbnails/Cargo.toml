@@ -1,0 +1,28 @@
+[package]
+name = "xdg-kit-thumbnails"
+description = "The Thumbnail Managing Standard: thumbnailers, the thumbnail cache, shared repositories"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+documentation = "https://docs.rs/xdg-kit-thumbnails"
+keywords = ["xdg", "freedesktop", "thumbnails", "thumbnailer", "cache"]
+categories = ["os::unix-apis", "filesystem", "caching"]
+
+[dependencies]
+rustix = { workspace = true, features = ["fs"] }
+xdg-kit-basedir.workspace = true
+xdg-kit-desktop-entry.workspace = true
+xdg-kit-mime.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+# The hidden `__count-work` feature (not public API): the bytes fed to the
+# hashers of the shared maps keyed by text, for the tests that check a
+# long key is not hashed again as a map grows.
+xdg-kit-basedir = { workspace = true, features = ["__count-work"] }
+
+[lints]
+workspace = true
