@@ -50,7 +50,7 @@ pub use stamp::FileStamp;
 pub use user_dirs::{UserDirKind, UserDirs};
 pub use write::{
     Committed, CreateMode, Durability, PreparedWrite, SymlinkPolicy, WriteFileError, WriteOptions,
-    write_regular_file,
+    create_dir_all_synced, write_regular_file,
 };
 
 // Values are shared between threads; keep them that way.

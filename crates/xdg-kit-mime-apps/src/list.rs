@@ -4,9 +4,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::fs::DirBuilder;
 use std::io;
-use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -787,16 +785,15 @@ impl MimeAppsList {
         {
             return Err(WriteError::OverLimits);
         }
-        if let Some(parent) = path
+        let folders = match path
             .parent()
-            .filter(|parent| !parent.as_os_str().is_empty() && !parent.exists())
+            .filter(|parent| !parent.as_os_str().is_empty())
         {
-            DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(parent)
-                .map_err(WriteError::Io)?;
-        }
+            Some(parent) => {
+                xdg_kit_basedir::create_dir_all_synced(parent, 0o700).map_err(WriteError::Io)?
+            }
+            None => Durability::Synced,
+        };
         let prepared = PreparedWrite::new(&path, &bytes, &OPTIONS).map_err(|err| match err {
             WriteFileError::Before(err) => WriteError::Io(err),
             // Links are followed; no-replace comes later.
@@ -838,7 +835,12 @@ impl MimeAppsList {
         // onto its own output.
         self.source = bytes;
         self.baseline = committed.stamp.map_or(Baseline::Unknown, Baseline::Stamped);
-        Ok(committed.durability)
+        // A new folder whose entry could not be synced leaves the file
+        // reachable only until a crash, however the file itself synced.
+        Ok(match folders {
+            Durability::NotSynced(err) => Durability::NotSynced(err),
+            Durability::Synced => committed.durability,
+        })
     }
 
     /// Whether the destination still holds exactly what was opened.

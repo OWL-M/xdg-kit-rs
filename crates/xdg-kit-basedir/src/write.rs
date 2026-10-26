@@ -331,6 +331,75 @@ impl Drop for PreparedWrite {
     }
 }
 
+/// Creates `dir` and every missing ancestor, one level at a time, each
+/// with `mode` (filtered by the umask, as `mkdir(2)` does), and syncs the
+/// folder holding each one created: a new folder's own entry survives a
+/// crash only once its parent is synced, which a later replacement's
+/// folder sync (the innermost folder only) does not do for the levels
+/// above. Folders that exist already are left alone.
+///
+/// The result says whether those syncs all succeeded: a caller writing a
+/// file into the new folders reports [`Durability::NotSynced`] when this
+/// did, even if the file's own replacement synced. A folder another
+/// process created meanwhile is taken as found, and its parent synced all
+/// the same.
+///
+/// # Errors
+///
+/// [`io::ErrorKind::NotADirectory`] when `dir`, or a level of it, is
+/// something other than a folder (a symbolic link counts as what it points
+/// to, as path lookup follows it; a dangling one is no folder); any error
+/// creating a missing folder or looking at an ancestor.
+pub fn create_dir_all_synced(dir: &Path, mode: u32) -> io::Result<Durability> {
+    use std::os::unix::fs::DirBuilderExt;
+    let not_a_folder = |path: &Path| {
+        io::Error::new(
+            io::ErrorKind::NotADirectory,
+            format!("{} is not a folder", path.display()),
+        )
+    };
+    let mut missing = Vec::new();
+    let mut at = dir;
+    loop {
+        match fs::metadata(at) {
+            Ok(metadata) if metadata.is_dir() => break,
+            Ok(_) => return Err(not_a_folder(at)),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                missing.push(at);
+                match at.parent() {
+                    Some(parent) if !parent.as_os_str().is_empty() => at = parent,
+                    _ => break,
+                }
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    let mut durability = Durability::Synced;
+    for created in missing.into_iter().rev() {
+        match fs::DirBuilder::new().mode(mode).create(created) {
+            Ok(()) => {}
+            // Made by someone else meanwhile, or a dangling link: only a
+            // folder will do.
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                if !fs::metadata(created).is_ok_and(|metadata| metadata.is_dir()) {
+                    return Err(not_a_folder(created));
+                }
+            }
+            Err(err) => return Err(err),
+        }
+        let parent = created
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        if let Err(err) = fs::File::open(parent).and_then(|parent| parent.sync_all())
+            && matches!(durability, Durability::Synced)
+        {
+            durability = Durability::NotSynced(err);
+        }
+    }
+    Ok(durability)
+}
+
 /// Renames `temp` to `target` only if nothing exists there:
 /// `renameat2(2)` with `RENAME_NOREPLACE` (`RENAME_EXCL` on Apple
 /// systems), where rustix has it.
@@ -626,6 +695,38 @@ mod tests {
             (read.kind(), read.raw_os_error())
         );
         assert_eq!(fs::read_to_string(dir.path().join("real")).unwrap(), "old");
+    }
+
+    #[test]
+    fn missing_folders_are_created_level_by_level() {
+        let dir = tempfile::tempdir().unwrap();
+        let deep = dir.path().join("a/b/c");
+        let made = create_dir_all_synced(&deep, 0o700).unwrap();
+        assert!(matches!(made, Durability::Synced));
+        for level in ["a", "a/b", "a/b/c"] {
+            assert_eq!(mode_of(&dir.path().join(level)) & 0o777, 0o700, "{level}");
+        }
+        // Existing folders are left as they are.
+        fs::set_permissions(dir.path().join("a"), fs::Permissions::from_mode(0o755)).unwrap();
+        let again = create_dir_all_synced(&deep, 0o700).unwrap();
+        assert!(matches!(again, Durability::Synced));
+        assert_eq!(mode_of(&dir.path().join("a")) & 0o777, 0o755);
+        // Anything but a folder in the way is an error: a file at the
+        // destination or above it, a dangling link at the destination or
+        // above it. A link to a folder is that folder.
+        fs::write(dir.path().join("file"), "").unwrap();
+        symlink(dir.path().join("nowhere"), dir.path().join("dangling")).unwrap();
+        symlink(dir.path().join("a"), dir.path().join("linked")).unwrap();
+        for target in ["file", "file/below", "dangling", "dangling/below"] {
+            let err = create_dir_all_synced(&dir.path().join(target), 0o700).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::NotADirectory, "{target}: {err}");
+        }
+        assert!(
+            !dir.path().join("nowhere").exists(),
+            "the link's target was not made"
+        );
+        let through = create_dir_all_synced(&dir.path().join("linked/b"), 0o700).unwrap();
+        assert!(matches!(through, Durability::Synced));
     }
 
     #[test]

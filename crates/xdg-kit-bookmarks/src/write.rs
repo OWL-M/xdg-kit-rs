@@ -4,7 +4,6 @@
 
 use std::fs;
 use std::io;
-use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 
 use xdg_kit_basedir::{
@@ -171,16 +170,15 @@ impl BookmarkFile {
         if !written.is_editable() {
             return Err(WriteError::OverLimits);
         }
-        if let Some(parent) = path
+        let folders = match path
             .parent()
-            .filter(|parent| !parent.as_os_str().is_empty() && !parent.exists())
+            .filter(|parent| !parent.as_os_str().is_empty())
         {
-            fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(parent)
-                .map_err(WriteError::Io)?;
-        }
+            Some(parent) => {
+                xdg_kit_basedir::create_dir_all_synced(parent, 0o700).map_err(WriteError::Io)?
+            }
+            None => Durability::Synced,
+        };
         let prepared = PreparedWrite::new(&path, &bytes, &OPTIONS).map_err(|err| match err {
             WriteFileError::Before(err) => WriteError::Io(err),
             // Links are followed; no-replace comes later.
@@ -224,7 +222,12 @@ impl BookmarkFile {
         written.path = Some(path);
         written.baseline = committed.stamp.map_or(Baseline::Unknown, Baseline::Stamped);
         *self = written;
-        Ok(committed.durability)
+        // A new folder whose entry could not be synced leaves the file
+        // reachable only until a crash, however the file itself synced.
+        Ok(match folders {
+            Durability::NotSynced(err) => Durability::NotSynced(err),
+            Durability::Synced => committed.durability,
+        })
     }
 
     /// Whether the destination still holds exactly what was loaded.
