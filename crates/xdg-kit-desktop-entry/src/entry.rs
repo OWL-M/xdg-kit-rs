@@ -236,6 +236,15 @@ impl DesktopEntry {
         Self::from_key_file(KeyFile::parse(bytes))
     }
 
+    /// Parses `bytes`, already read from the file at `path`, as that
+    /// entry: [`DesktopEntry::path`] is `path` (made absolute), which
+    /// launching needs for `%k` and for a D-Bus activation's bus name. See
+    /// [`KeyFile::parse_at`].
+    #[must_use]
+    pub fn parse_at(bytes: &[u8], path: impl AsRef<Path>) -> Self {
+        Self::from_key_file(KeyFile::parse_at(bytes, path, KeyNames::DesktopEntry))
+    }
+
     /// The entry a key file holds.
     #[must_use]
     pub fn from_key_file(file: KeyFile) -> Self {
@@ -837,5 +846,30 @@ mod tests {
             .set_string(DESKTOP_ENTRY, "Exec", "fooview --new %U")
             .unwrap();
         assert_eq!(entry.exec().as_deref(), Some("fooview --new %U"));
+    }
+
+    #[test]
+    fn parsed_bytes_can_name_their_file() {
+        let bytes =
+            b"[Desktop Entry]\nType=Application\nExec=tool %k\nGarbled=\xff\n\xfe\n# \xfd\n";
+        let entry = DesktopEntry::parse_at(bytes, "relative/org.example.App.desktop");
+        let path = entry.path().unwrap();
+        assert!(path.is_absolute(), "made absolute as reading makes it");
+        assert!(path.ends_with("relative/org.example.App.desktop"));
+        assert_eq!(
+            entry.key_file().to_bytes(),
+            bytes,
+            "parsed exactly as parse does"
+        );
+        assert_eq!(DesktopEntry::parse(bytes).path(), None);
+        // Lines 4 and 5 are dropped as not UTF-8; the comment on 6 is not
+        // a dropped line.
+        assert_eq!(entry.key_file().undecodable_lines(), [4, 5]);
+        assert_eq!(
+            DesktopEntry::parse(b"[A]\nk=v\n")
+                .key_file()
+                .undecodable_lines(),
+            []
+        );
     }
 }

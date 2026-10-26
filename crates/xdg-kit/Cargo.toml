@@ -15,6 +15,7 @@ categories = ["os::unix-apis", "filesystem", "parser-implementations", "config"]
 
 [features]
 default = [
+    "autostart",
     "basedir",
     "bookmarks",
     "desktop-entry",
@@ -24,6 +25,9 @@ default = [
     "mime-apps",
     "thumbnails",
 ]
+## The Desktop Application Autostart spec: login autostart entries,
+## their eligibility and launch plans, user overrides.
+autostart = ["dep:xdg-kit-autostart", "desktop-entry", "basedir"]
 ## The XDG Base Directory spec and user folders.
 basedir = ["dep:xdg-kit-basedir"]
 ## The Desktop Bookmark spec: recently-used.xbel.
@@ -31,7 +35,8 @@ bookmarks = ["dep:xdg-kit-bookmarks", "basedir", "mime"]
 ## Desktop entries: reading, writing, validation, installed entries by
 ## desktop file ID, launching.
 desktop-entry = ["dep:xdg-kit-desktop-entry", "basedir"]
-## D-Bus activation when launching `DBusActivatable` applications.
+## D-Bus activation when launching `DBusActivatable` applications (autostart
+## plans included).
 desktop-entry-dbus = ["desktop-entry", "xdg-kit-desktop-entry/dbus"]
 ## The Icon Theme spec: themed icon lookup.
 icon-theme = ["dep:xdg-kit-icon-theme", "desktop-entry", "locale", "basedir"]
@@ -46,6 +51,7 @@ thumbnails = ["dep:xdg-kit-thumbnails", "desktop-entry", "mime", "basedir"]
 mime-apps = ["dep:xdg-kit-mime-apps", "desktop-entry", "mime", "basedir"]
 
 [dependencies]
+xdg-kit-autostart = { workspace = true, optional = true }
 xdg-kit-basedir = { workspace = true, optional = true }
 xdg-kit-bookmarks = { workspace = true, optional = true }
 xdg-kit-desktop-entry = { workspace = true, optional = true }

@@ -2,8 +2,8 @@
 
 Freedesktop.org XDG specifications for Rust: MIME types, default
 applications, desktop entries, base directories, the user's languages,
-recently-used bookmarks, thumbnails and icon themes. Pure Rust, no
-`unsafe` code.
+recently-used bookmarks, thumbnails, icon themes and login autostart.
+Pure Rust, no `unsafe` code.
 
 ## Crates
 
@@ -18,6 +18,7 @@ recently-used bookmarks, thumbnails and icon themes. Pure Rust, no
 | [`xdg-kit-bookmarks`](https://docs.rs/xdg-kit-bookmarks) | The Desktop Bookmark spec: `recently-used.xbel`, read leniently and edited losslessly — everything other applications put in the file survives byte for byte — with atomic, conflict-detecting writes. |
 | [`xdg-kit-thumbnails`](https://docs.rs/xdg-kit-thumbnails) | The Thumbnail Managing Standard: `.thumbnailer` discovery and commands, the thumbnail cache with its keys, freshness and failure markers, and the shared per-directory repositories. |
 | [`xdg-kit-icon-theme`](https://docs.rs/xdg-kit-icon-theme) | The Icon Theme spec: `index.theme` inheritance, the exact lookup algorithm over an in-memory index (built from validated GTK caches or directory scans), and the Icon Naming spec's fallback chains. |
+| [`xdg-kit-autostart`](https://docs.rs/xdg-kit-autostart) | The Desktop Application Autostart spec: the entries a session starts after login, with precedence and `Hidden` overrides, structured reasons for every entry that does not start, launch plans, and user overrides that enable, disable or reset an entry without losing anything in the file. |
 
 ## Installing
 
@@ -58,6 +59,7 @@ re-export it.
 | `bookmarks` | yes | `xdg_kit::bookmarks`: `recently-used.xbel`, read leniently, edited losslessly, written with conflict detection | `basedir`, `mime` |
 | `thumbnails` | yes | `xdg_kit::thumbnails`: thumbnailer discovery and commands, the thumbnail cache and the shared repositories | `desktop-entry`, `mime`, `basedir` |
 | `icon-theme` | yes | `xdg_kit::icon_theme`: icon lookup over theme inheritance, from GTK caches or directory scans | `desktop-entry`, `locale`, `basedir` |
+| `autostart` | yes | `xdg_kit::autostart`: login autostart entries, why each does or does not start, launch plans, user overrides | `desktop-entry`, `basedir` |
 | `desktop-entry-dbus` | no | D-Bus activation when launching `DBusActivatable` applications | `desktop-entry` |
 
 When using the crates directly, enable `dbus` on `xdg-kit-desktop-entry`
@@ -191,6 +193,33 @@ assert!(source.cache_name().ends_with(".png"));
 # Ok::<(), std::io::Error>(())
 ```
 
+Disabling a login autostart entry for the user, keeping the system's file
+untouched (here on given directories, not the real ones):
+
+```rust
+use xdg_kit::autostart::{AutostartEntries, Context, Desktops, Ineligible, Limits};
+
+let root = std::env::temp_dir().join(format!("xdg-kit-readme-{}", std::process::id()));
+let (user, system) = (root.join("user"), root.join("system"));
+std::fs::create_dir_all(&system)?;
+std::fs::write(
+    system.join("tray.desktop"),
+    "[Desktop Entry]\nType=Application\nName=Tray\nExec=tray\n",
+)?;
+let entries = AutostartEntries::from_dirs(&user, [&system], &Limits::default())?;
+let mut tray = entries.edit("tray.desktop")?;
+tray.disable()?;
+let _durability = tray.write()?;
+let entries = entries.refresh().expect("the override appeared");
+let session = Context::new(Desktops::new(["GNOME"]), "/usr/bin");
+assert_eq!(
+    entries.get("tray.desktop").unwrap().eligibility(&session).reasons(),
+    [Ineligible::Hidden]
+);
+std::fs::remove_dir_all(&root)?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
 An icon from the user's theme, at a size and scale:
 
 ```rust,no_run
@@ -216,10 +245,10 @@ systems fall back to portable calls or fixed values: `fstat` instead of
 read only on Linux, Android, Hurd and Apple's systems.
 These fallbacks have not been built or tested on any system but Linux.
 
-`xdg-kit-basedir`, `xdg-kit-bookmarks`, `xdg-kit-desktop-entry`,
-`xdg-kit-icon-theme`, `xdg-kit-mime`, `xdg-kit-mime-apps` and
-`xdg-kit-thumbnails` stop with a compile error on systems that are not
-Unix.
+`xdg-kit-autostart`, `xdg-kit-basedir`, `xdg-kit-bookmarks`,
+`xdg-kit-desktop-entry`, `xdg-kit-icon-theme`, `xdg-kit-mime`,
+`xdg-kit-mime-apps` and `xdg-kit-thumbnails` stop with a compile error on
+systems that are not Unix.
 `xdg-kit-locale` uses only the standard library and has no such check.
 
 ## Tests
@@ -242,7 +271,9 @@ The dev shell provides:
   pinned desktop-file-utils commit;
 - `xdg-user-dir` (xdg-user-dirs), `dbus-daemon` (for the D-Bus activation
   test, which runs on Linux with the `dbus` feature) and `gio` (GLib), from
-  the locked nixpkgs.
+  the locked nixpkgs;
+- `XDG_KIT_SYSTEMD`, systemd from the locked nixpkgs, whose
+  `systemd-xdg-autostart-generator` the autostart tests compare with.
 
 None of this reference material is copied into the repository. Outside the
 dev shell, the tests that need it fail with a message that says to run

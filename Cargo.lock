@@ -400,6 +400,7 @@ dependencies = [
 name = "xdg-kit"
 version = "0.1.0"
 dependencies = [
+ "xdg-kit-autostart",
  "xdg-kit-basedir",
  "xdg-kit-bookmarks",
  "xdg-kit-desktop-entry",
@@ -408,6 +409,16 @@ dependencies = [
  "xdg-kit-mime",
  "xdg-kit-mime-apps",
  "xdg-kit-thumbnails",
+]
+
+[[package]]
+name = "xdg-kit-autostart"
+version = "0.1.0"
+dependencies = [
+ "rustix",
+ "tempfile",
+ "xdg-kit-basedir",
+ "xdg-kit-desktop-entry",
 ]
 
 [[package]]

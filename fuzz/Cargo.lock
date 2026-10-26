@@ -147,6 +147,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "xdg-kit-autostart"
+version = "0.1.0"
+dependencies = [
+ "rustix",
+ "xdg-kit-basedir",
+ "xdg-kit-desktop-entry",
+]
+
+[[package]]
 name = "xdg-kit-basedir"
 version = "0.1.0"
 dependencies = [
@@ -178,6 +187,7 @@ name = "xdg-kit-fuzz"
 version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
+ "xdg-kit-autostart",
  "xdg-kit-basedir",
  "xdg-kit-bookmarks",
  "xdg-kit-desktop-entry",

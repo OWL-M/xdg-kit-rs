@@ -147,5 +147,11 @@ printf 'sh -c "convert \\"%%u\\" #not-a-comment" %%o' > "$out/thumbnailer_comman
 # user-dirs.dirs: the reference shapes, and lines the parser must skip.
 mkdir -p "$out/user_dirs"
 printf '# comment\nXDG_DESKTOP_DIR="$HOME/Desktop"\nXDG_DOWNLOAD_DIR="/abs/down"\nXDG_MUSIC_DIR="relative"\nXDG_ODD_DIR="$HOME/unclosed\nnot a line\n' > "$out/user_dirs/seed"
+# Autostart files: an override, desktop filters, TryExec, the KDE group,
+# CRLF lines and a duplicate Hidden key.
+mkdir -p "$out/autostart_entry"
+printf '[Desktop Entry]\nType=Application\nName=A\nExec=a\nHidden=true\nOnlyShowIn=GNOME;\nTryExec=a\nX-GNOME-Autostart-enabled=false\n' > "$out/autostart_entry/override"
+printf '[KDE Desktop Entry]\r\nType=Application\r\nExec=a\r\nHidden=false\r\nHidden=yes\r\n' > "$out/autostart_entry/kde-crlf"
+printf '# only a comment' > "$out/autostart_entry/no-group"
 rm -rf seeds
 mv "$out" seeds

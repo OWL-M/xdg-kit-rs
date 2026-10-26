@@ -1201,6 +1201,21 @@ impl KeyFile {
         Self::parse_from(bytes, None, key_names)
     }
 
+    /// Parses `bytes`, already read from the file at `path`, as that file:
+    /// [`KeyFile::path`] is `path`, made absolute as [`KeyFile::read`]
+    /// makes it. For a caller that reads the bytes itself — through one
+    /// descriptor, paired with that file's identity, say — and must not
+    /// read the file a second time just to name it.
+    #[must_use]
+    pub fn parse_at(bytes: &[u8], path: impl AsRef<Path>, key_names: KeyNames) -> Self {
+        // Absolute now, as reading makes it; as given when it cannot be.
+        // Each byte copied.
+        let path = path.as_ref();
+        let path = std::path::absolute(path).unwrap_or_else(|_| path.to_owned());
+        work::count(path.as_os_str().len());
+        Self::parse_from(bytes, Some(path), key_names)
+    }
+
     /// The key names this file accepts.
     #[must_use]
     pub fn key_names(&self) -> KeyNames {
@@ -1463,6 +1478,26 @@ impl KeyFile {
                 })
                 .collect()
         })
+    }
+
+    /// The lines (counted from 1) that are neither comments nor UTF-8:
+    /// reading ignores them (with a diagnostic), so whatever they were
+    /// meant to say — a key, a group header — is not in the file as read.
+    /// A caller for which a dropped line matters (one that may have meant
+    /// to disable something) can refuse the file on them. A step per line
+    /// and per byte of a candidate line checked.
+    #[must_use]
+    pub fn undecodable_lines(&self) -> Vec<usize> {
+        self.lines()
+            .enumerate()
+            .filter(|(_, line)| {
+                line.kind == Kind::Invalid && {
+                    work::count(line.raw.len());
+                    std::str::from_utf8(line.content()).is_err()
+                }
+            })
+            .map(|(at, _)| at + 1)
+            .collect()
     }
 
     /// The lines (counted from 1) of the comments that are not UTF-8, which

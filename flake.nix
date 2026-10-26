@@ -142,6 +142,15 @@
         XDG_KIT_SMI_SRC = "${shared-mime-info}";
         XDG_KIT_XDG_SPECS_SRC = "${xdg-specs}";
       };
+      # Where the tests find the pinned sources and the reference programs
+      # that are not on PATH: systemd's autostart generator, the reference
+      # the autostart tests compare with, lives under lib/systemd.
+      referenceVars =
+        pkgs:
+        sourceVars
+        // {
+          XDG_KIT_SYSTEMD = "${pkgs.systemd}";
+        };
     in
     {
       devShells = eachSystem (
@@ -168,7 +177,7 @@
 
               RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
             }
-            // sourceVars
+            // referenceVars pkgs
           );
 
           # `nix develop .#fuzz`: a pinned nightly with cargo-fuzz, for the
@@ -211,7 +220,7 @@
                 ]
                 ++ testTools pkgs;
               }
-              // sourceVars
+              // referenceVars pkgs
             );
         }
       );
@@ -275,7 +284,7 @@
                 runHook postInstall
               '';
             }
-            // sourceVars
+            // referenceVars pkgs
           );
 
           # Each fuzz target for `fuzzSeconds`, from seeds that

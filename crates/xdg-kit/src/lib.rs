@@ -6,12 +6,16 @@
 //! `basedir`; `mime-apps` enables `desktop-entry`, `mime` and `basedir`;
 //! `bookmarks` enables `mime` and `basedir`; `thumbnails` enables
 //! `desktop-entry`, `mime` and `basedir`; `icon-theme` enables
-//! `desktop-entry`, `locale` and `basedir`.
+//! `desktop-entry`, `locale` and `basedir`; `autostart` enables
+//! `desktop-entry` and `basedir`.
 //! The exception is `locale`: `desktop-entry` and `mime` use only `Locales`
 //! from that crate and re-export it.
 //!
-//! `desktop-entry-dbus` adds D-Bus activation when launching.
+//! `desktop-entry-dbus` adds D-Bus activation when launching, autostart
+//! plans included.
 
+#[cfg(feature = "autostart")]
+pub use xdg_kit_autostart as autostart;
 #[cfg(feature = "basedir")]
 pub use xdg_kit_basedir as basedir;
 #[cfg(feature = "bookmarks")]
@@ -32,6 +36,7 @@ pub use xdg_kit_thumbnails as thumbnails;
 /// The examples of the workspace's README, run as doctests.
 #[cfg(all(
     doctest,
+    feature = "autostart",
     feature = "basedir",
     feature = "bookmarks",
     feature = "desktop-entry",
