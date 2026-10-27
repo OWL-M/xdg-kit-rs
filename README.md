@@ -2,7 +2,8 @@
 
 Freedesktop.org XDG specifications for Rust: MIME types, default
 applications, desktop entries, base directories, the user's languages,
-recently-used bookmarks, thumbnails, icon themes and login autostart.
+recently-used bookmarks, thumbnails, icon themes, login autostart and
+application menus.
 Pure Rust, no `unsafe` code.
 
 ## Crates
@@ -18,6 +19,7 @@ Pure Rust, no `unsafe` code.
 | [`xdg-kit-bookmarks`](https://docs.rs/xdg-kit-bookmarks) | The Desktop Bookmark spec: `recently-used.xbel`, read leniently and edited losslessly — everything other applications put in the file survives byte for byte — with atomic, conflict-detecting writes. |
 | [`xdg-kit-thumbnails`](https://docs.rs/xdg-kit-thumbnails) | The Thumbnail Managing Standard: `.thumbnailer` discovery and commands, the thumbnail cache with its keys, freshness and failure markers, and the shared per-directory repositories. |
 | [`xdg-kit-icon-theme`](https://docs.rs/xdg-kit-icon-theme) | The Icon Theme spec: `index.theme` inheritance, the exact lookup algorithm over an in-memory index (built from validated GTK caches or directory scans), and the Icon Naming spec's fallback chains. |
+| [`xdg-kit-menu`](https://docs.rs/xdg-kit-menu) | The Desktop Menu spec (version 1.1): `.menu` files resolved into the application menu tree — `XDG_MENU_PREFIX` and user overrides, merges, moves, deletions, `<Include>`/`<Exclude>` rules with `<OnlyUnallocated>`, legacy hierarchies, localized `.directory` captions, and layouts with separators and inlining — every step bounded, with each entry's desktop file and path kept for launching. |
 | [`xdg-kit-autostart`](https://docs.rs/xdg-kit-autostart) | The Desktop Application Autostart spec: the entries a session starts after login, with precedence and `Hidden` overrides, structured reasons for every entry that does not start, launch plans, and user overrides that enable, disable or reset an entry without losing anything in the file. |
 
 ## Installing
@@ -60,6 +62,7 @@ re-export it.
 | `thumbnails` | yes | `xdg_kit::thumbnails`: thumbnailer discovery and commands, the thumbnail cache and the shared repositories | `desktop-entry`, `mime`, `basedir` |
 | `icon-theme` | yes | `xdg_kit::icon_theme`: icon lookup over theme inheritance, from GTK caches or directory scans | `desktop-entry`, `locale`, `basedir` |
 | `autostart` | yes | `xdg_kit::autostart`: login autostart entries, why each does or does not start, launch plans, user overrides | `desktop-entry`, `basedir` |
+| `menu` | yes | `xdg_kit::menu`: `.menu` files resolved into application menus | `desktop-entry`, `locale`, `basedir` |
 | `desktop-entry-dbus` | no | D-Bus activation when launching `DBusActivatable` applications | `desktop-entry` |
 
 When using the crates directly, enable `dbus` on `xdg-kit-desktop-entry`
@@ -220,6 +223,34 @@ std::fs::remove_dir_all(&root)?;
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
+An application menu from a menu file (here a given one, not the user's):
+
+```rust
+use xdg_kit::basedir::BaseDirs;
+use xdg_kit::menu::{MenuContext, MenuTree};
+
+let root = std::env::temp_dir().join(format!("xdg-kit-readme-menu-{}", std::process::id()));
+let apps = root.join("applications");
+std::fs::create_dir_all(&apps)?;
+std::fs::write(
+    apps.join("org.example.Editor.desktop"),
+    "[Desktop Entry]\nType=Application\nName=Editor\nExec=editor %f\nCategories=Utility;\n",
+)?;
+std::fs::write(
+    root.join("applications.menu"),
+    "<Menu><Name>Applications</Name><AppDir>applications</AppDir>\
+     <Menu><Name>Accessories</Name><Include><Category>Utility</Category></Include></Menu></Menu>",
+)?;
+let vars = |name: &str| (name == "HOME").then(|| root.clone().into_os_string());
+let context = MenuContext::new(BaseDirs::from_vars(vars)?);
+let tree = MenuTree::load_file(&context, root.join("applications.menu"))?;
+let accessories = tree.root().submenu("Accessories").unwrap();
+let editor = accessories.entries().next().unwrap();
+assert_eq!((editor.label(), editor.id()), ("Editor", "org.example.Editor.desktop"));
+std::fs::remove_dir_all(&root)?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
 An icon from the user's theme, at a size and scale:
 
 ```rust,no_run
@@ -246,8 +277,8 @@ read only on Linux, Android, Hurd and Apple's systems.
 These fallbacks have not been built or tested on any system but Linux.
 
 `xdg-kit-autostart`, `xdg-kit-basedir`, `xdg-kit-bookmarks`,
-`xdg-kit-desktop-entry`, `xdg-kit-icon-theme`, `xdg-kit-mime`,
-`xdg-kit-mime-apps` and `xdg-kit-thumbnails` stop with a compile error on
+`xdg-kit-desktop-entry`, `xdg-kit-icon-theme`, `xdg-kit-menu`,
+`xdg-kit-mime`, `xdg-kit-mime-apps` and `xdg-kit-thumbnails` stop with a compile error on
 systems that are not Unix.
 `xdg-kit-locale` uses only the standard library and has no such check.
 
@@ -273,7 +304,11 @@ The dev shell provides:
   test, which runs on Linux with the `dbus` feature) and `gio` (GLib), from
   the locked nixpkgs;
 - `XDG_KIT_SYSTEMD`, systemd from the locked nixpkgs, whose
-  `systemd-xdg-autostart-generator` the autostart tests compare with.
+  `systemd-xdg-autostart-generator` the autostart tests compare with;
+- `perl`, which runs the Desktop Menu spec's own test suite from
+  xdg-specs, and Python with PyGObject and `XDG_KIT_GI_TYPELIB_PATH`, for
+  the menu tests' comparison with GNOME's libgnome-menu (gnome-menus from
+  the locked nixpkgs).
 
 None of this reference material is copied into the repository. Outside the
 dev shell, the tests that need it fail with a message that says to run

@@ -192,6 +192,7 @@ dependencies = [
  "xdg-kit-bookmarks",
  "xdg-kit-desktop-entry",
  "xdg-kit-icon-theme",
+ "xdg-kit-menu",
  "xdg-kit-mime",
  "xdg-kit-mime-apps",
  "xdg-kit-thumbnails",
@@ -209,6 +210,17 @@ dependencies = [
 [[package]]
 name = "xdg-kit-locale"
 version = "0.1.0"
+
+[[package]]
+name = "xdg-kit-menu"
+version = "0.1.0"
+dependencies = [
+ "quick-xml",
+ "rustix",
+ "xdg-kit-basedir",
+ "xdg-kit-desktop-entry",
+ "xdg-kit-locale",
+]
 
 [[package]]
 name = "xdg-kit-mime"

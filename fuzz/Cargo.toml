@@ -22,6 +22,7 @@ xdg-kit-autostart = { path = "../crates/xdg-kit-autostart" }
 xdg-kit-basedir = { path = "../crates/xdg-kit-basedir" }
 xdg-kit-bookmarks = { path = "../crates/xdg-kit-bookmarks" }
 xdg-kit-icon-theme = { path = "../crates/xdg-kit-icon-theme" }
+xdg-kit-menu = { path = "../crates/xdg-kit-menu" }
 xdg-kit-thumbnails = { path = "../crates/xdg-kit-thumbnails" }
 
 [[bin]]
@@ -160,6 +161,13 @@ bench = false
 [[bin]]
 name = "autostart_entry"
 path = "fuzz_targets/autostart_entry.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "menu_file"
+path = "fuzz_targets/menu_file.rs"
 test = false
 doc = false
 bench = false

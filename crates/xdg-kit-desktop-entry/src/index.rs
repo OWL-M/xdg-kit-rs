@@ -60,6 +60,15 @@ impl AppEntry {
         self.entry.no_display()
     }
 
+    /// Whether `TryExec` indicates that the application is installed, as
+    /// [`DesktopEntry::try_exec_available`] checks it.
+    #[must_use]
+    pub fn try_exec(&self, search_path: &OsStr) -> bool {
+        self.entry.try_exec_available(search_path)
+    }
+}
+
+impl DesktopEntry {
     /// Whether `TryExec` indicates that the application is installed,
     /// checked as `GLib` 2.88 checks it (`g_find_program_for_path`).
     /// Returns true if the key is missing or names an executable file.
@@ -75,8 +84,8 @@ impl AppEntry {
     /// letter sends every non-absolute name only to `$PATH`; the direct
     /// probe on top of that follows the reference, deliberately.
     #[must_use]
-    pub fn try_exec(&self, search_path: &OsStr) -> bool {
-        let Some(program) = self.entry.try_exec() else {
+    pub fn try_exec_available(&self, search_path: &OsStr) -> bool {
+        let Some(program) = self.try_exec() else {
             return true;
         };
         let executable = |path: &Path| {
@@ -85,7 +94,7 @@ impl AppEntry {
         };
         // A relative candidate is resolved where a launch would run the
         // program: in the entry's `Path=` working folder when set.
-        let base = self.entry.working_dir().map(PathBuf::from);
+        let base = self.working_dir().map(PathBuf::from);
         let resolved = |path: &Path| match &base {
             Some(base) if path.is_relative() => executable(&base.join(path)),
             _ => executable(path),
@@ -271,6 +280,9 @@ pub struct AppIndex {
     /// `held` stays right and a change to one is noticed.
     shadowed: Vec<(PathBuf, FileStamp, Arc<DesktopEntry>)>,
     diagnostics: Vec<Diagnostic>,
+    /// Whether some folder was not read in full: the walk stopped at a
+    /// limit, a folder was nested too deep, or one could not be listed.
+    incomplete: bool,
     /// The limits it was read within.
     limits: Limits,
 }
@@ -334,12 +346,9 @@ impl AppIndex {
         &self.limits
     }
 
-    fn scan(
-        roots: Vec<(PathBuf, FileStamp)>,
-        cache: &HashMap<PathBuf, (FileStamp, Arc<DesktopEntry>)>,
-        limits: Limits,
-    ) -> Self {
-        let mut index = Self {
+    /// An index of `roots` folders that holds nothing yet.
+    fn empty(roots: usize, limits: Limits) -> Self {
+        Self {
             roots: Vec::new(),
             folders: Vec::new(),
             found: Vec::new(),
@@ -347,11 +356,20 @@ impl AppIndex {
             links: Vec::new(),
             by_id: BTreeMap::new(),
             lookup: Map::new(),
-            held: vec![BTreeSet::new(); roots.len()],
+            held: vec![BTreeSet::new(); roots],
             shadowed: Vec::new(),
             diagnostics: Vec::new(),
+            incomplete: false,
             limits,
-        };
+        }
+    }
+
+    fn scan(
+        roots: Vec<(PathBuf, FileStamp)>,
+        cache: &HashMap<PathBuf, (FileStamp, Arc<DesktopEntry>)>,
+        limits: Limits,
+    ) -> Self {
+        let mut index = Self::empty(roots.len(), limits);
         // A root reached again under another path is scanned once; it holds
         // what it held the first time.
         let mut roots_seen: HashMap<(u64, u64), usize> = HashMap::new();
@@ -424,6 +442,10 @@ impl AppIndex {
                     _ => match DesktopEntry::read_with_limits(&path, &limits) {
                         Ok(entry) => Arc::new(entry),
                         Err(err) => {
+                            // Over the size limit: a limit cut the scan.
+                            if err.kind() == std::io::ErrorKind::FileTooLarge {
+                                index.incomplete = true;
+                            }
                             index.report(Diagnostic::new(
                                 Some(path.clone()),
                                 None,
@@ -596,6 +618,7 @@ impl AppIndex {
             }
         }
         if walk.capped {
+            self.incomplete = true;
             let max = self.limits.max_listed.unwrap_or(usize::MAX);
             self.report(Diagnostic::new(
                 Some(root.to_owned()),
@@ -646,6 +669,7 @@ impl AppIndex {
                 None,
                 "folders nested too deep; not scanned further",
             ));
+            self.incomplete = true;
             walk.ancestors.remove(&identity);
             return;
         }
@@ -659,6 +683,7 @@ impl AppIndex {
                 None,
                 format!("cannot be listed: {err}; the entries not read are left out"),
             ));
+            self.incomplete = true;
         }
         // Past the cap the walk stops: what was found stays.
         if left.is_some_and(|left| read > left) {
@@ -819,6 +844,18 @@ impl AppIndex {
     #[must_use]
     pub fn diagnostics(&self) -> &[Diagnostic] {
         &self.diagnostics
+    }
+
+    /// Whether every folder was read in full. `false` when a walk stopped at
+    /// [`Limits::max_listed`], a folder was nested past [`Limits::max_depth`],
+    /// a folder could not be listed, or a desktop file was larger than
+    /// [`Limits::max_file_len`] (each also a diagnostic): entries may
+    /// then be missing — a more important file that would shadow, or hide
+    /// with `Hidden=true`, a less important one included — so a caller that
+    /// must not show what such a file would hide can refuse the index.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        !self.incomplete
     }
 
     /// Whether the folder `dir` (an index into [`AppIndex::dirs`]) holds a
@@ -1174,6 +1211,7 @@ mod tests {
             };
             self.walk_recursive(root, Path::new(""), 0, &mut walk);
             if walk.capped {
+                self.incomplete = true;
                 self.report(Diagnostic::new(
                     Some(root.to_owned()),
                     None,
@@ -1229,6 +1267,7 @@ mod tests {
                     None,
                     "folders nested too deep; not scanned further",
                 ));
+                self.incomplete = true;
                 return;
             }
             // Every name, in name order, cut below at the cap.
@@ -1239,6 +1278,7 @@ mod tests {
                     None,
                     format!("cannot be listed: {err}; the entries not read are left out"),
                 ));
+                self.incomplete = true;
             }
             // Past the cap the walk stops: what was found stays.
             if let Some(max) = self.limits.max_listed {
@@ -3118,6 +3158,33 @@ mod tests {
         let index = index.refresh().expect("a removed file");
         assert!(index.get("a.desktop").is_none());
         assert!(index.refresh().is_none());
+    }
+
+    #[test]
+    fn an_index_says_whether_every_folder_was_read() {
+        let root = tempfile::tempdir().unwrap();
+        for at in 0..3 {
+            write(&root.path().join(format!("a{at}.desktop")), &app("x"));
+        }
+        assert!(AppIndex::from_dirs([root.path()]).is_complete());
+        let capped = Limits {
+            max_listed: Some(2),
+            ..Limits::default()
+        };
+        assert!(!AppIndex::from_dirs_with([root.path()], &capped).is_complete());
+        let shallow = Limits {
+            max_depth: Some(0),
+            ..Limits::default()
+        };
+        write(&root.path().join("deep/b.desktop"), &app("x"));
+        assert!(!AppIndex::from_dirs_with([root.path()], &shallow).is_complete());
+        let small = Limits {
+            max_file_len: Some(8),
+            ..Limits::default()
+        };
+        assert!(!AppIndex::from_dirs_with([root.path()], &small).is_complete());
+        // A missing folder holds nothing: nothing is missing from the index.
+        assert!(AppIndex::from_dirs([root.path().join("absent")]).is_complete());
     }
 
     #[test]

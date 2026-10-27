@@ -10,7 +10,7 @@ repository.workspace = true
 # find it in the packaged crate.
 readme = "README.md"
 documentation = "https://docs.rs/xdg-kit"
-keywords = ["xdg", "freedesktop", "mime", "desktop-entry", "mimeapps"]
+keywords = ["xdg", "freedesktop", "mime", "desktop-entry", "menu"]
 categories = ["os::unix-apis", "filesystem", "parser-implementations", "config"]
 
 [features]
@@ -21,6 +21,7 @@ default = [
     "desktop-entry",
     "icon-theme",
     "locale",
+    "menu",
     "mime",
     "mime-apps",
     "thumbnails",
@@ -42,6 +43,8 @@ desktop-entry-dbus = ["desktop-entry", "xdg-kit-desktop-entry/dbus"]
 icon-theme = ["dep:xdg-kit-icon-theme", "desktop-entry", "locale", "basedir"]
 ## The user's languages, for translated values.
 locale = ["dep:xdg-kit-locale"]
+## The Desktop Menu spec: `.menu` files resolved into application menus.
+menu = ["dep:xdg-kit-menu", "desktop-entry", "locale", "basedir"]
 ## The Shared MIME-info database.
 mime = ["dep:xdg-kit-mime", "basedir"]
 ## The Thumbnail Managing Standard: thumbnailers and the thumbnail cache.
@@ -57,6 +60,7 @@ xdg-kit-bookmarks = { workspace = true, optional = true }
 xdg-kit-desktop-entry = { workspace = true, optional = true }
 xdg-kit-icon-theme = { workspace = true, optional = true }
 xdg-kit-locale = { workspace = true, optional = true }
+xdg-kit-menu = { workspace = true, optional = true }
 xdg-kit-mime = { workspace = true, optional = true }
 xdg-kit-mime-apps = { workspace = true, optional = true }
 xdg-kit-thumbnails = { workspace = true, optional = true }

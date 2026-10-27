@@ -7,7 +7,8 @@
 //! `bookmarks` enables `mime` and `basedir`; `thumbnails` enables
 //! `desktop-entry`, `mime` and `basedir`; `icon-theme` enables
 //! `desktop-entry`, `locale` and `basedir`; `autostart` enables
-//! `desktop-entry` and `basedir`.
+//! `desktop-entry` and `basedir`; `menu` enables `desktop-entry`, `locale`
+//! and `basedir`.
 //! The exception is `locale`: `desktop-entry` and `mime` use only `Locales`
 //! from that crate and re-export it.
 //!
@@ -26,6 +27,8 @@ pub use xdg_kit_desktop_entry as desktop_entry;
 pub use xdg_kit_icon_theme as icon_theme;
 #[cfg(feature = "locale")]
 pub use xdg_kit_locale as locale;
+#[cfg(feature = "menu")]
+pub use xdg_kit_menu as menu;
 #[cfg(feature = "mime")]
 pub use xdg_kit_mime as mime;
 #[cfg(feature = "mime-apps")]
@@ -42,6 +45,7 @@ pub use xdg_kit_thumbnails as thumbnails;
     feature = "desktop-entry",
     feature = "icon-theme",
     feature = "locale",
+    feature = "menu",
     feature = "mime",
     feature = "mime-apps",
     feature = "thumbnails"

@@ -1,0 +1,35 @@
+[package]
+name = "xdg-kit-menu"
+description = "The Desktop Menu spec: .menu files resolved into application menu trees"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+documentation = "https://docs.rs/xdg-kit-menu"
+keywords = ["xdg", "freedesktop", "menu", "desktop-entry", "launcher"]
+categories = ["os::unix-apis", "filesystem", "parser-implementations"]
+
+[dependencies]
+quick-xml.workspace = true
+rustix = { workspace = true, features = ["fs"] }
+xdg-kit-basedir.workspace = true
+xdg-kit-desktop-entry.workspace = true
+xdg-kit-locale.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+# The hidden `__count-work` feature (not public API) compiles in the key
+# file's work counter, which this crate's counted tests count on too, so
+# the parsing of each entry is part of the count.
+xdg-kit-desktop-entry = { workspace = true, features = ["__count-work"] }
+
+[lints]
+workspace = true
+
+# The spec's suite runner calls this binary back as `$MENUTEST`, so it has
+# its own `main`.
+[[test]]
+name = "spec_suite"
+harness = false

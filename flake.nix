@@ -136,6 +136,11 @@
         # GLib from the locked nixpkgs: it changes only with
         # `nix flake update nixpkgs`.
         pkgs.glib.bin
+        # The Desktop Menu spec's own test runner is bash and perl; the menu
+        # tests drive GNOME's libgnome-menu (the reference they compare
+        # with) through Python's GObject introspection.
+        pkgs.perl
+        (pkgs.python3.withPackages (ps: [ ps.pygobject3 ]))
       ];
       # Where the tests find the pinned sources.
       sourceVars = {
@@ -150,6 +155,8 @@
         sourceVars
         // {
           XDG_KIT_SYSTEMD = "${pkgs.systemd}";
+          # The typelibs of gnome-menus and GLib, for tests/gmenu-dump.py.
+          XDG_KIT_GI_TYPELIB_PATH = "${pkgs.gnome-menus}/lib/girepository-1.0:${pkgs.glib.out}/lib/girepository-1.0";
         };
     in
     {
