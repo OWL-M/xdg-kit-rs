@@ -11,6 +11,7 @@ repository = "https://github.com/OWL-M/xdg-kit-rs"
 readme = "README.md"
 
 [workspace.dependencies]
+jiff = { version = "0.2.38", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo", "tzdb-concatenated"] }
 libc = "0.2.190"
 quick-xml = "0.42"
 rustix = { version = "1.1", default-features = false, features = ["std", "process"] }
@@ -24,6 +25,7 @@ xdg-kit-locale = { path = "crates/xdg-kit-locale", version = "0.1.0" }
 xdg-kit-menu = { path = "crates/xdg-kit-menu", version = "0.1.0" }
 xdg-kit-mime = { path = "crates/xdg-kit-mime", version = "0.1.0" }
 xdg-kit-thumbnails = { path = "crates/xdg-kit-thumbnails", version = "0.1.0" }
+xdg-kit-trash = { path = "crates/xdg-kit-trash", version = "0.1.0" }
 xdg-kit-mime-apps = { path = "crates/xdg-kit-mime-apps", version = "0.1.0" }
 # D-Bus calls for `DBusActivatable` entries (`dbus` feature of the desktop
 # entry crate), driven by zbus's `block_on` on its own runtime, or on the

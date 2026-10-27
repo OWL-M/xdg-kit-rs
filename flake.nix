@@ -141,6 +141,9 @@
         # with) through Python's GObject introspection.
         pkgs.perl
         (pkgs.python3.withPackages (ps: [ ps.pygobject3 ]))
+        # `unshare`, which runs the trash crate's mount tests in a user and
+        # mount namespace of their own (with XDG_KIT_TRASH_MOUNT_TESTS=1).
+        pkgs.util-linux
       ];
       # Where the tests find the pinned sources.
       sourceVars = {
@@ -269,6 +272,8 @@
               # The sandbox's build folder cannot hold extended attributes, which
               # the `user.mime_type` test needs; the dev shell runs it.
               XDG_KIT_SKIP_XATTR_TEST = "1";
+              # The trash crate's mount tests, in a namespace of their own.
+              XDG_KIT_TRASH_MOUNT_TESTS = "1";
 
               buildPhase = ''
                 runHook preBuild

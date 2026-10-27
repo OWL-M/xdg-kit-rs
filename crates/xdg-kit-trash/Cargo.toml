@@ -1,0 +1,36 @@
+[package]
+name = "xdg-kit-trash"
+description = "The Trash spec: trashing, listing, restoring and erasing files in freedesktop.org trash directories"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+documentation = "https://docs.rs/xdg-kit-trash"
+keywords = ["xdg", "freedesktop", "trash", "recycle-bin", "filesystem"]
+categories = ["os::unix-apis", "filesystem"]
+
+[dependencies]
+# Civil times in a time zone, and the system's zone for `Context::from_env`.
+# Only zoneinfo lookup: no bundled database (Unix systems ship one), and
+# Android's concatenated database.
+jiff = { workspace = true }
+rustix = { workspace = true, features = ["fs"] }
+xdg-kit-basedir.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+# Per-thread user IDs (permission tests as root), user and mount
+# namespaces (the mount tests).
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+rustix = { workspace = true, features = ["fs", "thread", "mount"] }
+
+[lints]
+workspace = true
+
+# Re-runs itself in a user and mount namespace, so it has its own `main`.
+[[test]]
+name = "mounts"
+harness = false

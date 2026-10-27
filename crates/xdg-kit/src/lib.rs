@@ -8,7 +8,7 @@
 //! `desktop-entry`, `mime` and `basedir`; `icon-theme` enables
 //! `desktop-entry`, `locale` and `basedir`; `autostart` enables
 //! `desktop-entry` and `basedir`; `menu` enables `desktop-entry`, `locale`
-//! and `basedir`.
+//! and `basedir`; `trash` enables `basedir`.
 //! The exception is `locale`: `desktop-entry` and `mime` use only `Locales`
 //! from that crate and re-export it.
 //!
@@ -35,6 +35,8 @@ pub use xdg_kit_mime as mime;
 pub use xdg_kit_mime_apps as mime_apps;
 #[cfg(feature = "thumbnails")]
 pub use xdg_kit_thumbnails as thumbnails;
+#[cfg(feature = "trash")]
+pub use xdg_kit_trash as trash;
 
 /// The examples of the workspace's README, run as doctests.
 #[cfg(all(
@@ -48,7 +50,8 @@ pub use xdg_kit_thumbnails as thumbnails;
     feature = "menu",
     feature = "mime",
     feature = "mime-apps",
-    feature = "thumbnails"
+    feature = "thumbnails",
+    feature = "trash"
 ))]
 #[doc = include_str!("../README.md")]
 pub struct ReadmeDoctests;

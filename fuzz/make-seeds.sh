@@ -159,5 +159,14 @@ mkdir -p "$out/menu_file"
 printf '<!DOCTYPE Menu PUBLIC "-//freedesktop//DTD Menu 1.0//EN" "http://www.freedesktop.org/standards/menu-spec/1.0/menu.dtd">\n<Menu><Name>Applications</Name><DefaultAppDirs/><DefaultDirectoryDirs/><DefaultMergeDirs/><AppDir>apps</AppDir><DirectoryDir>dirs</DirectoryDir><KDELegacyDirs/><LegacyDir prefix="kde-">legacy</LegacyDir><MergeFile type="parent"/><MergeDir>merged</MergeDir>\n<Menu><Name>Games</Name><Directory>g.directory</Directory><Include><And><Category>Game</Category><Not><Category>Office</Category></Not></And><Filename>b.desktop</Filename></Include><Exclude><Or><Filename>c.desktop</Filename><Regex>x</Regex></Or></Exclude></Menu>\n<Menu><Name>Office</Name><Include><Category>Office</Category></Include><NotDeleted/><Deleted/></Menu>\n<Menu><Name>Other</Name><OnlyUnallocated/><Include><All/></Include></Menu>\n<Move><Old>Games</Old><New>Fun/Games</New><Old>Office</Old><New>Work</New></Move>\n<Layout><Merge type="menus"/><Separator/><Menuname inline="true" inline_limit="2" inline_header="true" inline_alias="true" show_empty="false">Other</Menuname><Filename>a.desktop</Filename><Merge type="files"/><Merge type="all"/></Layout>\n<DefaultLayout show_empty="true" inline="false"><Merge type="all"/></DefaultLayout></Menu>\n' > "$out/menu_file/full"
 printf '<Menu xmlns="http://www.freedesktop.org/standards/menu" xmlns:x="urn:x"><Name>R&amp;&#x41;</Name><DefaultAppDirs/><x:Include><All/></x:Include><Include xmlns="urn:y"><All/></Include><Menu><Name>A</Name><Include><![CDATA[ ]]><Category>X-A</Category></Include><Menu><Name>A</Name></Menu></Menu><Menu><Name>A</Name><Move><Old>A</Old><New>A/A</New></Move></Menu></Menu>\n' > "$out/menu_file/namespaces"
 printf '<?xml version="1.0"?>\n<!-- c --><!DOCTYPE Menu [<!ENTITY x "y">]><Menu><Name>&x;</Name></Menu>\n' > "$out/menu_file/entity"
+# Trash info files: escapes, a duplicate key, a group header, CRLF, the
+# spec's example date form; directorysizes lines good and bad; mountinfo
+# lines with escapes and optional fields.
+mkdir -p "$out/trash_info" "$out/directory_sizes" "$out/mountinfo"
+printf '[Trash Info]\nPath=foo/bar/meow.bow-wow\nDeletionDate=20040831T22:32:08\n' > "$out/trash_info/spec"
+printf '[Trash Info]\nPath=/home/u/caf%%C3%%A9%%20x\\s%%25\nPath=second\n[Other]\nDeletionDate = 2024-02-29T13:14:15\r\nX=1\n' > "$out/trash_info/escapes"
+printf '[Trash Info]\nPath=a/../%%2E%%2E/b%%00\nDeletionDate=2023-02-29T00:00:00\n' > "$out/trash_info/refused"
+printf '16384 15803468 Documents\n8192 -5 Another%%20Folder\n1 2 raw space\n3 4 %%25%%0Aodd%%E9\nx 1 bad\n1 2 a%%2Fb\n1 2 Documents\n' > "$out/directory_sizes/seed"
+printf '22 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw\n35 22 0:31 / /media/my\\040disk rw master:2 shared:3 - vfat /dev/sdb1 rw\n' > "$out/mountinfo/seed"
 rm -rf seeds
 mv "$out" seeds

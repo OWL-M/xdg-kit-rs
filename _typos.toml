@@ -13,8 +13,8 @@ extend-exclude = [
 extend-ignore-re = [
     # Code points in Rust escapes, such as `\u{ba3}`.
     '\\u\{[0-9a-fA-F]+\}',
-    # "café" as test data, through escapes or an octal byte.
-    'caf(\\{1,2}[ux]|\\[0-7]{3})',
+    # "café" as test data, through escapes, an octal byte or a URL escape.
+    'caf(\\{1,2}[ux]|\\[0-7]{3}|%[eE]9)',
     'afe\\{1,2}u\{',
     # Markup left malformed on purpose in tests.
     '</commen>',

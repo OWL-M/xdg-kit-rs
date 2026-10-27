@@ -1,0 +1,128 @@
+//! Failures injected at named stages, in this crate's own tests only.
+//! Outside tests every check passes and compiles to nothing.
+
+use std::io;
+
+/// A step that can be made to fail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Stage {
+    /// Creating the trash info file.
+    CreateInfo,
+    /// Writing it.
+    WriteInfo,
+    /// Syncing it.
+    SyncInfo,
+    /// Syncing `info` after creating it.
+    SyncInfoDir,
+    /// Moving the payload into `files` (an I/O error).
+    Move,
+    /// Just before the move, the source is removed (by "another
+    /// process").
+    SourceVanishes,
+    /// Moving the payload into `files` (another mount).
+    MoveCrossDevice,
+    /// Removing a reservation after a failure.
+    RemoveReservation,
+    /// Syncing `files` and the source's directory after the move.
+    SyncAfterMove,
+    /// Moving a payload out of `files` when restoring.
+    Restore,
+    /// Identifying a directory just made for a restore.
+    IdentifyCreated,
+    /// Opening a directory just made for a restore.
+    OpenCreated,
+    /// Removing the trash info file after a restore or an erase.
+    RemoveInfo,
+    /// Removing one item of a payload when erasing.
+    EraseItem,
+    /// Replacing `directorysizes`.
+    WriteCache,
+    /// Looking whether an erased payload is gone.
+    Confirm,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The stages to fail, each with how many times to pass it first.
+    #[allow(
+        clippy::missing_const_for_thread_local,
+        reason = "both initializers are const already; the lint still fires for Android targets"
+    )]
+    static FAIL: std::cell::RefCell<Vec<(Stage, u32)>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// When set, the home trash is taken as on another mount than every
+    /// source, and this as the sources' top directory.
+    #[allow(
+        clippy::missing_const_for_thread_local,
+        reason = "both initializers are const already; the lint still fires for Android targets"
+    )]
+    static ELSEWHERE: std::cell::RefCell<Option<std::path::PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Fails `stage` once on this thread, after passing it `skip` times.
+#[cfg(test)]
+pub(crate) fn fail(stage: Stage, skip: u32) {
+    FAIL.with(|fail| fail.borrow_mut().push((stage, skip)));
+}
+
+/// Stops failing, and stops pretending.
+#[cfg(test)]
+pub(crate) fn clear() {
+    FAIL.with(|fail| fail.borrow_mut().clear());
+    ELSEWHERE.with(|elsewhere| *elsewhere.borrow_mut() = None);
+}
+
+/// Pretends on this thread that the home trash is on another mount than
+/// every source, and that sources' mount is at `topdir`: per-volume
+/// selection without mounting anything.
+#[cfg(test)]
+pub(crate) fn pretend_volume(topdir: &std::path::Path) {
+    ELSEWHERE.with(|elsewhere| *elsewhere.borrow_mut() = Some(topdir.to_path_buf()));
+}
+
+/// The pretended top directory, if any.
+#[cfg(test)]
+pub(crate) fn pretended_volume() -> Option<std::path::PathBuf> {
+    ELSEWHERE.with(|elsewhere| elsewhere.borrow().clone())
+}
+
+/// Never.
+#[cfg(not(test))]
+#[inline]
+pub(crate) fn pretended_volume() -> Option<std::path::PathBuf> {
+    None
+}
+
+/// Whether `stage` fails now.
+#[cfg(test)]
+pub(crate) fn hits(stage: Stage) -> bool {
+    FAIL.with(|fail| {
+        let mut fail = fail.borrow_mut();
+        let Some(at) = fail.iter().position(|(failing, _)| *failing == stage) else {
+            return false;
+        };
+        if fail[at].1 == 0 {
+            fail.remove(at);
+            true
+        } else {
+            fail[at].1 -= 1;
+            false
+        }
+    })
+}
+
+/// Never.
+#[cfg(not(test))]
+#[inline]
+pub(crate) fn hits(_stage: Stage) -> bool {
+    false
+}
+
+/// An error when `stage` fails now.
+#[inline]
+pub(crate) fn check(stage: Stage) -> io::Result<()> {
+    if hits(stage) {
+        Err(io::Error::other(format!("injected failure at {stage:?}")))
+    } else {
+        Ok(())
+    }
+}

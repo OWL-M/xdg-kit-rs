@@ -25,6 +25,7 @@ default = [
     "mime",
     "mime-apps",
     "thumbnails",
+    "trash",
 ]
 ## The Desktop Application Autostart spec: login autostart entries,
 ## their eligibility and launch plans, user overrides.
@@ -49,6 +50,9 @@ menu = ["dep:xdg-kit-menu", "desktop-entry", "locale", "basedir"]
 mime = ["dep:xdg-kit-mime", "basedir"]
 ## The Thumbnail Managing Standard: thumbnailers and the thumbnail cache.
 thumbnails = ["dep:xdg-kit-thumbnails", "desktop-entry", "mime", "basedir"]
+## The Trash spec: trashing, listing, restoring and erasing files in
+## trash directories.
+trash = ["dep:xdg-kit-trash", "basedir"]
 ## Applications for MIME types: defaults, associations, `mimeapps.list`,
 ## opening files and URIs.
 mime-apps = ["dep:xdg-kit-mime-apps", "desktop-entry", "mime", "basedir"]
@@ -64,6 +68,7 @@ xdg-kit-menu = { workspace = true, optional = true }
 xdg-kit-mime = { workspace = true, optional = true }
 xdg-kit-mime-apps = { workspace = true, optional = true }
 xdg-kit-thumbnails = { workspace = true, optional = true }
+xdg-kit-trash = { workspace = true, optional = true }
 
 [lints]
 workspace = true

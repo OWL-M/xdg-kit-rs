@@ -2,8 +2,8 @@
 
 Freedesktop.org XDG specifications for Rust: MIME types, default
 applications, desktop entries, base directories, the user's languages,
-recently-used bookmarks, thumbnails, icon themes, login autostart and
-application menus.
+recently-used bookmarks, thumbnails, icon themes, login autostart,
+application menus and the trash.
 Pure Rust, no `unsafe` code.
 
 ## Crates
@@ -20,6 +20,7 @@ Pure Rust, no `unsafe` code.
 | [`xdg-kit-thumbnails`](https://docs.rs/xdg-kit-thumbnails) | The Thumbnail Managing Standard: `.thumbnailer` discovery and commands, the thumbnail cache with its keys, freshness and failure markers, and the shared per-directory repositories. |
 | [`xdg-kit-icon-theme`](https://docs.rs/xdg-kit-icon-theme) | The Icon Theme spec: `index.theme` inheritance, the exact lookup algorithm over an in-memory index (built from validated GTK caches or directory scans), and the Icon Naming spec's fallback chains. |
 | [`xdg-kit-menu`](https://docs.rs/xdg-kit-menu) | The Desktop Menu spec (version 1.1): `.menu` files resolved into the application menu tree — `XDG_MENU_PREFIX` and user overrides, merges, moves, deletions, `<Include>`/`<Exclude>` rules with `<OnlyUnallocated>`, legacy hierarchies, localized `.directory` captions, and layouts with separators and inlining — every step bounded, with each entry's desktop file and path kept for launching. |
+| [`xdg-kit-trash`](https://docs.rs/xdg-kit-trash) | The Trash spec (version 1.0): trashing into the home trash or a volume's `.Trash/$uid` or `.Trash-$uid` by rename only — never copied, never overwritten, metadata created exclusively first — listing every payload and orphan with byte-exact original paths, restoring without replacing, erasing without following links or crossing mounts, and the `directorysizes` cache. |
 | [`xdg-kit-autostart`](https://docs.rs/xdg-kit-autostart) | The Desktop Application Autostart spec: the entries a session starts after login, with precedence and `Hidden` overrides, structured reasons for every entry that does not start, launch plans, and user overrides that enable, disable or reset an entry without losing anything in the file. |
 
 ## Installing
@@ -63,6 +64,7 @@ re-export it.
 | `icon-theme` | yes | `xdg_kit::icon_theme`: icon lookup over theme inheritance, from GTK caches or directory scans | `desktop-entry`, `locale`, `basedir` |
 | `autostart` | yes | `xdg_kit::autostart`: login autostart entries, why each does or does not start, launch plans, user overrides | `desktop-entry`, `basedir` |
 | `menu` | yes | `xdg_kit::menu`: `.menu` files resolved into application menus | `desktop-entry`, `locale`, `basedir` |
+| `trash` | yes | `xdg_kit::trash`: trashing, listing, restoring and erasing in trash directories | `basedir` |
 | `desktop-entry-dbus` | no | D-Bus activation when launching `DBusActivatable` applications | `desktop-entry` |
 
 When using the crates directly, enable `dbus` on `xdg-kit-desktop-entry`
@@ -251,6 +253,29 @@ std::fs::remove_dir_all(&root)?;
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
+A file trashed and restored (here with a given data home, not the
+user's trash):
+
+```rust
+use xdg_kit::trash::{Context, LocalZone, Origin, RestoreOptions};
+
+let root = std::env::temp_dir().join(format!("xdg-kit-readme-trash-{}", std::process::id()));
+std::fs::create_dir_all(&root)?;
+let root = std::fs::canonicalize(&root)?;
+std::fs::write(root.join("notes.txt"), "draft")?;
+let uid = std::os::unix::fs::MetadataExt::uid(&std::fs::metadata(&root)?);
+let context = Context::new(root.join("data"), uid, &root, LocalZone::utc())?;
+let trashed = context.trash("notes.txt")?;
+assert_eq!(trashed.trash.path(), root.join("data/Trash"));
+let trash = context.open(&context.home_trash())?;
+let entry = trash.entries().next().unwrap()?;
+assert_eq!(entry.origin(), &Origin::Known(root.join("notes.txt")));
+let restored = trash.restore(&entry, &RestoreOptions::default())?;
+assert_eq!(std::fs::read_to_string(restored.destination)?, "draft");
+std::fs::remove_dir_all(&root)?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
 An icon from the user's theme, at a size and scale:
 
 ```rust,no_run
@@ -275,10 +300,13 @@ systems fall back to portable calls or fixed values: `fstat` instead of
 `statx`, `O_SEARCH` or nothing instead of `O_PATH`, and a link limit of 40. The `user.mime_type` extended attribute is
 read only on Linux, Android, Hurd and Apple's systems.
 These fallbacks have not been built or tested on any system but Linux.
+Trashing and restoring need a rename that never replaces its target
+(Linux's `renameat2`, Apple's `renameatx_np`); elsewhere `xdg-kit-trash`
+refuses them as unsupported rather than check first and replace after.
 
 `xdg-kit-autostart`, `xdg-kit-basedir`, `xdg-kit-bookmarks`,
 `xdg-kit-desktop-entry`, `xdg-kit-icon-theme`, `xdg-kit-menu`,
-`xdg-kit-mime`, `xdg-kit-mime-apps` and `xdg-kit-thumbnails` stop with a compile error on
+`xdg-kit-mime`, `xdg-kit-mime-apps`, `xdg-kit-thumbnails` and `xdg-kit-trash` stop with a compile error on
 systems that are not Unix.
 `xdg-kit-locale` uses only the standard library and has no such check.
 
@@ -305,6 +333,9 @@ The dev shell provides:
   the locked nixpkgs;
 - `XDG_KIT_SYSTEMD`, systemd from the locked nixpkgs, whose
   `systemd-xdg-autostart-generator` the autostart tests compare with;
+- `unshare` (util-linux), with which the trash crate's mount tests run in
+  a user and mount namespace of their own; they run only with
+  `XDG_KIT_TRASH_MOUNT_TESTS=1` and unprivileged user namespaces;
 - `perl`, which runs the Desktop Menu spec's own test suite from
   xdg-specs, and Python with PyGObject and `XDG_KIT_GI_TYPELIB_PATH`, for
   the menu tests' comparison with GNOME's libgnome-menu (gnome-menus from
