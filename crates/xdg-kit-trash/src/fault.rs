@@ -83,6 +83,21 @@ pub(crate) enum Stage {
     WriteCache,
     /// Looking whether an erased payload is gone.
     Confirm,
+    /// Right after the home trash's symbolic link is read, it is pointed
+    /// at the [`swap_to`] directory instead (by "another process").
+    RetargetHomeLink,
+    /// Between looking at a directory on the way to the link's target and
+    /// opening it, the directory is moved aside and a symbolic link to the
+    /// [`swap_to`] directory put in its place.
+    SwapOnTheWay,
+    /// Right after the link's target is opened and checked, the link is
+    /// pointed at the [`swap_to`] directory and the target renamed to its
+    /// name with `.moved` appended.
+    MoveHomeTarget,
+    /// Opening `$XDG_DATA_HOME` to look at the home trash's link fails
+    /// (`EACCES`), as where only a read-only open is available and the
+    /// directory may be searched but not read.
+    OpenDataHome,
 }
 
 #[cfg(test)]
@@ -100,6 +115,32 @@ thread_local! {
         reason = "both initializers are const already; the lint still fires for Android targets"
     )]
     static ELSEWHERE: std::cell::RefCell<Option<std::path::PathBuf>> = const { std::cell::RefCell::new(None) };
+    /// Where the stages that swap a link point it.
+    #[allow(
+        clippy::missing_const_for_thread_local,
+        reason = "both initializers are const already; the lint still fires for Android targets"
+    )]
+    static SWAP_TO: std::cell::RefCell<Option<std::path::PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Sets where [`Stage::RetargetHomeLink`], [`Stage::SwapOnTheWay`] and
+/// [`Stage::MoveHomeTarget`] point a link.
+#[cfg(test)]
+pub(crate) fn swap_to(path: &std::path::Path) {
+    SWAP_TO.with(|swap| *swap.borrow_mut() = Some(path.to_path_buf()));
+}
+
+/// Where a swapped link points, if set.
+#[cfg(test)]
+pub(crate) fn swapped_target() -> Option<std::path::PathBuf> {
+    SWAP_TO.with(|swap| swap.borrow().clone())
+}
+
+/// Never.
+#[cfg(not(test))]
+#[inline]
+pub(crate) fn swapped_target() -> Option<std::path::PathBuf> {
+    None
 }
 
 /// Fails `stage` once on this thread, after passing it `skip` times.
@@ -113,6 +154,7 @@ pub(crate) fn fail(stage: Stage, skip: u32) {
 pub(crate) fn clear() {
     FAIL.with(|fail| fail.borrow_mut().clear());
     ELSEWHERE.with(|elsewhere| *elsewhere.borrow_mut() = None);
+    SWAP_TO.with(|swap| *swap.borrow_mut() = None);
 }
 
 /// Pretends on this thread that the home trash is on another mount than

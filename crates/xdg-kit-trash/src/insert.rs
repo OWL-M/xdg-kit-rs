@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use xdg_kit_basedir::Durability;
 
 use crate::context::Context;
-use crate::dir::{self, OpenError, Trash, TrashDir, TrashKind};
+use crate::dir::{self, HomeRoot, OpenError, Trash, TrashDir, TrashKind};
 use crate::exclude::Excluded;
 use crate::fault::{self, Stage};
 use crate::info;
@@ -171,6 +171,10 @@ pub enum SourceProblem {
     HoldsTrash,
     /// It is inside a trash directory.
     InTrash,
+    /// It is the symbolic link at `$XDG_DATA_HOME/Trash` the home trash is
+    /// reached through ([`Policy::follow_home_link`](crate::Policy::follow_home_link)):
+    /// moving it would cut the way to what the home trash holds.
+    HomeTrashLink,
 }
 
 impl fmt::Display for SourceProblem {
@@ -179,6 +183,7 @@ impl fmt::Display for SourceProblem {
             Self::NoName => "it does not end in a name",
             Self::HoldsTrash => "it is or holds a trash directory",
             Self::InTrash => "it is inside a trash directory",
+            Self::HomeTrashLink => "it is the symbolic link the home trash is reached through",
         })
     }
 }
@@ -358,6 +363,9 @@ impl std::error::Error for TrashError {}
 pub(crate) struct Selection {
     pub(crate) candidates: Vec<TrashDir>,
     pub(crate) skipped: Vec<Attempt>,
+    /// How the home trash, if a candidate, is reached: its link followed
+    /// once for the whole trashing.
+    pub(crate) home: HomeRoot,
 }
 
 /// The file to trash, inspected.
@@ -399,7 +407,12 @@ impl Context {
     pub fn trash(&self, path: impl AsRef<Path>) -> Result<Trashed, TrashError> {
         let source = self.inspect(path.as_ref())?;
         let selection = self.select(&source)?;
-        self.insert(&source, selection.candidates, selection.skipped)
+        self.insert(
+            &source,
+            selection.candidates,
+            selection.skipped,
+            selection.home,
+        )
     }
 
     /// The trash directories [`Context::trash`] tries for `source`, in
@@ -409,7 +422,15 @@ impl Context {
     /// by the very selection trashing makes. Looks only: creates nothing.
     pub(crate) fn select(&self, source: &Source) -> Result<Selection, TrashError> {
         let home = self.home_trash();
-        let home_excluded = self.excluded_trash(&home).err();
+        // Excluded where the link leads, it is still known where that is,
+        // for the guard below.
+        let (home_root, home_excluded) = match self.home_root() {
+            Ok(root) => {
+                let excluded = root.excluded().cloned();
+                (root, excluded)
+            }
+            Err(excluded) => (HomeRoot::NoLink, Some(excluded)),
+        };
         let parent_place =
             Place::of(source.parent_fd.as_fd()).map_err(|error| TrashError::Source {
                 path: source.given.clone(),
@@ -417,11 +438,23 @@ impl Context {
             })?;
         let pretended = fault::pretended_volume();
         // Where the home trash's mount cannot be told, it is tried: the
-        // rename decides. An excluded home trash is not looked at.
-        let sameness = match &pretended {
-            Some(_) => Sameness::Different,
-            None if home_excluded.is_some() => Sameness::SameDevice,
-            None => match nearest_place(&home.path()) {
+        // rename decides. An excluded home trash is not looked at. One
+        // reached through a link is on its target's mount, as opened.
+        let sameness = match (&pretended, &home_root) {
+            (Some(_), _) => Sameness::Different,
+            _ if home_excluded.is_some() => Sameness::SameDevice,
+            (None, HomeRoot::Followed(followed)) => match Place::of(followed.fd.as_fd()) {
+                Ok(home) => parent_place.same(home),
+                Err(_) => Sameness::SameDevice,
+            },
+            // A link that leads nowhere is placed where the link is: files
+            // there are refused with it, as with any home trash that fails,
+            // rather than given a per-volume trash beside it.
+            (None, HomeRoot::Broken { .. }) => match nearest_place(home.base()) {
+                Ok(home) => parent_place.same(home),
+                Err(_) => Sameness::SameDevice,
+            },
+            (None, _) => match nearest_place(&home.path()) {
                 Ok(home) => parent_place.same(home),
                 Err(_) => Sameness::SameDevice,
             },
@@ -430,7 +463,8 @@ impl Context {
             Some(topdir) => Ok(topdir),
             None => topdir(&source.parent, parent_place),
         };
-        self.check_not_trash(source, &[], topdir.as_deref().ok())?;
+        let linked: Vec<&Path> = home_root.target().into_iter().collect();
+        self.check_not_trash(source, &[], topdir.as_deref().ok(), &linked)?;
         let mut candidates = Vec::new();
         let mut skipped = Vec::new();
         if let Some(excluded) = home_excluded {
@@ -478,7 +512,39 @@ impl Context {
         Ok(Selection {
             candidates,
             skipped,
+            home: home_root,
         })
+    }
+
+    /// The home trash's link followed, with the exclusions, unless the
+    /// home trash is excluded itself (then nothing is looked at).
+    fn home_root(&self) -> Result<HomeRoot, Excluded> {
+        self.followed(&self.home_trash())
+    }
+
+    /// The home trash `trash`'s link followed, with the exclusions, unless
+    /// the trash directory is excluded itself (then nothing is looked at).
+    /// An exclusion met where the link leads is in the [`HomeRoot`]; so is
+    /// one of the trash's own `files` or `info`, which following never
+    /// enters: the trash is not used, but where its link leads still holds
+    /// what it holds.
+    fn followed(&self, trash: &TrashDir) -> Result<HomeRoot, Excluded> {
+        let path = trash.path();
+        self.policy.exclusions.check(&path)?;
+        let child = ["files", "info"]
+            .into_iter()
+            .find_map(|child| self.policy.exclusions.check(&path.join(child)).err());
+        let root = dir::follow_home(self, trash, &self.policy.exclusions);
+        let Some(excluded) = child else {
+            return Ok(root);
+        };
+        match root.target() {
+            Some(reached) => Ok(HomeRoot::Excluded {
+                excluded,
+                reached: Some(reached.to_path_buf()),
+            }),
+            None => Err(excluded),
+        }
     }
 
     /// Moves `path` into the trash directory `trash`, and only there,
@@ -496,14 +562,36 @@ impl Context {
         path: impl AsRef<Path>,
     ) -> Result<Trashed, TrashError> {
         let source = self.inspect(path.as_ref())?;
-        if let Err(excluded) = self.excluded_trash(trash) {
-            return Err(TrashError::NoTrash {
-                path: source.given.clone(),
-                attempts: vec![skipped(
-                    Some(trash.clone()),
-                    AttemptFailure::Excluded(excluded),
-                )],
-            });
+        let excluded = |excluded| TrashError::NoTrash {
+            path: source.given.clone(),
+            attempts: vec![skipped(
+                Some(trash.clone()),
+                AttemptFailure::Excluded(excluded),
+            )],
+        };
+        self.excluded_trash(trash).map_err(excluded)?;
+        // This context's home trash is followed whatever the trash chosen,
+        // for the guard below; an excluded one is not looked at, which
+        // matters only when it is the one chosen. A home trash chosen that
+        // is another's (another data home or user) is followed as its own.
+        let own = trash == &self.home_trash();
+        let home = match self.home_root() {
+            Ok(home) => home,
+            Err(err) if own => return Err(excluded(err)),
+            Err(_) => HomeRoot::NoLink,
+        };
+        let chosen = if trash.kind() == TrashKind::Home && !own {
+            self.followed(trash).map_err(excluded)?
+        } else {
+            HomeRoot::NoLink
+        };
+        let target_excluded = if own {
+            home.excluded()
+        } else {
+            chosen.excluded()
+        };
+        if let Some(err) = target_excluded {
+            return Err(excluded(err.clone()));
         }
         let candidates = vec![trash.clone()];
         let place = Place::of(source.parent_fd.as_fd()).map_err(|error| TrashError::Source {
@@ -511,8 +599,17 @@ impl Context {
             error,
         })?;
         let topdir = topdir(&source.parent, place).ok();
-        self.check_not_trash(&source, &candidates, topdir.as_deref())?;
-        self.insert(&source, candidates, Vec::new())
+        let linked: Vec<&Path> = [home.target(), chosen.target()]
+            .into_iter()
+            .flatten()
+            .collect();
+        self.check_not_trash(&source, &candidates, topdir.as_deref(), &linked)?;
+        self.insert(
+            &source,
+            candidates,
+            Vec::new(),
+            if own { home } else { chosen },
+        )
     }
 
     /// Whether trashing into `trash` would reach an excluded place: the
@@ -598,12 +695,16 @@ impl Context {
     /// (a directory `.Trash` or `.Trash-<digits>` right below a mount's top
     /// directory), another user's included. The names alone mean nothing:
     /// a file, a link, or a directory elsewhere with such a name is
-    /// trashed like any.
+    /// trashed like any. A home trash reached through a link is also
+    /// matched at `linked`, where such links led — usable or not, as a
+    /// trash that fails its checks still holds what it holds; and the link
+    /// itself is refused while the policy follows it.
     fn check_not_trash(
         &self,
         source: &Source,
         candidates: &[TrashDir],
         topdir: Option<&Path>,
+        linked: &[&Path],
     ) -> Result<(), TrashError> {
         let path = source.path();
         let refuse = |problem| {
@@ -612,6 +713,14 @@ impl Context {
                 problem,
             })
         };
+        for target in linked {
+            if path.starts_with(target) && path != *target {
+                return refuse(SourceProblem::InTrash);
+            }
+            if target.starts_with(&path) && source.kind == FileKind::Directory {
+                return refuse(SourceProblem::HoldsTrash);
+            }
+        }
         let mut trashes: Vec<TrashDir> = candidates.to_vec();
         trashes.push(self.home_trash());
         if let Some(topdir) = topdir {
@@ -630,6 +739,16 @@ impl Context {
                 && let Ok(canonical) = sys::canonicalize(trash.base())
             {
                 places.push(canonical.join(written.strip_prefix(trash.base()).unwrap_or(&written)));
+            }
+            if trash.kind() == TrashKind::Home {
+                // The link is reached by name like any file: matched as
+                // written and as resolved up to it, as the source is.
+                if self.policy.follow_home_link
+                    && source.kind == FileKind::Symlink
+                    && places.contains(&path)
+                {
+                    return refuse(SourceProblem::HomeTrashLink);
+                }
             }
             for trash_path in places {
                 if path.starts_with(&trash_path) && path != trash_path {
@@ -684,11 +803,17 @@ impl Context {
         source: &Source,
         candidates: Vec<TrashDir>,
         mut attempts: Vec<Attempt>,
+        mut home: HomeRoot,
     ) -> Result<Trashed, TrashError> {
         let original = source.path();
         let date = DeletionDate::at(self.clock.now(), &self.zone).ok_or(TrashError::Clock)?;
         for candidate in candidates {
-            let (trash, unsynced) = match dir::open(self, &candidate, true) {
+            let root = if candidate.kind() == TrashKind::Home {
+                std::mem::replace(&mut home, HomeRoot::NoLink)
+            } else {
+                HomeRoot::NoLink
+            };
+            let (trash, unsynced) = match dir::open_with(self, &candidate, true, root) {
                 Ok(opened) => opened,
                 Err(err) => {
                     attempts.push(skipped(Some(candidate), AttemptFailure::Open(err)));

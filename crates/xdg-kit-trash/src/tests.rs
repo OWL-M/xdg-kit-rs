@@ -3725,3 +3725,758 @@ mod exclusions {
         assert_eq!(discovery.trashes.len(), 2);
     }
 }
+
+mod home_link {
+    use super::*;
+
+    /// A directory for the home trash to be kept in, under another name.
+    fn kept(fx: &Fx, rel: &str) -> PathBuf {
+        let target = fx.root.join(rel);
+        fs::create_dir_all(&target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+        target
+    }
+
+    /// `$XDG_DATA_HOME/Trash` made a symbolic link to `to`.
+    fn link_home(fx: &Fx, to: impl AsRef<Path>) {
+        fs::create_dir_all(&fx.home).unwrap();
+        symlink(to, fx.trash()).unwrap();
+    }
+
+    fn with_policy(fx: &Fx, change: impl FnOnce(&mut Policy)) -> Context {
+        let mut policy = Policy::default();
+        change(&mut policy);
+        fx.context.clone().with_policy(policy)
+    }
+
+    /// Why following the home trash's link failed: an error kind, or for
+    /// a loop the kind `Other` (`ELOOP` has no stable kind of its own).
+    fn broken(err: &OpenError) -> std::io::ErrorKind {
+        match &err.kind {
+            OpenErrorKind::BrokenLink { error, .. }
+                if error.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error()) =>
+            {
+                std::io::ErrorKind::Other
+            }
+            OpenErrorKind::BrokenLink { error, .. } => error.kind(),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn invalid(result: Result<Trashed, TrashError>) -> SourceProblem {
+        match result {
+            Err(TrashError::InvalidSource { problem, .. }) => problem,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_link_to_a_directory_of_another_name_is_the_home_trash() {
+        let fx = Fx::new();
+        let target = kept(&fx, "disk/my-trash");
+        link_home(&fx, &target);
+        assert!(Policy::default().follow_home_link, "on by default");
+
+        let planned = fx.context.plan(fx.file("a/b", "b")).unwrap();
+        let destination = planned.destination().unwrap();
+        assert_eq!(destination.trash.kind(), TrashKind::Home);
+        // `files` and `info` are missing in the target, and may be made.
+        assert!(
+            matches!(&destination.state, CandidateState::WouldCreate(first) if *first == fx.trash().join("files")),
+            "{:?}",
+            destination.state
+        );
+        assert!(!target.join("files").exists(), "planning created nothing");
+
+        let trashed = fx.context.trash(fx.work.join("a/b")).unwrap();
+        assert_eq!(trashed.trash, fx.context.home_trash());
+        assert_eq!(trashed.trash.path(), fx.trash(), "named as the home trash");
+        assert_eq!(fs::read_to_string(target.join("files/b")).unwrap(), "b");
+        let info = fs::read_to_string(target.join("info/b.trashinfo")).unwrap();
+        assert!(info.contains(&format!("\nPath={}\n", fx.work.join("a/b").display())));
+        // Below `$XDG_DATA_HOME`, the path recorded is relative to it, not
+        // to where the trash is kept.
+        fs::write(fx.home.join("doc"), "d").unwrap();
+        let _ = fx.context.trash(fx.home.join("doc")).unwrap();
+        let info = fs::read_to_string(target.join("info/doc.trashinfo")).unwrap();
+        assert!(info.contains("\nPath=doc\n"), "{info}");
+        assert!(matches!(
+            fx.context
+                .plan(fx.file("c", "c"))
+                .unwrap()
+                .destination()
+                .unwrap()
+                .state,
+            CandidateState::Usable
+        ));
+
+        let trash = fx.open_home();
+        assert_eq!(trash.link_target(), Some(target.as_path()));
+        let discovery = fx.context.discover(Vec::<PathBuf>::new());
+        assert!(discovery.is_complete());
+        assert_eq!(discovery.trashes[0].link_target(), Some(target.as_path()));
+        let listed = entries(&trash);
+        assert_eq!(listed.len(), 2);
+        let doc = listed.iter().find(|entry| entry.name() == "doc").unwrap();
+        assert_eq!(doc.origin(), &Origin::Known(fx.home.join("doc")));
+        let restored = trash.restore(doc, &RestoreOptions::default()).unwrap();
+        assert_eq!(restored.destination, fx.home.join("doc"));
+        assert_eq!(fs::read_to_string(fx.home.join("doc")).unwrap(), "d");
+        assert!(
+            trash
+                .size(&SizeOptions::default(), &|| false)
+                .unwrap()
+                .bytes
+                > 0
+        );
+        let b = entries(&trash).remove(0);
+        trash
+            .erase(&b, &EraseOptions::default(), &|| false)
+            .unwrap();
+        assert_eq!(names(&target.join("files")), Vec::<OsString>::new());
+        fs::write(target.join("info/pending.trashinfo"), "[Trash Info]\n").unwrap();
+        let pending = entries(&trash).remove(0);
+        trash
+            .discard_metadata(&pending, Quiescent::asserted())
+            .unwrap();
+        assert_eq!(names(&target.join("info")), Vec::<OsString>::new());
+        assert!(fs::symlink_metadata(fx.trash()).unwrap().is_symlink());
+    }
+
+    #[test]
+    fn a_chain_of_links_relative_and_absolute() {
+        let fx = Fx::new();
+        let target = kept(&fx, "real/kept");
+        // `Trash` -> `../hop` (relative to `$XDG_DATA_HOME`) -> the target
+        // through another link on the way.
+        symlink(fx.root.join("real"), fx.root.join("via")).unwrap();
+        symlink("via/kept", fx.root.join("hop")).unwrap();
+        link_home(&fx, "../hop");
+        let trashed = fx.context.trash(fx.file("f", "f")).unwrap();
+        assert_eq!(trashed.trash.kind(), TrashKind::Home);
+        assert_eq!(fs::read_to_string(target.join("files/f")).unwrap(), "f");
+        assert_eq!(fx.open_home().link_target(), Some(target.as_path()));
+    }
+
+    #[test]
+    fn links_that_lead_to_no_directory_create_nothing() {
+        let fx = Fx::new();
+        let missing = fx.root.join("disk/missing");
+        fs::create_dir(fx.root.join("disk")).unwrap();
+        fs::write(fx.root.join("disk/file"), "").unwrap();
+        fs::create_dir(&fx.home).unwrap();
+        let cases: [(PathBuf, std::io::ErrorKind); 3] = [
+            (missing.clone(), std::io::ErrorKind::NotFound),
+            (fx.root.join("disk/file"), std::io::ErrorKind::NotADirectory),
+            // A loop: the link names itself.
+            (PathBuf::from("Trash"), std::io::ErrorKind::Other),
+        ];
+        for (to, kind) in cases {
+            let _ = fs::remove_file(fx.trash());
+            symlink(&to, fx.trash()).unwrap();
+            let err = fx.context.open(&fx.context.home_trash()).unwrap_err();
+            assert_eq!(err.path, fx.trash(), "{to:?}");
+            assert_eq!(broken(&err), kind, "{to:?}");
+            // Listed as a problem, not as an absent trash.
+            let discovery = fx.context.discover(Vec::<PathBuf>::new());
+            assert!(discovery.trashes.is_empty());
+            assert_eq!(broken(&discovery.problems[0]), kind);
+            // Planning and trashing: unusable, and nothing made.
+            let source = fx.file("f", "f");
+            let planned = fx.context.plan(&source).unwrap();
+            assert!(planned.destination().is_none(), "{to:?}");
+            match &planned.candidates[0].state {
+                CandidateState::Unusable(AttemptFailure::Open(err)) => {
+                    assert_eq!(broken(err), kind);
+                }
+                other => panic!("{other:?}"),
+            }
+            match fx.context.trash(&source) {
+                Err(TrashError::NoTrash { attempts, .. }) => {
+                    assert_eq!(attempts.len(), 1, "the home trash only: {attempts:?}");
+                    assert!(
+                        matches!(&attempts[0].failure, AttemptFailure::Open(err) if broken(err) == kind)
+                    );
+                }
+                other => panic!("{other:?}"),
+            }
+            assert!(source.exists());
+            assert!(!missing.exists(), "nothing was created through the link");
+            assert_eq!(names(&fx.root.join("disk")), ["file"]);
+        }
+    }
+
+    #[test]
+    fn the_target_must_pass_the_home_trash_checks() {
+        let fx = Fx::new();
+        let target = kept(&fx, "disk/kept");
+        link_home(&fx, &target);
+        let other =
+            Context::new(&fx.home, uid().wrapping_add(1), &fx.work, LocalZone::utc()).unwrap();
+        let err = other.open(&other.home_trash()).unwrap_err();
+        assert_eq!(err.path, fx.trash());
+        assert!(matches!(
+            err.kind,
+            OpenErrorKind::Unsafe(CheckFailure::Owner { found, .. }) if found == uid()
+        ));
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o777)).unwrap();
+        let err = fx.context.open(&fx.context.home_trash()).unwrap_err();
+        assert!(matches!(
+            err.kind,
+            OpenErrorKind::Unsafe(CheckFailure::Writable(0o777))
+        ));
+        let source = fx.file("f", "f");
+        assert!(matches!(
+            fx.context.trash(&source),
+            Err(TrashError::NoTrash { .. })
+        ));
+        assert!(!target.join("files").exists());
+        // `files` and `info` in the target are checked as always.
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+        let _ = fx.context.trash(&source).unwrap();
+        fs::set_permissions(target.join("files"), fs::Permissions::from_mode(0o770)).unwrap();
+        let err = fx.context.open(&fx.context.home_trash()).unwrap_err();
+        assert_eq!(err.path, fx.trash().join("files"));
+        assert!(matches!(
+            err.kind,
+            OpenErrorKind::Unsafe(CheckFailure::Writable(0o770))
+        ));
+        fs::set_permissions(target.join("files"), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::rename(target.join("info"), fx.root.join("info")).unwrap();
+        symlink(fx.root.join("info"), target.join("info")).unwrap();
+        assert!(matches!(
+            fx.context.open(&fx.context.home_trash()).unwrap_err().kind,
+            OpenErrorKind::Unsafe(CheckFailure::Symlink)
+        ));
+    }
+
+    #[test]
+    fn with_the_policy_off_a_link_fails_its_check() {
+        let fx = Fx::new();
+        let target = kept(&fx, "disk/kept");
+        link_home(&fx, &target);
+        let context = with_policy(&fx, |policy| policy.follow_home_link = false);
+        assert!(matches!(
+            context.open(&context.home_trash()).unwrap_err().kind,
+            OpenErrorKind::Unsafe(CheckFailure::Symlink)
+        ));
+        let source = fx.file("f", "f");
+        assert!(matches!(
+            context.trash(&source),
+            Err(TrashError::NoTrash { .. })
+        ));
+        assert!(matches!(
+            context.plan(&source).unwrap().candidates[0].state,
+            CandidateState::Unusable(AttemptFailure::Open(OpenError {
+                kind: OpenErrorKind::Unsafe(CheckFailure::Symlink),
+                ..
+            }))
+        ));
+        assert!(!target.join("files").exists());
+        // The link is an ordinary link then, and can be trashed as one.
+        let elsewhere = context.private_trash(&fx.root);
+        let trashed = context.trash_into(&elsewhere, fx.trash()).unwrap();
+        assert!(
+            fs::symlink_metadata(elsewhere.path().join("files").join(&trashed.name))
+                .unwrap()
+                .is_symlink()
+        );
+        assert!(target.exists());
+    }
+
+    #[test]
+    fn the_link_its_target_and_what_holds_them_are_not_trashed() {
+        let fx = Fx::new();
+        let target = kept(&fx, "disk/kept");
+        link_home(&fx, &target);
+        let _ = fx.context.trash(fx.file("f", "f")).unwrap();
+        symlink(&target, fx.work.join("alias")).unwrap();
+        let cases: [(PathBuf, SourceProblem); 6] = [
+            (fx.trash(), SourceProblem::HomeTrashLink),
+            (
+                fx.root.join("data/../data/Trash/"),
+                SourceProblem::HomeTrashLink,
+            ),
+            (target.clone(), SourceProblem::HoldsTrash),
+            (fx.root.join("disk"), SourceProblem::HoldsTrash),
+            (target.join("files/f"), SourceProblem::InTrash),
+            (fx.work.join("alias/files"), SourceProblem::InTrash),
+        ];
+        for (path, problem) in &cases {
+            assert_eq!(invalid(fx.context.trash(path)), *problem, "{path:?}");
+            assert_eq!(
+                invalid(fx.context.trash_into(&fx.context.home_trash(), path)),
+                *problem,
+                "{path:?}"
+            );
+            assert!(
+                matches!(fx.context.plan(path), Err(TrashError::InvalidSource { problem: found, .. }) if found == *problem),
+                "{path:?}"
+            );
+        }
+        // Into another trash too.
+        let elsewhere = fx.context.private_trash(&fx.root);
+        assert_eq!(
+            invalid(fx.context.trash_into(&elsewhere, &target)),
+            SourceProblem::HoldsTrash
+        );
+        // The link is refused even when it leads nowhere.
+        fs::remove_file(fx.trash()).unwrap();
+        symlink(fx.root.join("missing"), fx.trash()).unwrap();
+        assert_eq!(
+            invalid(fx.context.trash(fx.trash())),
+            SourceProblem::HomeTrashLink
+        );
+        assert!(fs::symlink_metadata(fx.trash()).is_ok());
+    }
+
+    #[test]
+    fn exclusions_reach_the_target_and_links_on_the_way() {
+        let fx = Fx::new();
+        let net = fx.root.join("net");
+        fs::create_dir(&net).unwrap();
+        symlink(net.join("hop-target"), fx.root.join("hop")).unwrap();
+        let top = fx.root.join("vol");
+        fs::create_dir(&top).unwrap();
+        let context = with_policy(&fx, |policy| {
+            policy.exclusions = Exclusions::new().subtree(&net, "nfs");
+        });
+        // Each leads to a missing directory in the excluded place: an
+        // exclusion, not a broken link, shows it was refused unlooked at.
+        let cases = [
+            net.join("kept"),
+            PathBuf::from("../net/kept"),
+            fx.root.join("hop"),
+        ];
+        for to in cases {
+            let _ = fs::remove_file(fx.trash());
+            link_home(&fx, &to);
+            fault::pretend_volume(&top);
+            let source = top.join("doc");
+            fs::write(&source, "d").unwrap();
+            let planned = context.plan(&source).unwrap();
+            assert!(
+                matches!(&planned.skipped[0], Attempt { trash: Some(trash), failure: AttemptFailure::Excluded(_), .. } if trash.kind() == TrashKind::Home),
+                "{to:?}: {planned:?}"
+            );
+            let trashed = context.trash(&source).unwrap();
+            assert_eq!(trashed.trash.kind(), TrashKind::Private, "{to:?}");
+            assert!(matches!(
+                trashed.fallbacks[0].failure,
+                AttemptFailure::Excluded(_)
+            ));
+            assert!(matches!(
+                context.trash_into(&context.home_trash(), fx.file("g", "g")),
+                Err(TrashError::NoTrash { attempts, .. }) if matches!(attempts[0].failure, AttemptFailure::Excluded(_))
+            ));
+            fault::clear();
+            // Listing does not use the exclusions: it finds the link broken.
+            assert_eq!(
+                broken(&context.open(&context.home_trash()).unwrap_err()),
+                std::io::ErrorKind::NotFound
+            );
+        }
+        assert_eq!(names(&net), Vec::<OsString>::new());
+    }
+
+    #[test]
+    fn a_link_retargeted_after_it_is_read_is_not_followed_again() {
+        let fx = Fx::new();
+        let target = kept(&fx, "disk/kept");
+        let elsewhere = kept(&fx, "elsewhere");
+        link_home(&fx, &target);
+        fault::swap_to(&elsewhere);
+        fault::fail(Stage::RetargetHomeLink, 0);
+        let _ = fx.context.trash(fx.file("f", "f")).unwrap();
+        assert_eq!(fs::read_to_string(target.join("files/f")).unwrap(), "f");
+        assert_eq!(names(&elsewhere), Vec::<OsString>::new());
+        // A later operation follows the link as it is now.
+        let _ = fx.context.trash(fx.file("g", "g")).unwrap();
+        assert_eq!(fs::read_to_string(elsewhere.join("files/g")).unwrap(), "g");
+    }
+
+    #[test]
+    fn a_link_swapped_in_on_the_way_is_refused() {
+        let fx = Fx::new();
+        let _ = kept(&fx, "disk/kept");
+        let elsewhere = kept(&fx, "elsewhere");
+        link_home(&fx, "../disk/kept");
+        fault::swap_to(&elsewhere);
+        // `disk`, after it was looked at as a directory, becomes a link,
+        // which opening without following refuses (`ELOOP`, or `ENOTDIR`
+        // as Linux has it for a directory open).
+        fault::fail(Stage::SwapOnTheWay, 0);
+        let source = fx.file("f", "f");
+        match fx.context.trash(&source) {
+            Err(TrashError::NoTrash { attempts, .. }) => assert!(
+                matches!(&attempts[0].failure, AttemptFailure::Open(OpenError { kind: OpenErrorKind::Io(err), .. }) if [rustix::io::Errno::LOOP, rustix::io::Errno::NOTDIR].map(|errno| Some(errno.raw_os_error())).contains(&err.raw_os_error())),
+                "{attempts:?}"
+            ),
+            other => panic!("{other:?}"),
+        }
+        assert!(source.exists());
+        assert_eq!(names(&elsewhere), Vec::<OsString>::new());
+    }
+
+    #[test]
+    fn an_operation_and_an_open_trash_stay_on_the_directory_opened() {
+        let fx = Fx::new();
+        let target = kept(&fx, "disk/kept");
+        let elsewhere = kept(&fx, "elsewhere");
+        link_home(&fx, &target);
+        // Retargeted, and the target renamed, once it is open: the
+        // trashing goes on into it.
+        fault::swap_to(&elsewhere);
+        fault::fail(Stage::MoveHomeTarget, 0);
+        let _ = fx.context.trash(fx.file("f", "f")).unwrap();
+        let moved = fx.root.join("disk/kept.moved");
+        assert_eq!(fs::read_to_string(moved.join("files/f")).unwrap(), "f");
+        assert_eq!(names(&elsewhere), Vec::<OsString>::new());
+        // An open trash, likewise.
+        fs::remove_file(fx.trash()).unwrap();
+        symlink(&moved, fx.trash()).unwrap();
+        let trash = fx.open_home();
+        fs::remove_file(fx.trash()).unwrap();
+        symlink(&elsewhere, fx.trash()).unwrap();
+        assert_eq!(trash.link_target(), Some(moved.as_path()));
+        let listed = entries(&trash);
+        assert_eq!(listed.len(), 1);
+        let _ = trash
+            .restore(&listed[0], &RestoreOptions::default())
+            .unwrap();
+        assert_eq!(fs::read_to_string(fx.work.join("f")).unwrap(), "f");
+        // A new open sees the link as it is now.
+        assert!(matches!(
+            fx.context.open(&fx.context.home_trash()).unwrap_err(),
+            OpenError { kind: OpenErrorKind::Absent, path } if path == fx.trash().join("files")
+        ));
+    }
+
+    #[test]
+    fn another_contexts_home_trash_is_followed_as_its_own() {
+        let fx = Fx::new();
+        let mine = kept(&fx, "disk/mine");
+        link_home(&fx, &mine);
+        let theirs = kept(&fx, "disk/theirs");
+        let other_home = fx.root.join("other-data");
+        fs::create_dir(&other_home).unwrap();
+        symlink(&theirs, other_home.join("Trash")).unwrap();
+        let other = Context::new(&other_home, uid(), &fx.work, LocalZone::utc()).unwrap();
+        let trashed = fx
+            .context
+            .trash_into(&other.home_trash(), fx.file("f", "f"))
+            .unwrap();
+        assert_eq!(trashed.trash, other.home_trash());
+        assert_eq!(fs::read_to_string(theirs.join("files/f")).unwrap(), "f");
+        assert!(!mine.join("files").exists(), "not into this context's own");
+        let opened = fx.context.open(&other.home_trash()).unwrap();
+        assert_eq!(opened.link_target(), Some(theirs.as_path()));
+        // Another's plain home trash is used as it is.
+        let plain = Context::new(fx.root.join("plain"), uid(), &fx.work, LocalZone::utc()).unwrap();
+        let _ = fx
+            .context
+            .trash_into(&plain.home_trash(), fx.file("g", "g"))
+            .unwrap();
+        assert!(fx.root.join("plain/Trash/files/g").exists());
+        assert!(!mine.join("files").exists());
+    }
+
+    #[test]
+    fn a_target_failing_its_checks_still_holds_what_it_holds() {
+        let fx = Fx::new();
+        let target = kept(&fx, "disk/kept");
+        link_home(&fx, &target);
+        let _ = fx.context.trash(fx.file("f", "f")).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o777)).unwrap();
+        let elsewhere = fx.context.private_trash(&fx.root);
+        for path in [target.join("files/f"), target.clone()] {
+            assert!(matches!(
+                fx.context.trash_into(&elsewhere, &path),
+                Err(TrashError::InvalidSource { .. })
+            ));
+            assert!(matches!(
+                fx.context.trash(&path),
+                Err(TrashError::InvalidSource { .. })
+            ));
+        }
+        assert!(target.join("files/f").exists());
+        assert!(!elsewhere.path().exists());
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
+    fn a_relative_target_is_checked_as_configured_too() {
+        let fx = Fx::new();
+        let data = fx.root.join("data");
+        fs::create_dir(&data).unwrap();
+        let _ = kept(&fx, "data/kept");
+        symlink(&data, fx.root.join("alias")).unwrap();
+        symlink("kept", data.join("Trash")).unwrap();
+        let alias = fx.root.join("alias");
+        let policy = Policy {
+            exclusions: Exclusions::new().subtree(alias.join("kept"), "nfs"),
+            ..Policy::default()
+        };
+        let context = Context::new(&alias, uid(), &fx.work, LocalZone::utc())
+            .unwrap()
+            .with_policy(policy);
+        let source = fx.file("f", "f");
+        assert!(matches!(
+            context.trash_into(&context.home_trash(), &source),
+            Err(TrashError::NoTrash { attempts, .. }) if matches!(attempts[0].failure, AttemptFailure::Excluded(_))
+        ));
+        let planned = context.plan(&source).unwrap();
+        assert!(matches!(
+            planned.skipped[0].failure,
+            AttemptFailure::Excluded(_)
+        ));
+        assert!(source.exists());
+        assert!(!data.join("kept/files").exists());
+    }
+
+    #[test]
+    fn directories_on_the_way_need_only_search_permission() {
+        if !cfg!(any(target_os = "linux", target_os = "android")) {
+            return;
+        }
+        unprivileged(|| {
+            let fx = Fx::new();
+            let target = kept(&fx, "disk/kept");
+            link_home(&fx, &target);
+            let disk = fx.root.join("disk");
+            fs::set_permissions(&disk, fs::Permissions::from_mode(0o111)).unwrap();
+            let trashed = fx.context.trash(fx.file("f", "f"));
+            let opened = fx.context.open(&fx.context.home_trash()).map(|_| ());
+            fs::set_permissions(&disk, fs::Permissions::from_mode(0o755)).unwrap();
+            assert_eq!(trashed.unwrap().trash.kind(), TrashKind::Home);
+            opened.unwrap();
+            assert_eq!(fs::read_to_string(target.join("files/f")).unwrap(), "f");
+        });
+    }
+
+    #[test]
+    fn an_unreadable_target_still_holds_what_it_holds() {
+        unprivileged(|| {
+            let fx = Fx::new();
+            let target = kept(&fx, "disk/kept");
+            link_home(&fx, &target);
+            let _ = fx.context.trash(fx.file("f", "f")).unwrap();
+            // Searchable, not readable: reached, but not opened for reading.
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o300)).unwrap();
+            let elsewhere = fx.context.private_trash(&fx.root);
+            let into = fx.context.trash_into(&elsewhere, target.join("files/f"));
+            let trashed = fx.context.trash(target.join("files/f"));
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+            for result in [into, trashed] {
+                assert!(
+                    matches!(
+                        result,
+                        Err(TrashError::InvalidSource {
+                            problem: SourceProblem::InTrash,
+                            ..
+                        })
+                    ),
+                    "{result:?}"
+                );
+            }
+            assert!(target.join("files/f").exists());
+        });
+    }
+
+    #[test]
+    fn every_spelling_of_the_target_is_checked_with_files_and_info() {
+        let fx = Fx::new();
+        let data = fx.root.join("data");
+        fs::create_dir(&data).unwrap();
+        let _ = kept(&fx, "data/kept");
+        symlink(&data, fx.root.join("alias")).unwrap();
+        let alias = fx.root.join("alias");
+        let source = fx.file("f", "f");
+        // A relative target under the data home's alias, an absolute one
+        // through the alias, and a link on the way to it: the exclusion
+        // names only `files` or `info` there.
+        symlink("alias/kept", fx.root.join("hop")).unwrap();
+        for to in [
+            PathBuf::from("kept"),
+            alias.join("kept"),
+            fx.root.join("hop"),
+        ] {
+            let _ = fs::remove_file(data.join("Trash"));
+            symlink(&to, data.join("Trash")).unwrap();
+            for child in ["files", "info"] {
+                let policy = Policy {
+                    exclusions: Exclusions::new().subtree(alias.join("kept").join(child), "nfs"),
+                    ..Policy::default()
+                };
+                let context = Context::new(&alias, uid(), &fx.work, LocalZone::utc())
+                    .unwrap()
+                    .with_policy(policy);
+                assert!(
+                    matches!(
+                        context.trash_into(&context.home_trash(), &source),
+                        Err(TrashError::NoTrash { attempts, .. }) if matches!(attempts[0].failure, AttemptFailure::Excluded(_))
+                    ),
+                    "{to:?} {child}"
+                );
+            }
+        }
+        assert!(source.exists());
+        assert!(!data.join("kept/files").exists());
+    }
+
+    #[test]
+    fn an_unreadable_data_home_is_still_followed() {
+        if !cfg!(any(target_os = "linux", target_os = "android")) {
+            return;
+        }
+        unprivileged(|| {
+            let fx = Fx::new();
+            let target = kept(&fx, "disk/kept");
+            link_home(&fx, &target);
+            let _ = fx.context.trash(fx.file("f", "f")).unwrap();
+            // Searchable, not readable: the link can be read without
+            // listing the directory.
+            fs::set_permissions(&fx.home, fs::Permissions::from_mode(0o300)).unwrap();
+            let elsewhere = fx.context.private_trash(&fx.root);
+            let into = fx.context.trash_into(&elsewhere, target.join("files/f"));
+            let trashed = fx.context.trash(fx.file("g", "g"));
+            let opened = fx.context.open(&fx.context.home_trash()).map(|_| ());
+            fs::set_permissions(&fx.home, fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(
+                matches!(
+                    into,
+                    Err(TrashError::InvalidSource {
+                        problem: SourceProblem::InTrash,
+                        ..
+                    })
+                ),
+                "{into:?}"
+            );
+            assert_eq!(trashed.unwrap().trash.kind(), TrashKind::Home);
+            opened.unwrap();
+            assert!(target.join("files/f").exists());
+            assert!(target.join("files/g").exists());
+        });
+    }
+
+    #[test]
+    fn an_excluded_files_or_info_still_marks_the_target_as_trash() {
+        for child in ["files", "info"] {
+            let fx = Fx::new();
+            let target = kept(&fx, "disk/kept");
+            link_home(&fx, &target);
+            let _ = fx.context.trash(fx.file("f", "f")).unwrap();
+            let context = with_policy(&fx, |policy| {
+                policy.exclusions = Exclusions::new().subtree(target.join(child), "nfs");
+            });
+            let elsewhere = context.private_trash(&fx.root);
+            let moved = context.trash_into(&elsewhere, target.join("files/f"));
+            // In an excluded `files`, the source is refused from its path
+            // already; with `info` excluded, it is still known as trashed.
+            let refused = match &moved {
+                Err(TrashError::Excluded(_)) => child == "files",
+                Err(TrashError::InvalidSource {
+                    problem: SourceProblem::InTrash,
+                    ..
+                }) => true,
+                _ => false,
+            };
+            assert!(refused, "{child}: {moved:?}");
+            assert!(matches!(
+                context.trash_into(&elsewhere, &target),
+                Err(TrashError::InvalidSource {
+                    problem: SourceProblem::HoldsTrash,
+                    ..
+                })
+            ));
+            // The home trash itself is not used.
+            assert!(matches!(
+                context.trash_into(&context.home_trash(), fx.file("g", "g")),
+                Err(TrashError::NoTrash { attempts, .. }) if matches!(attempts[0].failure, AttemptFailure::Excluded(_))
+            ));
+            fault::pretend_volume(&fx.root);
+            let planned = context.plan(fx.file("h", "h")).unwrap();
+            assert!(matches!(
+                planned.skipped[0].failure,
+                AttemptFailure::Excluded(_)
+            ));
+            fault::clear();
+            assert!(target.join("files/f").exists());
+            assert!(!elsewhere.path().exists());
+        }
+    }
+
+    #[test]
+    fn an_excluded_logical_files_or_info_still_marks_the_target_as_trash() {
+        for child in ["files", "info"] {
+            let fx = Fx::new();
+            let target = kept(&fx, "disk/kept");
+            link_home(&fx, &target);
+            let _ = fx.context.trash(fx.file("f", "f")).unwrap();
+            let context = with_policy(&fx, |policy| {
+                policy.exclusions = Exclusions::new().subtree(fx.trash().join(child), "nfs");
+            });
+            let elsewhere = context.private_trash(&fx.root);
+            assert!(
+                matches!(
+                    context.trash_into(&elsewhere, target.join("files/f")),
+                    Err(TrashError::InvalidSource {
+                        problem: SourceProblem::InTrash,
+                        ..
+                    })
+                ),
+                "{child}"
+            );
+            assert!(matches!(
+                context.trash_into(&context.home_trash(), fx.file("g", "g")),
+                Err(TrashError::NoTrash { attempts, .. }) if matches!(attempts[0].failure, AttemptFailure::Excluded(_))
+            ));
+            assert!(target.join("files/f").exists());
+            assert!(!elsewhere.path().exists());
+        }
+    }
+
+    #[test]
+    fn a_data_home_that_cannot_be_opened_is_located_by_path() {
+        let fx = Fx::new();
+        let target = kept(&fx, "disk/kept");
+        link_home(&fx, &target);
+        let _ = fx.context.trash(fx.file("f", "f")).unwrap();
+        let elsewhere = fx.context.private_trash(&fx.root);
+        // Opening `$XDG_DATA_HOME` fails, as a read-only open of a
+        // directory that can be searched but not read does.
+        fault::fail(Stage::OpenDataHome, 0);
+        assert!(matches!(
+            fx.context.trash_into(&elsewhere, target.join("files/f")),
+            Err(TrashError::InvalidSource {
+                problem: SourceProblem::InTrash,
+                ..
+            })
+        ));
+        assert!(target.join("files/f").exists());
+        assert!(!elsewhere.path().exists());
+    }
+
+    #[test]
+    fn locating_by_path_checks_what_following_checks() {
+        let fx = Fx::new();
+        let target = kept(&fx, "disk/kept");
+        symlink(fx.root.join("disk"), fx.root.join("via")).unwrap();
+        symlink("via/kept", fx.root.join("hop")).unwrap();
+        link_home(&fx, "../hop");
+        let home = fx.context.home_trash();
+        let none = Exclusions::new().anchored(Path::new("/"));
+        assert_eq!(crate::dir::locate(&home, &none), Some(target.clone()));
+        let info = Exclusions::new()
+            .subtree(target.join("info"), "nfs")
+            .anchored(Path::new("/"));
+        assert_eq!(crate::dir::locate(&home, &info), Some(target.clone()));
+        let disk = Exclusions::new()
+            .subtree(fx.root.join("disk"), "nfs")
+            .anchored(Path::new("/"));
+        assert_eq!(crate::dir::locate(&home, &disk), None);
+        fs::remove_file(fx.trash()).unwrap();
+        symlink(fx.root.join("missing"), fx.trash()).unwrap();
+        assert_eq!(crate::dir::locate(&home, &none), None);
+    }
+}

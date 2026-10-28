@@ -38,6 +38,25 @@ pub struct Policy {
     /// refuse sources there and never use or probe trash directories
     /// there. Listing, restoring and erasing are not affected.
     pub exclusions: Exclusions,
+    /// Follow a symbolic link at `$XDG_DATA_HOME/Trash`, the home trash's
+    /// own name, to a directory of any name: a home trash kept elsewhere.
+    /// Only that one component may be a link: `$XDG_DATA_HOME` is reached
+    /// as always, and `files` and `info` in the target are walked without
+    /// following links. The target must pass the home trash's own checks
+    /// (a directory, the user's, not writable by group or others); a link
+    /// that leads to no directory is a failed open
+    /// ([`OpenErrorKind::BrokenLink`](crate::OpenErrorKind::BrokenLink)),
+    /// and nothing is ever created through it. The link itself is then
+    /// part of the home trash, and is not trashed. The trash's relative
+    /// `Path` values stay relative to `$XDG_DATA_HOME`. Off: a link there
+    /// fails the check like any ([`CheckFailure::Symlink`](crate::CheckFailure::Symlink)),
+    /// and can be trashed as an ordinary link.
+    ///
+    /// The path alone vouches for nothing: who may change the link is who
+    /// may write to `$XDG_DATA_HOME`. Following it is what keeps the
+    /// checks meaningful — the directory is checked as opened, and used
+    /// through that open handle.
+    pub follow_home_link: bool,
 }
 
 impl Default for Policy {
@@ -49,6 +68,7 @@ impl Default for Policy {
             absolute_paths: AbsolutePaths::default(),
             fallbacks: Fallbacks::default(),
             exclusions: Exclusions::default(),
+            follow_home_link: true,
         }
     }
 }

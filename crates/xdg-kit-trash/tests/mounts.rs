@@ -1,6 +1,7 @@
 //! Behavior across real mounts: trash selection by mount, a bind mount of
 //! the home trash's file system, restoring across mounts and to an
-//! unmounted volume, and erasing and sizing a payload with a mount inside.
+//! unmounted volume, erasing and sizing a payload with a mount inside, and
+//! a home trash kept on another mount through a symbolic link.
 //!
 //! Gated: it runs only with `XDG_KIT_TRASH_MOUNT_TESTS=1`, and then needs
 //! util-linux's `unshare` and unprivileged user namespaces. It re-runs
@@ -115,7 +116,7 @@ impl Fx {
 
 #[cfg(target_os = "linux")]
 fn run() {
-    let tests: [(&str, fn()); 12] = [
+    let tests: [(&str, fn()); 13] = [
         ("selection by mount", selection_by_mount),
         ("a bind mount is another mount", bind_mount),
         ("restoring across mounts", restore_across_mounts),
@@ -137,6 +138,10 @@ fn run() {
         ("plans across mounts create nothing", plan_across_mounts),
         ("excluded volumes, nested volumes", excluded_volumes),
         ("another mount is not a fallback", cross_device_is_final),
+        (
+            "a home trash linked to another mount is on that mount",
+            home_link_to_another_mount,
+        ),
     ];
     for (name, test) in tests {
         println!("mount test: {name}");
@@ -558,5 +563,48 @@ fn cross_device_is_final() {
     assert!(vol.join("f").exists());
     let files: Vec<_> = fs::read_dir(fx.home.join("Trash/files")).unwrap().collect();
     assert!(files.is_empty());
+    unmount(&vol);
+}
+
+#[cfg(target_os = "linux")]
+fn home_link_to_another_mount() {
+    // `$XDG_DATA_HOME/Trash` a link to a directory on a volume: files are
+    // matched with the mount the link leads to, not the link's own.
+    let fx = Fx::new();
+    let vol = fx.root.join("vol");
+    tmpfs(&vol);
+    let kept = vol.join("kept");
+    fs::create_dir(&kept).unwrap();
+    fs::set_permissions(&kept, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    fs::create_dir(&fx.home).unwrap();
+    std::os::unix::fs::symlink(&kept, fx.home.join("Trash")).unwrap();
+    // A file on the volume goes to the home trash there.
+    fs::write(vol.join("doc"), "d").unwrap();
+    let plan = fx.context.plan(vol.join("doc")).unwrap();
+    assert_eq!(plan.destination().unwrap().trash.kind(), TrashKind::Home);
+    assert!(plan.skipped.is_empty());
+    let trashed = fx.context.trash(vol.join("doc")).unwrap();
+    assert_eq!(trashed.trash.kind(), TrashKind::Home);
+    assert_eq!(fs::read_to_string(kept.join("files/doc")).unwrap(), "d");
+    assert!(!vol.join(".Trash-0").exists());
+    assert_eq!(fx.home_trash().link_target(), Some(kept.as_path()));
+    // A file beside `$XDG_DATA_HOME` is on another mount than the home
+    // trash now: never copied there; without per-volume trashing, refused.
+    let mut policy = Policy::default();
+    policy.volume_trash = false;
+    let context = fx.context.clone().with_policy(policy);
+    fs::write(fx.root.join("local"), "l").unwrap();
+    match context.trash(fx.root.join("local")) {
+        Err(TrashError::NoTrash { attempts, .. }) => {
+            assert!(matches!(attempts[0].failure, AttemptFailure::OtherMount));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(fx.root.join("local").exists());
+    let kept_names: Vec<_> = fs::read_dir(kept.join("files"))
+        .unwrap()
+        .map(|item| item.unwrap().file_name())
+        .collect();
+    assert_eq!(kept_names, ["doc"], "only the file from the volume");
     unmount(&vol);
 }

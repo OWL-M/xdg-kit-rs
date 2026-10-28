@@ -150,6 +150,69 @@ pub(crate) fn open_dir_at(dir: BorrowedFd<'_>, name: &OsStr) -> io::Result<Owned
     )?)
 }
 
+/// The target of the symbolic link `name` in `dir`, as stored.
+pub(crate) fn read_link_at(dir: BorrowedFd<'_>, name: &OsStr) -> io::Result<std::ffi::OsString> {
+    use std::os::unix::ffi::OsStringExt as _;
+    probe(None);
+    Ok(std::ffi::OsString::from_vec(
+        rustix::fs::readlinkat(dir, name, Vec::new())?.into_bytes(),
+    ))
+}
+
+/// Opens the directory `name` in `dir` for looking up names in it, refusing
+/// a symbolic link: on Linux and Android with `O_PATH`, which needs only
+/// the search permission a path lookup needs; elsewhere read-only, which
+/// needs read permission too. Not for reading the directory: see
+/// [`reopen_dir`].
+pub(crate) fn open_search_at(dir: BorrowedFd<'_>, name: &OsStr) -> io::Result<OwnedFd> {
+    probe(None);
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let access = OFlags::PATH;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let access = OFlags::RDONLY;
+    Ok(rustix::fs::openat(
+        dir,
+        name,
+        access | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )?)
+}
+
+/// Opens the directory at `path`, following symbolic links on the way as
+/// [`open_dir`] does, for looking up names in it: with `O_PATH` on Linux
+/// and Android (search permission suffices), elsewhere read-only.
+pub(crate) fn open_search(path: &Path) -> io::Result<OwnedFd> {
+    probe(Some(path));
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let access = OFlags::PATH;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let access = OFlags::RDONLY;
+    Ok(rustix::fs::open(
+        path,
+        access | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?)
+}
+
+/// The directory open as `dir` (perhaps only for lookups), opened again
+/// for reading: the same directory, found by no name.
+pub(crate) fn reopen_dir(dir: BorrowedFd<'_>) -> io::Result<OwnedFd> {
+    probe(None);
+    Ok(rustix::fs::openat(
+        dir,
+        ".",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?)
+}
+
+/// The target of the symbolic link at `path`, as stored (links before the
+/// last component followed).
+pub(crate) fn read_link(path: &Path) -> io::Result<std::ffi::OsString> {
+    probe(Some(path));
+    Ok(std::fs::read_link(path)?.into_os_string())
+}
+
 /// `stat` of `name` in `dir`, not following a symbolic link.
 pub(crate) fn stat_at(dir: BorrowedFd<'_>, name: &OsStr) -> io::Result<Meta> {
     probe(None);

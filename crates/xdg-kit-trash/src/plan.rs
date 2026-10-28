@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::context::Context;
-use crate::dir::{self, Mode, TrashDir, Walked};
+use crate::dir::{self, HomeRoot, Mode, TrashDir, TrashKind, Walked};
 use crate::insert::{Attempt, AttemptFailure, TrashError, recorded_path};
 
 /// Where [`Context::trash`] would put a path, as far as can be told now.
@@ -90,11 +90,17 @@ impl Context {
         let source = self.inspect(path.as_ref())?;
         let selection = self.select(&source)?;
         let original = source.path();
+        let mut home = selection.home;
         let candidates = selection
             .candidates
             .into_iter()
             .map(|trash| {
-                let state = match dir::walk(self, &trash, Mode::Probe) {
+                let root = if trash.kind() == TrashKind::Home {
+                    std::mem::replace(&mut home, HomeRoot::NoLink)
+                } else {
+                    HomeRoot::NoLink
+                };
+                let state = match dir::walk_with(self, &trash, Mode::Probe, root) {
                     Ok(Walked::Opened(opened, _)) => match recorded_path(&opened, &original) {
                         Some(_) => CandidateState::Usable,
                         None => CandidateState::Unusable(AttemptFailure::OutsideBase),

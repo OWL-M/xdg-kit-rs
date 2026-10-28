@@ -61,6 +61,43 @@
 //! link) named `.Trash` or `.Trash-<digits>` right below a mount's top
 //! directory counts as one, another user's included.
 //!
+//! ## A home trash kept elsewhere
+//!
+//! `$XDG_DATA_HOME/Trash` may be a symbolic link to a directory of any
+//! name ([`Policy::follow_home_link`], on by default): opening, discovery,
+//! trashing, planning, listing, restoring, erasing and sizing all use the
+//! directory it leads to. The spec forbids a link only at `$topdir/.Trash`;
+//! here only that one component is followed, nothing else in any trash.
+//! The link is read once and followed from open directories, name by name,
+//! each opened without following a link; the directory reached is held
+//! open and checked as the home trash always is (the user's, not writable
+//! by group or others), and `files` and `info` in it are walked as in any
+//! trash. A link that leads to no directory — dangling, to another kind of
+//! file, a loop — fails as [`OpenErrorKind::BrokenLink`], is listed among
+//! [`Discovery::problems`], and nothing is created through it; `files` and
+//! `info` missing in a valid target are created as in any home trash.
+//!
+//! An operation follows the link once and uses what it opened for the
+//! mount comparison, the checks and the move alike; an open [`Trash`]
+//! stays on its directory however the link is changed afterwards, while a
+//! later open follows the link as it is then ([`Trash::link_target`] says
+//! where it led). Changing the link concurrently can therefore make an
+//! operation use the directory it led to when read, or fail if a directory
+//! on the way is replaced by a link meanwhile; it cannot make an operation
+//! use a directory that was not checked, nor follow a link swapped in on
+//! the way. The home trash's mount is the target's: files on the link's
+//! own mount are then on another mount than the home trash, and go to
+//! their volume's trash or are refused — never copied. The link itself,
+//! its target, a directory holding the target, and anything inside it are
+//! never trashed ([`SourceProblem::HomeTrashLink`],
+//! [`SourceProblem::HoldsTrash`], [`SourceProblem::InTrash`]) — a target
+//! that fails its checks or cannot be read, or whose `files` or `info` is
+//! excluded, included, as it still holds what it holds. A home
+//! trash given to [`Context::trash_into`] or [`Context::open`] that is
+//! another context's is followed by its own link, not this one's. Relative
+//! `Path` values are relative to `$XDG_DATA_HOME`, the home trash's base,
+//! wherever the trash is kept.
+//!
 //! Each insertion creates the trash info file first with `O_EXCL`, under a
 //! storage name cut to fit the reported name limits of `files` and `info`
 //! (leaving room for `.trashinfo` and a numeric suffix), writes and syncs
@@ -129,9 +166,20 @@
 //! known, it is checked again, which catches an alias (a link into an
 //! excluded place) — only after resolving it reached that place. A path
 //! that passes is trashed as usual; nothing promises it cannot reach a
-//! hung volume some other way. Listing, restoring and erasing do not use
-//! the exclusions: [`Context::discover`] lists whatever top directories it
-//! is given.
+//! hung volume some other way. A home trash reached through a link is
+//! checked before following it, at each link met on the way, with the
+//! rest of the way still to go, and at the directory reached — each
+//! spelling with its `files` and `info`: one that leads into an excluded
+//! place is passed over like an excluded home trash. An excluded `files`
+//! or `info` is never entered — whether named through the link's target
+//! or as `$XDG_DATA_HOME/Trash/files` and `…/info` — but following goes on
+//! to the directory holding it, which then still counts as a trash
+//! directory. A relative link's target is checked both
+//! from `$XDG_DATA_HOME` as configured and from its resolved path, which
+//! resolving it reaches whatever an alias there leads to. Listing,
+//! restoring and erasing do not use the exclusions: [`Context::discover`]
+//! lists whatever top directories it is given, and opens a linked home
+//! trash wherever it leads.
 //!
 //! # Listing
 //!
@@ -162,6 +210,7 @@
 //! | Spec | Level | Here |
 //! |---|---|---|
 //! | Home trash at `$XDG_DATA_HOME/Trash` | MUST | [`Context::home_trash`]; created when needed (SHOULD) |
+//! | A link at `$XDG_DATA_HOME/Trash` | not addressed | followed to a directory of any name, which passes the home trash's checks ([`Policy::follow_home_link`]); never created through |
 //! | Files from the home trash's file system go there | SHOULD | yes, by mount (device where mounts are unknown) |
 //! | Trash other file systems into the home trash | MAY | no: that is a copy |
 //! | Trash into top directories | MAY | yes, [`Policy::volume_trash`] |
@@ -196,6 +245,7 @@
 //! | [`Context::plan`] | yes; it does not predict the move's method | yes | yes |
 //! | [`Trash::restore`] | as trashing | as trashing | as trashing |
 //! | [`Policy::exclusions`] | lexical, no system call | the same | the same |
+//! | A link at `$XDG_DATA_HOME/Trash` ([`Policy::follow_home_link`]) | followed name by name from open directories, holding `$XDG_DATA_HOME` and those on the way with `O_PATH` (search permission suffices) | the same, but those directories are opened read-only, which needs read permission too: where one cannot be read, the home trash cannot be used, and its target is located by path alone (search permission suffices) so that what it holds is still recognised as trashed | the same as Apple systems |
 //! | [`Context::open`], [`Context::discover`], [`Trash::entries`] | yes | yes | yes |
 //! | [`Trash::erase`], [`Trash::discard_metadata`] | yes | yes | yes |
 //! | [`Trash::size`] | yes | yes | yes |
@@ -203,7 +253,8 @@
 //! | [`mounts`] | yes | — | — |
 //!
 //! Every system: names are resolved relative to open directories without
-//! following links in the final component. A directory that is a mount
+//! following links in the final component — but for the home trash's own
+//! link, where the policy follows it. A directory that is a mount
 //! point of the same device (a bind mount) is told apart only where mount
 //! IDs are known.
 
