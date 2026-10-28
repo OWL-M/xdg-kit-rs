@@ -1614,6 +1614,27 @@ mod restoring {
     }
 
     #[test]
+    fn destinations_are_checked_as_written() {
+        let fx = Fx::new();
+        let (trash, entry) = trashed(&fx, "r");
+        for suffix in ["a/.", "a/", "a/..", "a//"] {
+            let destination = PathBuf::from(format!("{}/{suffix}", fx.work.display()));
+            let options = RestoreOptions {
+                destination: Some(destination.clone()),
+                create_parents: true,
+            };
+            let err = trash.restore(&entry, &options).unwrap_err();
+            assert!(
+                matches!(&err.failure, RestoreFailure::InvalidDestination(path) if path == &destination),
+                "{suffix}: {err}"
+            );
+            assert!(!fx.work.join("a").exists(), "{suffix}: nothing was made");
+        }
+        assert!(fx.trash().join("files/r").exists());
+        assert!(fx.trash().join("info/r.trashinfo").exists());
+    }
+
+    #[test]
     fn existing_parents_are_never_removed() {
         let fx = Fx::new();
         let (trash, entry) = trashed(&fx, "m/n");
@@ -2384,5 +2405,296 @@ mod mount_list {
                 .iter()
                 .any(|mount| mount.mount_point == Path::new("/"))
         );
+    }
+}
+
+mod planning {
+    use super::*;
+
+    /// Every path below `root`, with its mode: what a query must leave as
+    /// it is.
+    fn snapshot(root: &Path) -> Vec<(PathBuf, u32)> {
+        let mut all = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for item in fs::read_dir(&dir).unwrap() {
+                let path = item.unwrap().path();
+                let meta = fs::symlink_metadata(&path).unwrap();
+                if meta.is_dir() {
+                    stack.push(path.clone());
+                }
+                all.push((path, meta.mode()));
+            }
+        }
+        all.sort();
+        all
+    }
+
+    /// The plan for `path`, checking that finding it changed nothing.
+    fn plan(fx: &Fx, context: &Context, path: &Path) -> TrashPlan {
+        let before = snapshot(&fx.root);
+        let plan = context.plan(path).unwrap();
+        assert_eq!(snapshot(&fx.root), before, "the query changed nothing");
+        plan
+    }
+
+    fn kinds(plan: &TrashPlan) -> Vec<TrashKind> {
+        plan.candidates
+            .iter()
+            .map(|candidate| candidate.trash.kind())
+            .collect()
+    }
+
+    fn top(fx: &Fx, shared_mode: Option<u32>) -> PathBuf {
+        let top = fx.root.join("vol");
+        fs::create_dir(&top).unwrap();
+        if let Some(mode) = shared_mode {
+            fs::create_dir(top.join(".Trash")).unwrap();
+            fs::set_permissions(top.join(".Trash"), fs::Permissions::from_mode(mode)).unwrap();
+        }
+        fs::write(top.join("doc"), "d").unwrap();
+        top
+    }
+
+    fn open_failure(state: &CandidateState) -> &OpenError {
+        match state {
+            CandidateState::Unusable(AttemptFailure::Open(err)) => err,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_home_trash_on_the_same_mount() {
+        let fx = Fx::new();
+        let source = fx.file("f", "f");
+        let first = plan(&fx, &fx.context, &source);
+        assert_eq!(kinds(&first), [TrashKind::Home]);
+        assert!(first.skipped.is_empty(), "{:?}", first.skipped);
+        assert!(
+            matches!(&first.candidates[0].state, CandidateState::WouldCreate(path) if path == &fx.home),
+            "{:?}",
+            first.candidates[0].state
+        );
+        assert!(!fx.home.exists());
+        // Once it exists, as it is.
+        let _ = fx.context.trash(fx.file("g", "g")).unwrap();
+        let second = plan(&fx, &fx.context, &source);
+        assert!(matches!(second.candidates[0].state, CandidateState::Usable));
+        assert_eq!(second.destination().unwrap().trash.kind(), TrashKind::Home);
+    }
+
+    #[test]
+    fn an_existing_volume_trash() {
+        let fx = Fx::new();
+        let top = top(&fx, None);
+        fs::write(top.join("seed"), "s").unwrap();
+        let _ = fx
+            .context
+            .trash_into(&fx.context.private_trash(&top), top.join("seed"))
+            .unwrap();
+        fault::pretend_volume(&top);
+        let plan = plan(&fx, &fx.context, &top.join("doc"));
+        assert!(matches!(
+            plan.skipped[0].failure,
+            AttemptFailure::OtherMount
+        ));
+        assert_eq!(kinds(&plan), [TrashKind::Shared, TrashKind::Private]);
+        let shared = open_failure(&plan.candidates[0].state);
+        assert!(matches!(shared.kind, OpenErrorKind::Absent));
+        assert_eq!(shared.path, top.join(".Trash"));
+        assert!(matches!(plan.candidates[1].state, CandidateState::Usable));
+        // And trashing agrees.
+        let trashed = fx.context.trash(top.join("doc")).unwrap();
+        assert_eq!(trashed.trash, plan.destination().unwrap().trash);
+    }
+
+    #[test]
+    fn volume_trashes_that_would_be_created() {
+        // In a sticky `.Trash`: its `$uid`.
+        let fx = Fx::new();
+        let top = top(&fx, Some(0o1777));
+        fault::pretend_volume(&top);
+        let plan = plan(&fx, &fx.context, &top.join("doc"));
+        let shared = top.join(".Trash").join(uid().to_string());
+        assert!(
+            matches!(&plan.candidates[0].state, CandidateState::WouldCreate(path) if path == &shared)
+        );
+        assert!(matches!(&plan.candidates[1].state,
+            CandidateState::WouldCreate(path) if path == &top.join(format!(".Trash-{}", uid()))));
+        let trashed = fx.context.trash(top.join("doc")).unwrap();
+        assert_eq!(trashed.trash.kind(), TrashKind::Shared);
+        // Without `.Trash`: the `.Trash-$uid` fallback.
+        let fx = Fx::new();
+        let top = self::top(&fx, None);
+        fault::pretend_volume(&top);
+        let plan = self::plan(&fx, &fx.context, &top.join("doc"));
+        assert!(matches!(
+            open_failure(&plan.candidates[0].state).kind,
+            OpenErrorKind::Absent
+        ));
+        let destination = plan.destination().unwrap();
+        assert_eq!(destination.trash.kind(), TrashKind::Private);
+        assert!(
+            matches!(&destination.state, CandidateState::WouldCreate(path)
+            if path == &top.join(format!(".Trash-{}", uid())))
+        );
+    }
+
+    #[test]
+    fn shared_directories_failing_their_checks() {
+        let fx = Fx::new();
+        let top = top(&fx, Some(0o0777));
+        fault::pretend_volume(&top);
+        let plan = plan(&fx, &fx.context, &top.join("doc"));
+        assert!(matches!(
+            open_failure(&plan.candidates[0].state).kind,
+            OpenErrorKind::Unsafe(CheckFailure::NotSticky(0o0777))
+        ));
+        let fx = Fx::new();
+        let top = self::top(&fx, None);
+        fs::create_dir(fx.root.join("elsewhere")).unwrap();
+        symlink(fx.root.join("elsewhere"), top.join(".Trash")).unwrap();
+        fault::pretend_volume(&top);
+        let plan = self::plan(&fx, &fx.context, &top.join("doc"));
+        assert!(matches!(
+            open_failure(&plan.candidates[0].state).kind,
+            OpenErrorKind::Unsafe(CheckFailure::Symlink)
+        ));
+        assert!(matches!(
+            plan.candidates[1].state,
+            CandidateState::WouldCreate(_)
+        ));
+    }
+
+    #[test]
+    fn an_unwritable_top_directory() {
+        unprivileged(|| {
+            let fx = Fx::new();
+            let top = top(&fx, None);
+            fs::set_permissions(&top, fs::Permissions::from_mode(0o555)).unwrap();
+            fault::pretend_volume(&top);
+            let plan = plan(&fx, &fx.context, &top.join("doc"));
+            let private = open_failure(&plan.candidates[1].state);
+            assert!(
+                matches!(&private.kind, OpenErrorKind::Io(err) if err.kind() == std::io::ErrorKind::PermissionDenied),
+                "{private:?}"
+            );
+            assert_eq!(private.path, top.join(format!(".Trash-{}", uid())));
+            assert!(plan.destination().is_none());
+            // And trashing agrees.
+            assert!(matches!(
+                fx.context.trash(top.join("doc")),
+                Err(TrashError::NoTrash { .. })
+            ));
+            fs::set_permissions(&top, fs::Permissions::from_mode(0o755)).unwrap();
+        });
+    }
+
+    #[test]
+    fn an_existing_trash_that_cannot_be_written() {
+        unprivileged(|| {
+            let fx = Fx::new();
+            let _ = fx.context.trash(fx.file("seed", "s")).unwrap();
+            fs::set_permissions(fx.trash().join("info"), fs::Permissions::from_mode(0o500))
+                .unwrap();
+            let plan = plan(&fx, &fx.context, &fx.file("f", "f"));
+            let home = open_failure(&plan.candidates[0].state);
+            fs::set_permissions(fx.trash().join("info"), fs::Permissions::from_mode(0o700))
+                .unwrap();
+            assert_eq!(home.path, fx.trash().join("info"));
+        });
+    }
+
+    #[test]
+    fn volume_trashing_disabled_by_policy() {
+        let fx = Fx::new();
+        let top = top(&fx, Some(0o1777));
+        fault::pretend_volume(&top);
+        let context = fx.context.clone().with_policy(Policy {
+            volume_trash: false,
+            ..Policy::default()
+        });
+        let plan = plan(&fx, &context, &top.join("doc"));
+        assert!(plan.candidates.is_empty());
+        let failures: Vec<&AttemptFailure> = plan
+            .skipped
+            .iter()
+            .map(|attempt| &attempt.failure)
+            .collect();
+        assert!(matches!(
+            failures[..],
+            [
+                AttemptFailure::OtherMount,
+                AttemptFailure::Disabled,
+                AttemptFailure::Disabled
+            ]
+        ));
+        assert!(plan.destination().is_none());
+    }
+
+    #[test]
+    fn a_dangling_link_is_not_a_directory_to_create() {
+        // `$XDG_DATA_HOME` a dangling link, and below one: trashing cannot
+        // create through it, and the query says so.
+        for (link, data_home) in [
+            ("data", "data"),
+            ("data", "data/"),
+            ("data", "data/."),
+            ("link", "link/data"),
+            ("link", "link/./data/"),
+        ] {
+            let fx = Fx::new();
+            symlink(fx.root.join("nowhere"), fx.root.join(link)).unwrap();
+            let context = Context::new(fx.root.join(data_home), uid(), &fx.work, LocalZone::utc())
+                .unwrap()
+                .with_clock(Clock::Fixed(at(WHEN)));
+            let source = fx.file("f", "f");
+            let plan = plan(&fx, &context, &source);
+            let home = open_failure(&plan.candidates[0].state);
+            assert_eq!(home.path, fx.root.join(link), "{data_home}");
+            assert!(
+                matches!(&home.kind, OpenErrorKind::Io(err) if err.kind() == std::io::ErrorKind::NotADirectory),
+                "{data_home}: {home:?}"
+            );
+            assert!(plan.destination().is_none());
+            assert!(
+                matches!(context.trash(&source), Err(TrashError::NoTrash { .. })),
+                "{data_home}"
+            );
+            assert!(!fx.root.join("nowhere").exists());
+        }
+    }
+
+    #[test]
+    fn sources_trashing_refuses() {
+        let fx = Fx::new();
+        let _ = fx.context.trash(fx.file("seed", "s")).unwrap();
+        let before = snapshot(&fx.root);
+        assert!(matches!(
+            fx.context.plan(fx.trash()),
+            Err(TrashError::InvalidSource {
+                problem: SourceProblem::HoldsTrash,
+                ..
+            })
+        ));
+        assert!(matches!(
+            fx.context.plan(fx.trash().join("files/seed")),
+            Err(TrashError::InvalidSource {
+                problem: SourceProblem::InTrash,
+                ..
+            })
+        ));
+        assert!(matches!(
+            fx.context.plan(fx.work.join("missing")),
+            Err(TrashError::SourceMissing { .. })
+        ));
+        assert!(matches!(
+            fx.context.plan("/"),
+            Err(TrashError::InvalidSource {
+                problem: SourceProblem::NoName,
+                ..
+            })
+        ));
+        assert_eq!(snapshot(&fx.root), before);
     }
 }

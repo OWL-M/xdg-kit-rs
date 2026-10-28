@@ -292,6 +292,29 @@ enum Check {
     Owned,
 }
 
+/// What [`walk`] does about missing directories.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Mode {
+    /// Open only: a missing directory is [`OpenErrorKind::Absent`].
+    Open,
+    /// Create what is missing (what may be created).
+    Create,
+    /// Create nothing: stop at the first missing directory that could be
+    /// created, and say which; check that an existing trash's `files` and
+    /// `info` may be written to.
+    Probe,
+}
+
+/// What [`walk`] found.
+pub(crate) enum Walked {
+    /// The trash directory, open; and the first error syncing a directory
+    /// a new one was made in (it exists, but may not survive a crash).
+    Opened(Trash, Option<io::Error>),
+    /// ([`Mode::Probe`] only.) This directory, and all below it, would
+    /// have to be made, which the checks so far allow.
+    WouldCreate(PathBuf),
+}
+
 /// Opens (and when `create`, creates) the trash directory `dir`. Also
 /// returns the first error syncing a directory a new one was made in: the
 /// directory exists, but may not survive a crash.
@@ -300,6 +323,17 @@ pub(crate) fn open(
     dir: &TrashDir,
     create: bool,
 ) -> Result<(Trash, Option<io::Error>), OpenError> {
+    match walk(context, dir, if create { Mode::Create } else { Mode::Open })? {
+        Walked::Opened(trash, unsynced) => Ok((trash, unsynced)),
+        Walked::WouldCreate(path) => unreachable!("only a probe stops at {}", path.display()),
+    }
+}
+
+/// Walks to the trash directory `dir` and its `files` and `info`, component
+/// by component with every check, doing about missing ones what `mode`
+/// says. Opening, creating and probing are the one walk, so that a probe
+/// answers by the same checks a trashing meets.
+pub(crate) fn walk(context: &Context, dir: &TrashDir, mode: Mode) -> Result<Walked, OpenError> {
     let mut unsynced = None;
     let base = dir.base();
     let io_error = |path: &Path, err: io::Error| OpenError {
@@ -312,7 +346,16 @@ pub(crate) fn open(
     };
     let base_fd = match sys::open_dir(base) {
         Err(err)
-            if err.kind() == io::ErrorKind::NotFound && create && dir.kind == TrashKind::Home =>
+            if err.kind() == io::ErrorKind::NotFound
+                && mode == Mode::Probe
+                && dir.kind == TrashKind::Home =>
+        {
+            return creatable(base).map(Walked::WouldCreate);
+        }
+        Err(err)
+            if err.kind() == io::ErrorKind::NotFound
+                && mode == Mode::Create
+                && dir.kind == TrashKind::Home =>
         {
             match xdg_kit_basedir::create_dir_all_synced(base, 0o700) {
                 Ok(xdg_kit_basedir::Durability::Synced) => {}
@@ -337,39 +380,49 @@ pub(crate) fn open(
         let (check, may_create) = match (dir.kind, index) {
             // The administrator makes `.Trash`; it is never created here.
             (TrashKind::Shared, 0) => (Check::Sticky { unchecked }, false),
-            _ => (Check::Owned, create),
+            _ => (Check::Owned, true),
         };
-        fd = step(
+        let Some(next) = step(
             fd.as_fd(),
             component,
             &path,
             check,
-            may_create,
+            mode.when(may_create),
             dir.uid,
             &mut unsynced,
-        )?;
+        )?
+        else {
+            return Ok(Walked::WouldCreate(path));
+        };
+        fd = next;
     }
     let id = sys::fstat(&fd).map_err(|err| io_error(&path, err))?.ident;
-    let files = step(
-        fd.as_fd(),
-        OsStr::new("files"),
-        &path.join("files"),
-        Check::Owned,
-        create,
-        dir.uid,
-        &mut unsynced,
-    )?;
-    let info = step(
-        fd.as_fd(),
-        OsStr::new("info"),
-        &path.join("info"),
-        Check::Owned,
-        create,
-        dir.uid,
-        &mut unsynced,
-    )?;
+    let mut inner = Vec::new();
+    for name in ["files", "info"] {
+        let inner_path = path.join(name);
+        let Some(opened) = step(
+            fd.as_fd(),
+            OsStr::new(name),
+            &inner_path,
+            Check::Owned,
+            mode,
+            dir.uid,
+            &mut unsynced,
+        )?
+        else {
+            return Ok(Walked::WouldCreate(inner_path));
+        };
+        // A probe of a trash that exists: trashing writes into both.
+        if mode == Mode::Probe {
+            sys::may_create_in(opened.as_fd()).map_err(|err| io_error(&inner_path, err))?;
+        }
+        inner.push(opened);
+    }
+    let (Some(info), Some(files)) = (inner.pop(), inner.pop()) else {
+        unreachable!("both were opened");
+    };
     let absolute_paths = (dir.kind != TrashKind::Home).then_some(context.policy.absolute_paths);
-    Ok((
+    Ok(Walked::Opened(
         Trash {
             dir: dir.clone(),
             root: fd,
@@ -384,17 +437,27 @@ pub(crate) fn open(
     ))
 }
 
-/// Opens `name` in `parent` as a directory meeting `check`, creating it
-/// (mode 0700) first when missing and `create`.
+impl Mode {
+    /// The mode for a directory that may be created only when `may`: one
+    /// that may not is only opened.
+    fn when(self, may: bool) -> Self {
+        if may { self } else { Mode::Open }
+    }
+}
+
+/// Opens `name` in `parent` as a directory meeting `check`. When it is
+/// missing, [`Mode::Create`] creates it (mode 0700) first, and
+/// [`Mode::Probe`] returns `None` if `parent` would let this process create
+/// it.
 fn step(
     parent: BorrowedFd<'_>,
     name: &OsStr,
     path: &Path,
     check: Check,
-    create: bool,
+    mode: Mode,
     uid: u32,
     unsynced: &mut Option<io::Error>,
-) -> Result<OwnedFd, OpenError> {
+) -> Result<Option<OwnedFd>, OpenError> {
     let fail = |kind| OpenError {
         path: path.to_path_buf(),
         kind,
@@ -405,7 +468,13 @@ fn step(
     };
     match sys::lookup_at(parent, name) {
         Err(err) => return Err(fail(OpenErrorKind::Io(err))),
-        Ok(None) if create => match sys::mkdir_at(parent, name, 0o700) {
+        Ok(None) if mode == Mode::Probe => {
+            return match sys::may_create_in(parent) {
+                Ok(()) => Ok(None),
+                Err(err) => Err(fail(OpenErrorKind::Io(err))),
+            };
+        }
+        Ok(None) if mode == Mode::Create => match sys::mkdir_at(parent, name, 0o700) {
             Ok(()) => {
                 if let Err(err) = sys::sync(parent) {
                     unsynced.get_or_insert(err);
@@ -443,6 +512,62 @@ fn step(
     };
     match failure {
         Some(failure) => Err(fail(OpenErrorKind::Unsafe(failure))),
-        None => Ok(fd),
+        None => Ok(Some(fd)),
     }
+}
+
+/// The first of `path` and its ancestors that is missing below the nearest
+/// one that exists, if that one would let this process create in it: what
+/// creating `path` would start with. Nothing is made.
+fn creatable(path: &Path) -> Result<PathBuf, OpenError> {
+    let fail = |path: &Path, kind| OpenError {
+        path: path.to_path_buf(),
+        kind,
+    };
+    // Rebuilt from its components: a trailing `/` or `.` would make the
+    // look at the final name follow a link, and `ancestors` would then never
+    // name the link itself.
+    let path: PathBuf = path.components().collect();
+    let path = path.as_path();
+    let mut first_missing = None;
+    for at in path.ancestors() {
+        // Looked at without following its final component: a dangling
+        // symbolic link is a name that exists, not a missing directory, and
+        // creating through it fails.
+        let meta = match sys::lookup_path_nofollow(at) {
+            Ok(None) => {
+                first_missing = Some(at);
+                continue;
+            }
+            Ok(Some(meta)) if meta.kind == FileKind::Symlink => match sys::lookup_path(at) {
+                Ok(Some(target)) => target,
+                Ok(None) => {
+                    return Err(fail(
+                        at,
+                        OpenErrorKind::Io(io::Error::new(
+                            io::ErrorKind::NotADirectory,
+                            "a dangling symbolic link",
+                        )),
+                    ));
+                }
+                Err(err) => return Err(fail(at, OpenErrorKind::Io(err))),
+            },
+            Ok(Some(meta)) => meta,
+            Err(err) => return Err(fail(at, OpenErrorKind::Io(err))),
+        };
+        if meta.kind != FileKind::Directory {
+            return Err(fail(
+                at,
+                OpenErrorKind::Unsafe(CheckFailure::NotDirectory(meta.kind)),
+            ));
+        }
+        let Some(first_missing) = first_missing else {
+            // Nothing is missing after all: it appeared meanwhile.
+            return Ok(path.to_path_buf());
+        };
+        return sys::may_create_at(at)
+            .map(|()| first_missing.to_path_buf())
+            .map_err(|err| fail(first_missing, OpenErrorKind::Io(err)));
+    }
+    Err(fail(path, OpenErrorKind::Absent))
 }

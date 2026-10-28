@@ -262,8 +262,15 @@ impl fmt::Display for TrashError {
 
 impl std::error::Error for TrashError {}
 
+/// The trash directories a trashing tries, in order, and the ones it
+/// passes over.
+pub(crate) struct Selection {
+    pub(crate) candidates: Vec<TrashDir>,
+    pub(crate) skipped: Vec<Attempt>,
+}
+
 /// The file to trash, inspected.
-struct Source {
+pub(crate) struct Source {
     /// As given, for errors.
     given: PathBuf,
     /// Its directory, canonical, and open.
@@ -278,7 +285,7 @@ struct Source {
 }
 
 impl Source {
-    fn path(&self) -> PathBuf {
+    pub(crate) fn path(&self) -> PathBuf {
         self.parent.join(&self.name)
     }
 }
@@ -300,6 +307,16 @@ impl Context {
     /// See [`TrashError`]: in every case the file was not moved.
     pub fn trash(&self, path: impl AsRef<Path>) -> Result<Trashed, TrashError> {
         let source = self.inspect(path.as_ref())?;
+        let selection = self.select(&source)?;
+        self.insert(&source, selection.candidates, selection.skipped)
+    }
+
+    /// The trash directories [`Context::trash`] tries for `source`, in
+    /// order, and the ones it passes over, with why; refuses a source that
+    /// is or holds a trash directory, or is inside one. Shared by
+    /// [`Context::trash`] and [`Context::plan`], so that the query answers
+    /// by the very selection trashing makes. Looks only: creates nothing.
+    pub(crate) fn select(&self, source: &Source) -> Result<Selection, TrashError> {
         let home = self.home_trash();
         let parent_place =
             Place::of(source.parent_fd.as_fd()).map_err(|error| TrashError::Source {
@@ -318,18 +335,21 @@ impl Context {
             Some(topdir) => Ok(topdir),
             None => topdir(&source.parent, parent_place),
         };
-        self.check_not_trash(&source, &[], topdir.as_deref().ok())?;
+        self.check_not_trash(source, &[], topdir.as_deref().ok())?;
         let mut candidates = Vec::new();
-        let mut attempts = Vec::new();
+        let mut skipped = Vec::new();
         if sameness == Sameness::Different {
-            attempts.push(skipped(Some(home.clone()), AttemptFailure::OtherMount));
+            skipped.push(self::skipped(
+                Some(home.clone()),
+                AttemptFailure::OtherMount,
+            ));
         } else {
             candidates.push(home);
         }
         if sameness != Sameness::Same {
             match topdir {
                 Err((ancestor, error)) => {
-                    attempts.push(skipped(
+                    skipped.push(self::skipped(
                         None,
                         AttemptFailure::TopdirUnknown { ancestor, error },
                     ));
@@ -343,13 +363,16 @@ impl Context {
                             candidates.push(private);
                         }
                     } else {
-                        attempts.push(skipped(Some(shared), AttemptFailure::Disabled));
-                        attempts.push(skipped(Some(private), AttemptFailure::Disabled));
+                        skipped.push(self::skipped(Some(shared), AttemptFailure::Disabled));
+                        skipped.push(self::skipped(Some(private), AttemptFailure::Disabled));
                     }
                 }
             }
         }
-        self.insert(&source, candidates, attempts)
+        Ok(Selection {
+            candidates,
+            skipped,
+        })
     }
 
     /// Moves `path` into the trash directory `trash`, and only there,
@@ -377,7 +400,7 @@ impl Context {
         self.insert(&source, candidates, Vec::new())
     }
 
-    fn inspect(&self, given: &Path) -> Result<Source, TrashError> {
+    pub(crate) fn inspect(&self, given: &Path) -> Result<Source, TrashError> {
         let invalid = |problem| TrashError::InvalidSource {
             path: given.to_path_buf(),
             problem,
@@ -727,7 +750,7 @@ pub(crate) fn topdir(dir: &Path, place: Place) -> Result<PathBuf, (PathBuf, io::
 
 /// The `Path` to record for `original` in `trash`: relative to the base
 /// when below it, else absolute (the home trash only).
-fn recorded_path(trash: &Trash, original: &Path) -> Option<PathBuf> {
+pub(crate) fn recorded_path(trash: &Trash, original: &Path) -> Option<PathBuf> {
     let base = std::fs::canonicalize(trash.dir().base()).ok();
     let relative = base
         .as_deref()

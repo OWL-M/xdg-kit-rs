@@ -290,6 +290,13 @@ impl Trash {
             (None, Origin::Unknown(why)) => return Err(RestoreFailure::OriginUnknown(why.clone())),
         };
         let invalid = || RestoreFailure::InvalidDestination(destination.clone());
+        // Checked as written: path decomposition drops a trailing `/` or
+        // `/.`, which would make `/a/.` mean `/a`.
+        let raw = destination.as_os_str().as_bytes();
+        let last = raw.rsplit(|&byte| byte == b'/').next().unwrap_or_default();
+        if matches!(last, b"" | b"." | b"..") {
+            return Err(invalid());
+        }
         if !destination.is_absolute()
             || !matches!(
                 destination.components().next_back(),

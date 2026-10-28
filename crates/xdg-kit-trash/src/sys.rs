@@ -315,6 +315,61 @@ pub(crate) fn create_exclusive(
     )?)
 }
 
+/// `accessat`'s flag for judging by the effective user and groups, as an
+/// actual operation is judged. Android's C library has no `AT_EACCESS`:
+/// there the real ones are used, which differ only in a set-ID program.
+#[cfg(not(target_os = "android"))]
+const EFFECTIVE_IDS: AtFlags = AtFlags::EACCESS;
+#[cfg(target_os = "android")]
+const EFFECTIVE_IDS: AtFlags = AtFlags::empty();
+
+/// Whether this process may create entries in the open directory `dir`:
+/// write and search permission, by the effective user and groups (the
+/// real ones on Android), as the kernel judges them now (ACLs and
+/// read-only mounts included). Advisory: only an actual creation decides.
+pub(crate) fn may_create_in(dir: BorrowedFd<'_>) -> io::Result<()> {
+    use rustix::fs::Access;
+    Ok(rustix::fs::accessat(
+        dir,
+        ".",
+        Access::WRITE_OK | Access::EXEC_OK,
+        EFFECTIVE_IDS,
+    )?)
+}
+
+/// [`may_create_in`] for the directory at `path` (symbolic links
+/// followed), which needs search permission on the way, not read
+/// permission on the directory.
+pub(crate) fn may_create_at(path: &Path) -> io::Result<()> {
+    use rustix::fs::Access;
+    Ok(rustix::fs::accessat(
+        rustix::fs::CWD,
+        path,
+        Access::WRITE_OK | Access::EXEC_OK,
+        EFFECTIVE_IDS,
+    )?)
+}
+
+/// `stat` of the file at `path`, symbolic links followed: `None` when
+/// nothing has that path.
+pub(crate) fn lookup_path(path: &Path) -> io::Result<Option<Meta>> {
+    match rustix::fs::stat(path) {
+        Ok(stat) => Ok(Some(Meta::of(&stat))),
+        Err(rustix::io::Errno::NOENT) => Ok(None),
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// `lstat` of the file at `path`: the final component is not followed (a
+/// symbolic link is itself). `None` when nothing has that path.
+pub(crate) fn lookup_path_nofollow(path: &Path) -> io::Result<Option<Meta>> {
+    match rustix::fs::lstat(path) {
+        Ok(stat) => Ok(Some(Meta::of(&stat))),
+        Err(rustix::io::Errno::NOENT) => Ok(None),
+        Err(err) => Err(err.into()),
+    }
+}
+
 /// Creates the directory `name` in `dir`.
 pub(crate) fn mkdir_at(dir: BorrowedFd<'_>, name: &OsStr, mode: u32) -> io::Result<()> {
     Ok(rustix::fs::mkdirat(dir, name, mode_bits(mode))?)

@@ -17,9 +17,9 @@ use std::process::{Command, ExitCode};
 
 #[cfg(target_os = "linux")]
 use xdg_kit_trash::{
-    AttemptFailure, CacheWrite, Context, EraseFailure, EraseOptions, EraseProblemKind, LocalZone,
-    Origin, RestoreFailure, RestoreOptions, SizeOptions, SizeProblemKind, SourceProblem, Trash,
-    TrashError, TrashKind,
+    AttemptFailure, CacheWrite, CandidateState, Context, EraseFailure, EraseOptions,
+    EraseProblemKind, LocalZone, Origin, RestoreFailure, RestoreOptions, SizeOptions,
+    SizeProblemKind, SourceProblem, Trash, TrashError, TrashKind,
 };
 
 const GATE: &str = "XDG_KIT_TRASH_MOUNT_TESTS";
@@ -115,7 +115,7 @@ impl Fx {
 
 #[cfg(target_os = "linux")]
 fn run() {
-    let tests: [(&str, fn()); 9] = [
+    let tests: [(&str, fn()); 10] = [
         ("selection by mount", selection_by_mount),
         ("a bind mount is another mount", bind_mount),
         ("restoring across mounts", restore_across_mounts),
@@ -134,6 +134,7 @@ fn run() {
             "files named like this user's trash roots",
             files_named_like_own_roots,
         ),
+        ("plans across mounts create nothing", plan_across_mounts),
     ];
     for (name, test) in tests {
         println!("mount test: {name}");
@@ -443,5 +444,48 @@ fn files_named_like_own_roots() {
             ..
         })
     ));
+    unmount(&vol);
+}
+
+#[cfg(target_os = "linux")]
+fn plan_across_mounts() {
+    let fx = Fx::new();
+    let vol = fx.root.join("vol");
+    tmpfs(&vol);
+    fs::create_dir(vol.join("sub")).unwrap();
+    fs::write(vol.join("sub/doc"), "d").unwrap();
+    let listing = |dir: &Path| {
+        let mut names: Vec<_> = fs::read_dir(dir)
+            .unwrap()
+            .map(|item| item.unwrap().file_name())
+            .collect();
+        names.sort();
+        names
+    };
+    let before = listing(&vol);
+    let plan = fx.context.plan(vol.join("sub/doc")).unwrap();
+    assert_eq!(listing(&vol), before, "nothing made on the volume");
+    assert!(!fx.home.exists(), "nor at home");
+    assert!(matches!(
+        plan.skipped[0].failure,
+        AttemptFailure::OtherMount
+    ));
+    let destination = plan.destination().unwrap();
+    assert_eq!(destination.trash.kind(), TrashKind::Private);
+    assert!(
+        matches!(&destination.state, CandidateState::WouldCreate(path) if path == &vol.join(".Trash-0"))
+    );
+    let trashed = fx.context.trash(vol.join("sub/doc")).unwrap();
+    assert_eq!(trashed.trash, destination.trash);
+    // A file on the home trash's mount: the home trash only.
+    fs::write(fx.root.join("local"), "l").unwrap();
+    let plan = fx.context.plan(fx.root.join("local")).unwrap();
+    let kinds: Vec<_> = plan
+        .candidates
+        .iter()
+        .map(|candidate| candidate.trash.kind())
+        .collect();
+    assert_eq!(kinds, [TrashKind::Home]);
+    assert!(plan.skipped.is_empty());
     unmount(&vol);
 }

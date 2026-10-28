@@ -31,7 +31,9 @@
 //! system's time zone) once; no operation reads it again.
 //!
 //! Discovery and operations are separate. [`Context::trash`] chooses a
-//! trash directory for a file; [`Context::trash_into`] uses one the caller
+//! trash directory for a file; [`Context::plan`] says what it would choose,
+//! by the same selection, creating nothing (advisory: the trashing still
+//! decides); [`Context::trash_into`] uses one the caller
 //! chose; [`Context::open`] opens a given one and [`Context::discover`]
 //! the home trash plus the per-volume ones of given top directories. Which
 //! top directories exist is the caller's to say: [`mounts`] lists them on
@@ -138,6 +140,7 @@
 //! | Operation | Linux, Android | Apple systems | FreeBSD, NetBSD, OpenBSD, `DragonFly`, `illumos` |
 //! |---|---|---|---|
 //! | [`Context::trash`], [`Context::trash_into`] | `renameat2(RENAME_NOREPLACE)`; [`Unsupported`] where the file system refuses it | `renameatx_np(RENAME_EXCL)`; likewise | [`Unsupported`] |
+//! | [`Context::plan`] | as trashing (it answers for it) | as trashing | [`Unsupported`], as trashing |
 //! | [`Trash::restore`] | as trashing | as trashing | [`Unsupported`] |
 //! | [`Context::open`], [`Context::discover`], [`Trash::entries`] | yes | yes | yes |
 //! | [`Trash::erase`], [`Trash::discard_metadata`] | yes | yes | yes |
@@ -166,6 +169,7 @@ mod limits;
 mod list;
 mod mounts;
 mod ops;
+mod plan;
 mod sizes;
 mod sys;
 #[cfg(test)]
@@ -191,6 +195,7 @@ pub use ops::{
     Erased, MetadataRemoval, Permissions, Quiescent, RestoreError, RestoreFailure, RestoreOptions,
     Restored,
 };
+pub use plan::{Candidate, CandidateState, TrashPlan};
 pub use sizes::{
     CacheEntry, CacheProblem, CacheProblemKind, CacheRead, CacheUse, CacheWrite,
     MAX_CACHE_PROBLEMS, ParsedSizes, SizeError, SizeOptions, SizeProblem, SizeProblemKind,
