@@ -337,8 +337,9 @@ The dev shell provides:
 - `XDG_KIT_SYSTEMD`, systemd from the locked nixpkgs, whose
   `systemd-xdg-autostart-generator` the autostart tests compare with;
 - `unshare` (util-linux), with which the trash crate's mount tests run in
-  a user and mount namespace of their own; they run only with
-  `XDG_KIT_TRASH_MOUNT_TESTS=1` and unprivileged user namespaces;
+  a user and mount namespace of their own. They need unprivileged user
+  namespaces, so neither `nix flake check` nor CI runs them; run them with
+  `XDG_KIT_TRASH_MOUNT_TESTS=1 nix develop -c cargo test -p xdg-kit-trash --test mounts`;
 - `perl`, which runs the Desktop Menu spec's own test suite from
   xdg-specs, and Python with PyGObject and `XDG_KIT_GI_TYPELIB_PATH`, for
   the menu tests' comparison with GNOME's libgnome-menu (gnome-menus from
