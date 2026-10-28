@@ -168,5 +168,12 @@ printf '[Trash Info]\nPath=/home/u/caf%%C3%%A9%%20x\\s%%25\nPath=second\n[Other]
 printf '[Trash Info]\nPath=a/../%%2E%%2E/b%%00\nDeletionDate=2023-02-29T00:00:00\n' > "$out/trash_info/refused"
 printf '16384 15803468 Documents\n8192 -5 Another%%20Folder\n1 2 raw space\n3 4 %%25%%0Aodd%%E9\nx 1 bad\n1 2 a%%2Fb\n1 2 Documents\n' > "$out/directory_sizes/seed"
 printf '22 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw\n35 22 0:31 / /media/my\\040disk rw master:2 shared:3 - vfat /dev/sdb1 rw\n' > "$out/mountinfo/seed"
+# Paths for the exclusion check: inside, beside, through `..`, nested.
+mkdir -p "$out/trash_exclusions"
+printf 'a/x' > "$out/trash_exclusions/inside"
+printf 'ab/x' > "$out/trash_exclusions/beside"
+printf 'x/../a/./y' > "$out/trash_exclusions/parent"
+printf 'a/n/x' > "$out/trash_exclusions/nested"
+printf 'b/c/d' > "$out/trash_exclusions/subtree"
 rm -rf seeds
 mv "$out" seeds

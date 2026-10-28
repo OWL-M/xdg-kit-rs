@@ -12,11 +12,13 @@ use xdg_kit_basedir::Durability;
 
 use crate::context::Context;
 use crate::dir::{self, OpenError, Trash, TrashDir, TrashKind};
+use crate::exclude::Excluded;
 use crate::fault::{self, Stage};
 use crate::info;
 use crate::list::info_name;
-use crate::sys::{self, FileKind, Ident, Place, RenameError, Sameness};
+use crate::sys::{self, FileKind, Ident, Place, Sameness};
 use crate::time::DeletionDate;
+use crate::transfer::{MoveMethod, PartialState, TransferError, TransferErrorKind, transfer};
 
 /// A completed trashing: the payload is in `files`, its trash info file in
 /// `info`.
@@ -37,6 +39,9 @@ pub struct Trashed {
     /// those, or the creation of a missing trash directory, failed to
     /// sync). The move happened either way: never redo it.
     pub durability: Durability,
+    /// How the payload was moved: atomically by the native rename, or by a
+    /// fallback the policy allows.
+    pub method: MoveMethod,
     /// The trash directories tried before, and why each was not used.
     pub fallbacks: Vec<Attempt>,
     /// The file moved is not the one inspected before: another process
@@ -54,19 +59,32 @@ pub struct Attempt {
     pub trash: Option<TrashDir>,
     /// Why it was not used.
     pub failure: AttemptFailure,
-    /// A trash info file reserved there and then left behind, because
-    /// removing it failed: it names no payload.
-    pub leftover: Option<Leftover>,
+    /// What this attempt made there and could not remove again: a trash
+    /// info file reserved (it names no payload), or a placeholder
+    /// directory (empty, unless someone filled it meanwhile).
+    pub leftovers: Vec<Leftover>,
 }
 
-/// A trash info file that could not be removed after a failure.
+/// Something an attempt made and could not remove after a failure.
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct Leftover {
+    /// What it is.
+    pub kind: LeftoverKind,
     /// Its path.
     pub path: PathBuf,
     /// Why it stayed.
     pub error: io::Error,
+}
+
+/// What a [`Leftover`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LeftoverKind {
+    /// A trash info file in `info`, without a payload.
+    Metadata,
+    /// A placeholder directory in `files`, without a trash info file.
+    Placeholder,
 }
 
 /// Why a trash directory was not used.
@@ -107,7 +125,12 @@ pub enum AttemptFailure {
     },
     /// The source disappeared before it could be moved.
     SourceGone,
-    /// The file system refused a non-replacing rename
+    /// The trash directory is in an excluded place
+    /// ([`Policy::exclusions`](crate::Policy::exclusions)): not probed,
+    /// not created.
+    Excluded(Excluded),
+    /// No way to move it without replacing: the native rename was refused
+    /// and the policy's fallbacks do not apply or were refused too
     /// ([`TrashError::Unsupported`] says more).
     Unsupported,
 }
@@ -124,7 +147,7 @@ impl fmt::Display for AttemptFailure {
             Self::Metadata(err) => write!(f, "cannot write the trash info file: {err}"),
             Self::CrossDevice => f.write_str("the rename crosses mounts"),
             Self::Move(err) => write!(f, "cannot move the file: {err}"),
-            Self::Unsupported => f.write_str("the file system cannot rename without replacing"),
+            Self::Unsupported => f.write_str("the file cannot be moved here without replacing"),
             Self::TopdirUnknown { ancestor, error } => {
                 write!(
                     f,
@@ -133,6 +156,7 @@ impl fmt::Display for AttemptFailure {
                 )
             }
             Self::SourceGone => f.write_str("the file disappeared"),
+            Self::Excluded(excluded) => excluded.fmt(f),
         }
     }
 }
@@ -159,14 +183,17 @@ impl fmt::Display for SourceProblem {
     }
 }
 
-/// An operation this system or file system cannot do safely.
+/// An operation this system or file system cannot do safely: the native
+/// non-replacing rename was refused, and the policy's fallbacks
+/// ([`Fallbacks`](crate::Fallbacks)) do not apply to the file or were refused too.
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct Unsupported {
     /// What was refused.
     pub operation: &'static str,
-    /// The file system's refusal; `None` when the system has no
-    /// non-replacing rename at all.
+    /// The last refusal: the fallback's, when one was tried, else the
+    /// native rename's; `None` when the system has no non-replacing rename
+    /// at all and no fallback applied.
     pub cause: Option<io::Error>,
 }
 
@@ -175,23 +202,63 @@ impl fmt::Display for Unsupported {
         match &self.cause {
             None => write!(
                 f,
-                "{} needs a rename that never replaces its target, which this system lacks",
+                "{} needs a move that never replaces its target, which is not available here",
                 self.operation
             ),
             Some(err) => write!(
                 f,
-                "{} needs a rename that never replaces its target, which the file system refused: {err}",
+                "{} needs a move that never replaces its target, which was refused: {err}",
                 self.operation
             ),
         }
     }
 }
 
-/// Why a file was not trashed. In every case it was not moved and is
-/// where it was.
+/// A trashing that went part of the way ([`TrashError::Partial`]).
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct PartialTrash {
+    /// The path, as given.
+    pub path: PathBuf,
+    /// The trash directory linked into.
+    pub trash: TrashDir,
+    /// The storage name linked to there.
+    pub name: OsString,
+    /// What the two names hold: [`PartialState::Duplicated`] (verified:
+    /// one file under both names, the trash entry complete; removing either
+    /// name loses nothing) or [`PartialState::Unverified`] (a name holds a
+    /// file not known to be the payload, or could not be inspected; nothing
+    /// was removed; inspect both names before removing anything).
+    pub state: PartialState,
+    /// Whether the trash info file reserved for `name` is still there. It
+    /// is removed only when `name` is confirmed not to hold the payload;
+    /// a name that could not be inspected keeps it, as it may hold it.
+    pub metadata_kept: bool,
+    /// Why the move did not complete.
+    pub error: io::Error,
+    /// Why it was not undone.
+    pub rollback: io::Error,
+    /// What could not be removed: the trash info file reserved, when it was
+    /// to go and removing it failed.
+    pub leftovers: Vec<Leftover>,
+    /// The trash directories tried before.
+    pub attempts: Vec<Attempt>,
+}
+
+/// Why a file was not trashed. In every case but [`TrashError::Partial`]
+/// it was not moved and is where it was.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum TrashError {
+    /// The path is in an excluded place
+    /// ([`Policy::exclusions`](crate::Policy::exclusions)), found from the
+    /// path alone: nothing was touched.
+    Excluded(Excluded),
+    /// The link fallback made a link in the trash, then could neither
+    /// complete the move nor undo it; no other trash was tried. See
+    /// [`PartialTrash`], and its [`PartialTrash::state`] before removing
+    /// anything.
+    Partial(Box<PartialTrash>),
     /// No non-replacing rename here; see [`Unsupported`].
     Unsupported {
         /// What is missing.
@@ -237,6 +304,30 @@ pub enum TrashError {
 impl fmt::Display for TrashError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Excluded(excluded) => excluded.fmt(f),
+            Self::Partial(partial) => {
+                let (path, trash, name) = (
+                    partial.path.display(),
+                    partial.trash.path(),
+                    partial.name.display(),
+                );
+                let (error, rollback) = (&partial.error, &partial.rollback);
+                match partial.state {
+                    PartialState::Duplicated => write!(
+                        f,
+                        "{path} is both in {} as {name} and still where it was (verified): the \
+                         move could not complete ({error}) nor be undone ({rollback})",
+                        trash.display()
+                    ),
+                    _ => write!(
+                        f,
+                        "trashing {path} into {} as {name} could not complete ({error}) nor be \
+                         undone ({rollback}), and what the two names hold is not verified: \
+                         nothing was removed",
+                        trash.display()
+                    ),
+                }
+            }
             Self::Unsupported { unsupported, .. } => unsupported.fmt(f),
             Self::InvalidSource { path, problem } => {
                 write!(f, "cannot trash {}: {problem}", path.display())
@@ -318,6 +409,7 @@ impl Context {
     /// by the very selection trashing makes. Looks only: creates nothing.
     pub(crate) fn select(&self, source: &Source) -> Result<Selection, TrashError> {
         let home = self.home_trash();
+        let home_excluded = self.excluded_trash(&home).err();
         let parent_place =
             Place::of(source.parent_fd.as_fd()).map_err(|error| TrashError::Source {
                 path: source.given.clone(),
@@ -325,11 +417,14 @@ impl Context {
             })?;
         let pretended = fault::pretended_volume();
         // Where the home trash's mount cannot be told, it is tried: the
-        // rename decides.
-        let sameness = match (&pretended, nearest_place(&home.path())) {
-            (Some(_), _) => Sameness::Different,
-            (None, Ok(home)) => parent_place.same(home),
-            (None, Err(_)) => Sameness::SameDevice,
+        // rename decides. An excluded home trash is not looked at.
+        let sameness = match &pretended {
+            Some(_) => Sameness::Different,
+            None if home_excluded.is_some() => Sameness::SameDevice,
+            None => match nearest_place(&home.path()) {
+                Ok(home) => parent_place.same(home),
+                Err(_) => Sameness::SameDevice,
+            },
         };
         let topdir = match pretended {
             Some(topdir) => Ok(topdir),
@@ -338,11 +433,13 @@ impl Context {
         self.check_not_trash(source, &[], topdir.as_deref().ok())?;
         let mut candidates = Vec::new();
         let mut skipped = Vec::new();
-        if sameness == Sameness::Different {
+        if let Some(excluded) = home_excluded {
             skipped.push(self::skipped(
-                Some(home.clone()),
-                AttemptFailure::OtherMount,
+                Some(home),
+                AttemptFailure::Excluded(excluded),
             ));
+        } else if sameness == Sameness::Different {
+            skipped.push(self::skipped(Some(home), AttemptFailure::OtherMount));
         } else {
             candidates.push(home);
         }
@@ -358,9 +455,18 @@ impl Context {
                     let shared = self.shared_trash(&topdir);
                     let private = self.private_trash(&topdir);
                     if self.policy.volume_trash {
-                        candidates.push(shared);
+                        let mut volume = vec![shared];
                         if self.policy.private_volume_trash {
-                            candidates.push(private);
+                            volume.push(private);
+                        }
+                        for trash in volume {
+                            match self.excluded_trash(&trash) {
+                                Ok(()) => candidates.push(trash),
+                                Err(excluded) => skipped.push(self::skipped(
+                                    Some(trash),
+                                    AttemptFailure::Excluded(excluded),
+                                )),
+                            }
                         }
                     } else {
                         skipped.push(self::skipped(Some(shared), AttemptFailure::Disabled));
@@ -390,6 +496,15 @@ impl Context {
         path: impl AsRef<Path>,
     ) -> Result<Trashed, TrashError> {
         let source = self.inspect(path.as_ref())?;
+        if let Err(excluded) = self.excluded_trash(trash) {
+            return Err(TrashError::NoTrash {
+                path: source.given.clone(),
+                attempts: vec![skipped(
+                    Some(trash.clone()),
+                    AttemptFailure::Excluded(excluded),
+                )],
+            });
+        }
         let candidates = vec![trash.clone()];
         let place = Place::of(source.parent_fd.as_fd()).map_err(|error| TrashError::Source {
             path: source.given.clone(),
@@ -400,24 +515,35 @@ impl Context {
         self.insert(&source, candidates, Vec::new())
     }
 
+    /// Whether trashing into `trash` would reach an excluded place: the
+    /// directories it opens or creates are the trash directory, its `files`
+    /// and its `info`, each with its ancestors. The trash directory is
+    /// checked as such: it is opened and inspected, not only passed through
+    /// (a mount rule's exemption for the way to a nested mount does not
+    /// apply to it).
+    fn excluded_trash(&self, trash: &TrashDir) -> Result<(), Excluded> {
+        let path = trash.path();
+        self.policy.exclusions.check(&path)?;
+        for child in ["files", "info"] {
+            self.policy.exclusions.check(&path.join(child))?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn inspect(&self, given: &Path) -> Result<Source, TrashError> {
         let invalid = |problem| TrashError::InvalidSource {
             path: given.to_path_buf(),
             problem,
         };
-        if !sys::NO_REPLACE_RENAME {
-            return Err(TrashError::Unsupported {
-                unsupported: Unsupported {
-                    operation: "trashing",
-                    cause: None,
-                },
-                attempts: Vec::new(),
-            });
-        }
         if given.as_os_str().is_empty() {
             return Err(invalid(SourceProblem::NoName));
         }
+        // From the path alone, before anything touches the file system.
         let path = self.anchor(given);
+        self.policy
+            .exclusions
+            .check(&path)
+            .map_err(TrashError::Excluded)?;
         let mut bytes = path.as_os_str().as_bytes();
         while bytes.len() > 1 && bytes.ends_with(b"/") {
             bytes = &bytes[..bytes.len() - 1];
@@ -443,7 +569,15 @@ impl Context {
                 }
             }
         };
-        let parent = std::fs::canonicalize(OsStr::from_bytes(parent)).map_err(source_error)?;
+        let parent =
+            sys::canonicalize(Path::new(OsStr::from_bytes(parent))).map_err(source_error)?;
+        // Again where it really is: an alias (a symbolic link on the way)
+        // can lead into an excluded place. Resolving it got there already;
+        // nothing more does.
+        self.policy
+            .exclusions
+            .check(&parent.join(OsStr::from_bytes(name)))
+            .map_err(TrashError::Excluded)?;
         let parent_fd = sys::open_dir(&parent).map_err(source_error)?;
         let name = OsStr::from_bytes(name).to_os_string();
         let meta = sys::stat_at(parent_fd.as_fd(), &name).map_err(source_error)?;
@@ -485,21 +619,31 @@ impl Context {
             trashes.push(self.private_trash(topdir));
         }
         for trash in trashes {
-            let mut trash_path = trash.path();
-            if let Ok(canonical) = std::fs::canonicalize(trash.base()) {
-                trash_path =
-                    canonical.join(trash_path.strip_prefix(trash.base()).unwrap_or(&trash_path));
+            // Its path as written, and — unless its base is excluded, which
+            // forbids looking at it — as resolved: the source's path is
+            // resolved, so a trash under a symbolic link is matched by the
+            // latter. Resolving looks at the base only, never below it. The
+            // comparison itself is lexical either way.
+            let written = trash.path();
+            let mut places = vec![written.clone()];
+            if self.policy.exclusions.check(trash.base()).is_ok()
+                && let Ok(canonical) = sys::canonicalize(trash.base())
+            {
+                places.push(canonical.join(written.strip_prefix(trash.base()).unwrap_or(&written)));
             }
-            if path.starts_with(&trash_path) && path != trash_path {
-                return refuse(SourceProblem::InTrash);
-            }
-            // Only a directory can hold one: a file or a link with a trash
-            // directory's name holds nothing (and a link is trashed itself,
-            // not its target).
-            if trash_path.starts_with(&path) && source.kind == FileKind::Directory {
-                return refuse(SourceProblem::HoldsTrash);
+            for trash_path in places {
+                if path.starts_with(&trash_path) && path != trash_path {
+                    return refuse(SourceProblem::InTrash);
+                }
+                // Only a directory can hold one: a file or a link with a
+                // trash directory's name holds nothing (and a link is
+                // trashed itself, not its target).
+                if trash_path.starts_with(&path) && source.kind == FileKind::Directory {
+                    return refuse(SourceProblem::HoldsTrash);
+                }
             }
         }
+
         // Other trash roots on the way: a directory (not a link) named
         // `.Trash` or `.Trash-<digits>` right below a mount's top
         // directory, another user's included.
@@ -515,7 +659,10 @@ impl Context {
                 || name
                     .strip_prefix(b".Trash-")
                     .is_some_and(|uid| !uid.is_empty() && uid.iter().all(u8::is_ascii_digit));
-            let is_dir = || std::fs::symlink_metadata(&prefix).is_ok_and(|meta| meta.is_dir());
+            let is_dir = || {
+                sys::lookup_path_nofollow(&prefix)
+                    .is_ok_and(|meta| meta.is_some_and(|meta| meta.kind == FileKind::Directory))
+            };
             let at_top = || {
                 prefix
                     .parent()
@@ -554,7 +701,7 @@ impl Context {
             };
             let bytes = info::format(recorded.as_os_str().as_bytes(), date);
             match self.move_in(&trash, source, &bytes) {
-                Ok((name, durability)) => {
+                Ok((name, durability, method)) => {
                     let durability = match (durability, unsynced) {
                         (Durability::Synced, Some(err)) => Durability::NotSynced(err),
                         (durability, _) => durability,
@@ -565,21 +712,42 @@ impl Context {
                         trash: candidate,
                         name,
                         original,
+                        method,
                         durability,
                         fallbacks: attempts,
                         replaced_meanwhile,
                     });
                 }
-                Err(MoveFailure::Attempt(failure, leftover)) => attempts.push(Attempt {
+                Err(MoveFailure::Attempt(failure, leftovers)) => attempts.push(Attempt {
                     trash: Some(candidate),
                     failure,
-                    leftover,
+                    leftovers,
                 }),
-                Err(MoveFailure::Unsupported(cause, leftover)) => {
+                Err(MoveFailure::Partial {
+                    name,
+                    error,
+                    rollback,
+                    state,
+                    metadata_kept,
+                    leftovers,
+                }) => {
+                    return Err(TrashError::Partial(Box::new(PartialTrash {
+                        path: source.given.clone(),
+                        trash: candidate,
+                        name,
+                        state,
+                        error,
+                        rollback,
+                        metadata_kept,
+                        leftovers,
+                        attempts,
+                    })));
+                }
+                Err(MoveFailure::Unsupported(cause, leftovers)) => {
                     attempts.push(Attempt {
                         trash: Some(candidate),
                         failure: AttemptFailure::Unsupported,
-                        leftover,
+                        leftovers,
                     });
                     return Err(TrashError::Unsupported {
                         unsupported: Unsupported {
@@ -589,11 +757,11 @@ impl Context {
                         attempts,
                     });
                 }
-                Err(MoveFailure::SourceMissing(leftover)) => {
+                Err(MoveFailure::SourceMissing(leftovers)) => {
                     attempts.push(Attempt {
                         trash: Some(candidate),
                         failure: AttemptFailure::SourceGone,
-                        leftover,
+                        leftovers,
                     });
                     return Err(TrashError::SourceMissing {
                         path: source.given.clone(),
@@ -610,87 +778,170 @@ impl Context {
 
     /// Reserves a name in `trash` with the trash info file `bytes` and
     /// moves the source in under it.
+    #[allow(
+        clippy::result_large_err,
+        reason = "internal: one per attempt, handled at once"
+    )]
     fn move_in(
         &self,
         trash: &Trash,
         source: &Source,
         bytes: &[u8],
-    ) -> Result<(OsString, Durability), MoveFailure> {
+    ) -> Result<(OsString, Durability, MoveMethod), MoveFailure> {
         let mut names = Names::new(trash, &source.name, &self.limits)?;
         loop {
             let reservation = names.reserve(trash, bytes)?;
-            if fault::hits(Stage::SourceVanishes) {
-                let _ = rustix::fs::unlinkat(
-                    source.parent_fd.as_fd(),
-                    &source.name,
-                    rustix::fs::AtFlags::empty(),
-                );
-            }
+            injected_before_move(trash, source, &reservation.name);
             let moved = if fault::hits(Stage::Move) {
-                Err(RenameError::Other(io::Error::other(
-                    "injected failure at Move",
-                )))
+                Err(TransferError {
+                    kind: TransferErrorKind::Other(io::Error::other("injected failure at Move")),
+                    left: None,
+                })
             } else if fault::hits(Stage::MoveCrossDevice) {
-                Err(RenameError::CrossDevice)
+                Err(TransferError {
+                    kind: TransferErrorKind::CrossDevice,
+                    left: None,
+                })
             } else {
-                sys::rename_no_replace(
+                transfer(
                     source.parent_fd.as_fd(),
                     &source.name,
                     trash.files(),
                     &reservation.name,
+                    source.kind,
+                    source.ident,
+                    self.policy.fallbacks,
                 )
             };
-            let failure = match moved {
-                Ok(()) => {
-                    let mut durability = Durability::Synced;
-                    for dir in [trash.files(), source.parent_fd.as_fd()] {
-                        if let Err(err) =
-                            fault::check(Stage::SyncAfterMove).and_then(|()| sys::sync(dir))
-                            && matches!(durability, Durability::Synced)
-                        {
-                            durability = Durability::NotSynced(err);
-                        }
-                    }
-                    return Ok((reservation.name, durability));
+            let error = match moved {
+                Ok(method) => {
+                    return Ok((reservation.name, after_move(trash, source), method));
                 }
-                // Taken in `files` (an orphaned payload, or another
-                // trashing): release the name, take the next.
-                Err(RenameError::Exists) => {
+                Err(error) => error,
+            };
+            let mut leftovers: Vec<Leftover> = error
+                .left
+                .map(|error| Leftover {
+                    kind: LeftoverKind::Placeholder,
+                    path: trash.dir().path().join("files").join(&reservation.name),
+                    error,
+                })
+                .into_iter()
+                .collect();
+            let failure = match error.kind {
+                // Taken in `files` (an orphaned payload, another trashing, a
+                // placeholder filled meanwhile): release the name, take the
+                // next — unless something of this attempt is left behind.
+                TransferErrorKind::Exists if leftovers.is_empty() => {
                     if let Some(leftover) = reservation.release(trash) {
-                        return Err(MoveFailure::Attempt(AttemptFailure::NoName, Some(leftover)));
+                        return Err(MoveFailure::Attempt(AttemptFailure::NoName, vec![leftover]));
                     }
                     continue;
                 }
-                Err(RenameError::CrossDevice) => AttemptFailure::CrossDevice,
-                Err(RenameError::Unsupported(cause)) => {
-                    let leftover = reservation.release(trash);
-                    return Err(MoveFailure::Unsupported(cause, leftover));
+                // The placeholder made was filled meanwhile, and stays.
+                TransferErrorKind::Exists => AttemptFailure::Move(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "the placeholder directory made was filled meanwhile",
+                )),
+                TransferErrorKind::CrossDevice => AttemptFailure::CrossDevice,
+                TransferErrorKind::Unsupported(cause) => {
+                    leftovers.extend(reservation.release(trash));
+                    return Err(MoveFailure::Unsupported(cause, leftovers));
                 }
-                Err(RenameError::Other(err)) => {
+                // Stop, whatever is where. The trash info file stays unless
+                // the name it describes is confirmed not to hold the payload:
+                // a name that could not be inspected may well hold it.
+                TransferErrorKind::Partial {
+                    error,
+                    rollback,
+                    state,
+                    destination_foreign,
+                } => {
+                    let _ = after_move(trash, source);
+                    let name = reservation.name.clone();
+                    let mut metadata_kept = true;
+                    if destination_foreign {
+                        match reservation.release(trash) {
+                            None => metadata_kept = false,
+                            Some(leftover) => leftovers.push(leftover),
+                        }
+                    }
+                    return Err(MoveFailure::Partial {
+                        name,
+                        error,
+                        rollback,
+                        state,
+                        metadata_kept,
+                        leftovers,
+                    });
+                }
+                TransferErrorKind::Other(err) => {
                     if matches!(
                         sys::lookup_at(source.parent_fd.as_fd(), &source.name),
                         Ok(None)
                     ) {
-                        return Err(MoveFailure::SourceMissing(reservation.release(trash)));
+                        leftovers.extend(reservation.release(trash));
+                        return Err(MoveFailure::SourceMissing(leftovers));
                     }
                     AttemptFailure::Move(err)
                 }
             };
-            let leftover = reservation.release(trash);
-            return Err(MoveFailure::Attempt(failure, leftover));
+            leftovers.extend(reservation.release(trash));
+            return Err(MoveFailure::Attempt(failure, leftovers));
         }
     }
 }
 
+/// What tests have "another process" do right before the move: remove the
+/// source, or take the reserved name in `files`. Nothing outside tests.
+fn injected_before_move(trash: &Trash, source: &Source, name: &OsStr) {
+    if fault::hits(Stage::SourceVanishes) {
+        let _ = rustix::fs::unlinkat(
+            source.parent_fd.as_fd(),
+            &source.name,
+            rustix::fs::AtFlags::empty(),
+        );
+    }
+    if fault::hits(Stage::TakeNameFile) {
+        let _ = sys::create_exclusive(trash.files(), name, 0o600);
+    } else if fault::hits(Stage::TakeNameDir) {
+        let _ = sys::mkdir_at(trash.files(), name, 0o700);
+    } else if fault::hits(Stage::TakeNameLink) {
+        let _ = rustix::fs::symlinkat("/nonexistent", trash.files(), name);
+    }
+}
+
+/// Syncs `files` and the source's directory after a move: whether it is
+/// known to survive a crash.
+fn after_move(trash: &Trash, source: &Source) -> Durability {
+    let mut durability = Durability::Synced;
+    for dir in [trash.files(), source.parent_fd.as_fd()] {
+        if let Err(err) = fault::check(Stage::SyncAfterMove).and_then(|()| sys::sync(dir))
+            && matches!(durability, Durability::Synced)
+        {
+            durability = Durability::NotSynced(err);
+        }
+    }
+    durability
+}
+
 enum MoveFailure {
-    Attempt(AttemptFailure, Option<Leftover>),
-    Unsupported(Option<io::Error>, Option<Leftover>),
-    SourceMissing(Option<Leftover>),
+    Attempt(AttemptFailure, Vec<Leftover>),
+    Unsupported(Option<io::Error>, Vec<Leftover>),
+    SourceMissing(Vec<Leftover>),
+    Partial {
+        name: OsString,
+        error: io::Error,
+        rollback: io::Error,
+        state: PartialState,
+        metadata_kept: bool,
+        leftovers: Vec<Leftover>,
+    },
 }
 
 impl From<AttemptFailure> for MoveFailure {
     fn from(failure: AttemptFailure) -> Self {
-        Self::Attempt(failure, None)
+        Self::Attempt(failure, Vec::new())
     }
 }
 
@@ -698,7 +949,7 @@ fn skipped(trash: Option<TrashDir>, failure: AttemptFailure) -> Attempt {
     Attempt {
         trash,
         failure,
-        leftover: None,
+        leftovers: Vec::new(),
     }
 }
 
@@ -751,7 +1002,7 @@ pub(crate) fn topdir(dir: &Path, place: Place) -> Result<PathBuf, (PathBuf, io::
 /// The `Path` to record for `original` in `trash`: relative to the base
 /// when below it, else absolute (the home trash only).
 pub(crate) fn recorded_path(trash: &Trash, original: &Path) -> Option<PathBuf> {
-    let base = std::fs::canonicalize(trash.dir().base()).ok();
+    let base = sys::canonicalize(trash.dir().base()).ok();
     let relative = base
         .as_deref()
         .and_then(|base| original.strip_prefix(base).ok())
@@ -777,6 +1028,7 @@ impl Reservation {
         let removed = fault::check(Stage::RemoveReservation)
             .and_then(|()| sys::remove_if_same(trash.info(), &info, self.ident, false));
         removed.err().map(|error| Leftover {
+            kind: LeftoverKind::Metadata,
             path: trash.dir().path().join("info").join(&info),
             error,
         })
@@ -835,6 +1087,10 @@ impl Names {
 
     /// Creates the trash info file for the next free name, holding
     /// `bytes`, synced with `info`.
+    #[allow(
+        clippy::result_large_err,
+        reason = "internal: one per attempt, handled at once"
+    )]
     fn reserve(&mut self, trash: &Trash, bytes: &[u8]) -> Result<Reservation, MoveFailure> {
         loop {
             if self.left == 0 {
@@ -893,7 +1149,7 @@ impl Names {
                     let leftover = reservation.release(trash);
                     Err(MoveFailure::Attempt(
                         AttemptFailure::Metadata(err),
-                        leftover,
+                        leftover.into_iter().collect(),
                     ))
                 }
             };

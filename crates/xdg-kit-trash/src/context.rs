@@ -4,9 +4,11 @@ use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::exclude::Exclusions;
 use crate::info::AbsolutePaths;
 use crate::limits::Limits;
 use crate::time::{Clock, LocalZone, ZoneError};
+use crate::transfer::Fallbacks;
 
 /// Which trash directories an operation may use, and how it reads them.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,6 +30,14 @@ pub struct Policy {
     pub unchecked_sticky: Vec<PathBuf>,
     /// How absolute `Path` values in per-volume trash directories are read.
     pub absolute_paths: AbsolutePaths,
+    /// What may stand in for the native non-replacing rename where it is
+    /// refused, when trashing and restoring.
+    pub fallbacks: Fallbacks,
+    /// Places trashing keeps out of, recognised before touching them:
+    /// [`Context::trash`], [`Context::trash_into`] and [`Context::plan`]
+    /// refuse sources there and never use or probe trash directories
+    /// there. Listing, restoring and erasing are not affected.
+    pub exclusions: Exclusions,
 }
 
 impl Default for Policy {
@@ -37,6 +47,8 @@ impl Default for Policy {
             private_volume_trash: true,
             unchecked_sticky: Vec::new(),
             absolute_paths: AbsolutePaths::default(),
+            fallbacks: Fallbacks::default(),
+            exclusions: Exclusions::default(),
         }
     }
 }
@@ -161,6 +173,7 @@ impl Context {
         for path in &mut policy.unchecked_sticky {
             *path = self.cwd.join(&*path);
         }
+        policy.exclusions = policy.exclusions.anchored(&self.cwd);
         self.policy = policy;
         self
     }

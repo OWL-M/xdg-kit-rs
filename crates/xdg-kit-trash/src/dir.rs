@@ -17,6 +17,7 @@ use crate::context::Context;
 use crate::info::AbsolutePaths;
 use crate::limits::Limits;
 use crate::sys::{self, FileKind, Ident, Meta};
+use crate::transfer::Fallbacks;
 
 /// The three kinds of trash directory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -263,6 +264,7 @@ pub struct Trash {
     pub(crate) id: Ident,
     pub(crate) uid: u32,
     pub(crate) absolute_paths: Option<AbsolutePaths>,
+    pub(crate) fallbacks: Fallbacks,
     pub(crate) limits: Limits,
 }
 
@@ -357,7 +359,7 @@ pub(crate) fn walk(context: &Context, dir: &TrashDir, mode: Mode) -> Result<Walk
                 && mode == Mode::Create
                 && dir.kind == TrashKind::Home =>
         {
-            match xdg_kit_basedir::create_dir_all_synced(base, 0o700) {
+            match sys::create_dir_all(base) {
                 Ok(xdg_kit_basedir::Durability::Synced) => {}
                 Ok(xdg_kit_basedir::Durability::NotSynced(err)) => {
                     unsynced = unsynced.or(Some(err));
@@ -431,6 +433,7 @@ pub(crate) fn walk(context: &Context, dir: &TrashDir, mode: Mode) -> Result<Walk
             id,
             uid: dir.uid,
             absolute_paths,
+            fallbacks: context.policy.fallbacks,
             limits: context.limits.clone(),
         },
         unsynced,

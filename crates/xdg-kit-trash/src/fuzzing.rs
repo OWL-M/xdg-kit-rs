@@ -81,3 +81,41 @@ pub fn mountinfo(bytes: &[u8]) {
         assert!(mounts.iter().all(|mount| mount.mount_point.is_absolute()));
     }
 }
+
+/// Checks `bytes` as a path against fixed exclusions: never panics, and
+/// the answer does not change when separators are repeated or `.` added.
+pub fn exclusions(bytes: &[u8]) {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    use crate::Exclusions;
+
+    let rules = Exclusions::new()
+        .mount("/a", "a")
+        .subtree("/b/c", "c")
+        .with_mount_points(["/a".into(), "/a/n".into(), "/b".into()])
+        .anchored(Path::new("/"));
+    let mut path = b"/".to_vec();
+    path.extend_from_slice(bytes);
+    let plain = rules.check(Path::new(OsStr::from_bytes(&path))).is_ok();
+    let doubled: Vec<u8> = path
+        .iter()
+        .flat_map(|&byte| {
+            if byte == b'/' {
+                vec![b'/', b'/']
+            } else {
+                vec![byte]
+            }
+        })
+        .collect();
+    assert_eq!(
+        rules.check(Path::new(OsStr::from_bytes(&doubled))).is_ok(),
+        plain
+    );
+    let mut dotted = b"/./".to_vec();
+    dotted.extend_from_slice(bytes);
+    assert_eq!(
+        rules.check(Path::new(OsStr::from_bytes(&dotted))).is_ok(),
+        plain
+    );
+}

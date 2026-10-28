@@ -36,7 +36,8 @@ use crate::dir::Trash;
 use crate::fault::{self, Stage};
 use crate::insert::Unsupported;
 use crate::list::{Entry, Metadata, Origin, Payload, UnknownOrigin, info_name};
-use crate::sys::{self, FileKind, Ident, Place, RenameError, Sameness};
+use crate::sys::{self, FileKind, Ident, Place, Sameness};
+use crate::transfer::{MoveMethod, PartialState, TransferError, TransferErrorKind, transfer};
 
 /// What no longer matches the listed entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,6 +145,8 @@ pub struct Restored {
     pub destination: PathBuf,
     /// The directories created above it, outermost first.
     pub created: Vec<PathBuf>,
+    /// How the payload was moved.
+    pub method: MoveMethod,
     /// What became of the trash info file.
     pub metadata: MetadataRemoval,
     /// Whether the move is known to survive a crash (`files`, the
@@ -152,14 +155,16 @@ pub struct Restored {
 }
 
 /// Why a restore did not happen: the payload is still in the trash, with
-/// its trash info file.
+/// its trash info file (under [`RestoreFailure::Partial`], also at the
+/// destination).
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct RestoreError {
     /// What went wrong.
     pub failure: RestoreFailure,
-    /// Directories created for the destination that could not be removed
-    /// again (they are empty, or were filled by someone else meanwhile).
+    /// Directories made for the destination that could not be removed
+    /// again — parents created, or a placeholder at the destination itself
+    /// — (they are empty, or were filled by someone else meanwhile).
     pub left_behind: Vec<PathBuf>,
 }
 
@@ -194,6 +199,22 @@ pub enum RestoreFailure {
     CrossDevice(PathBuf),
     /// The move failed otherwise.
     Move(io::Error),
+    /// The link fallback made a link at the destination, then could
+    /// neither complete the move (`error`) nor undo it (`rollback`); the
+    /// trash info file is kept. Under [`PartialState::Duplicated`] one file
+    /// has both names (verified) and removing either loses nothing; under
+    /// [`PartialState::Unverified`] a name holds a file not known to be the
+    /// payload: nothing was removed, inspect both before removing anything.
+    Partial {
+        /// The destination linked to.
+        destination: PathBuf,
+        /// What the two names hold.
+        state: PartialState,
+        /// Why the name in `files` was not removed.
+        error: io::Error,
+        /// Why the move was not undone.
+        rollback: io::Error,
+    },
 }
 
 impl fmt::Display for RestoreError {
@@ -213,6 +234,28 @@ impl fmt::Display for RestoreError {
                 write!(f, "{} is on another mount than the trash", path.display())
             }
             RestoreFailure::Move(err) => write!(f, "cannot move the payload: {err}"),
+            RestoreFailure::Partial {
+                destination,
+                state: PartialState::Duplicated,
+                error,
+                rollback,
+            } => write!(
+                f,
+                "the payload is both at {} and in the trash (verified): the restore could not \
+                 complete ({error}) nor be undone ({rollback})",
+                destination.display()
+            ),
+            RestoreFailure::Partial {
+                destination,
+                error,
+                rollback,
+                ..
+            } => write!(
+                f,
+                "the restore to {} could not complete ({error}) nor be undone ({rollback}), and \
+                 what the destination and the trash hold is not verified: nothing was removed",
+                destination.display()
+            ),
         }
     }
 }
@@ -236,16 +279,25 @@ impl Trash {
     /// destination are removed again if the move fails, when still the
     /// ones created and empty.
     ///
+    /// The move is the one trashing makes, the other way: the native
+    /// non-replacing rename, else the fallbacks of the policy the trash was
+    /// opened with ([`Policy::fallbacks`](crate::Policy::fallbacks)). One
+    /// difference: the destination's directory is the user's, possibly
+    /// writable by others, so the placeholder fallback's window (see
+    /// [`Fallbacks`](crate::Fallbacks)) is open to more processes than in `files`.
+    ///
     /// # Errors
     ///
-    /// See [`RestoreFailure`]; the payload stays in the trash.
+    /// See [`RestoreFailure`]; the payload stays in the trash (under
+    /// [`RestoreFailure::Partial`], it is also at the destination).
     pub fn restore(
         &self,
         entry: &Entry,
         options: &RestoreOptions,
     ) -> Result<Restored, RestoreError> {
         let mut created = Vec::new();
-        let result = self.restore_with(entry, options, &mut created);
+        let mut placeholder = Vec::new();
+        let result = self.restore_with(entry, options, &mut created, &mut placeholder);
         match result {
             Ok(mut restored) => {
                 restored.created = created.into_iter().map(|dir| dir.path).collect();
@@ -262,6 +314,7 @@ impl Trash {
                     }
                 }
                 left_behind.reverse();
+                left_behind.extend(placeholder);
                 Err(RestoreError {
                     failure,
                     left_behind,
@@ -275,16 +328,12 @@ impl Trash {
         entry: &Entry,
         options: &RestoreOptions,
         created: &mut Vec<Created>,
+        left_behind: &mut Vec<PathBuf>,
     ) -> Result<Restored, RestoreFailure> {
-        if !sys::NO_REPLACE_RENAME {
-            return Err(RestoreFailure::Unsupported(Unsupported {
-                operation: "restoring",
-                cause: None,
-            }));
-        }
-        if !matches!(entry.payload, Payload::Present(_)) {
+        let (Payload::Present(kind), Some(payload)) = (&entry.payload, entry.seen.payload) else {
             return Err(RestoreFailure::PayloadMissing);
-        }
+        };
+        let kind = *kind;
         let destination = match (&options.destination, &entry.origin) {
             (Some(path), _) | (None, Origin::Known(path)) => path.clone(),
             (None, Origin::Unknown(why)) => return Err(RestoreFailure::OriginUnknown(why.clone())),
@@ -311,32 +360,57 @@ impl Trash {
         let parent_fd = open_parent(parent, options.create_parents, created)?;
         self.verify(entry).map_err(RestoreFailure::Changed)?;
         let moved = if fault::hits(Stage::Restore) {
-            Err(RenameError::Other(io::Error::other(
-                "injected failure at Restore",
-            )))
+            Err(TransferError {
+                kind: TransferErrorKind::Other(io::Error::other("injected failure at Restore")),
+                left: None,
+            })
         } else {
-            sys::rename_no_replace(self.files(), &entry.name, parent_fd.as_fd(), name)
+            transfer(
+                self.files(),
+                &entry.name,
+                parent_fd.as_fd(),
+                name,
+                kind,
+                payload,
+                self.fallbacks,
+            )
         };
-        match moved {
-            Ok(()) => {}
-            Err(RenameError::Exists) => return Err(RestoreFailure::Conflict(destination)),
-            Err(RenameError::CrossDevice) => return Err(RestoreFailure::CrossDevice(destination)),
-            Err(RenameError::Unsupported(cause)) => {
-                return Err(RestoreFailure::Unsupported(Unsupported {
-                    operation: "restoring",
-                    cause,
-                }));
-            }
-            Err(RenameError::Other(err)) => {
-                return Err(
-                    if matches!(sys::lookup_at(self.files(), &entry.name), Ok(None)) {
-                        RestoreFailure::Changed(Changed::Payload)
-                    } else {
-                        RestoreFailure::Move(err)
+        let method = match moved {
+            Ok(method) => method,
+            Err(error) => {
+                if error.left.is_some() {
+                    left_behind.push(destination.clone());
+                }
+                return Err(match error.kind {
+                    TransferErrorKind::Exists => RestoreFailure::Conflict(destination),
+                    TransferErrorKind::CrossDevice => RestoreFailure::CrossDevice(destination),
+                    TransferErrorKind::Unsupported(cause) => {
+                        RestoreFailure::Unsupported(Unsupported {
+                            operation: "restoring",
+                            cause,
+                        })
+                    }
+                    TransferErrorKind::Partial {
+                        error,
+                        rollback,
+                        state,
+                        ..
+                    } => RestoreFailure::Partial {
+                        destination,
+                        state,
+                        error,
+                        rollback,
                     },
-                );
+                    TransferErrorKind::Other(err) => {
+                        if matches!(sys::lookup_at(self.files(), &entry.name), Ok(None)) {
+                            RestoreFailure::Changed(Changed::Payload)
+                        } else {
+                            RestoreFailure::Move(err)
+                        }
+                    }
+                });
             }
-        }
+        };
         let mut durability = Durability::Synced;
         let mut dirs: Vec<BorrowedFd<'_>> = vec![self.files(), parent_fd.as_fd()];
         dirs.extend(created.iter().map(|dir| dir.parent.as_fd()));
@@ -350,6 +424,7 @@ impl Trash {
         Ok(Restored {
             destination,
             created: Vec::new(),
+            method,
             metadata: self.remove_metadata(entry),
             durability,
         })

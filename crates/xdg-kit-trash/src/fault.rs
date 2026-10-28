@@ -21,6 +21,50 @@ pub(crate) enum Stage {
     SourceVanishes,
     /// Moving the payload into `files` (another mount).
     MoveCrossDevice,
+    /// The native non-replacing rename, refused as unsupported (`EINVAL`).
+    NativeRefused,
+    /// The link fallback's `linkat`, refused (`EPERM`).
+    LinkRefused,
+    /// Between the link and removing the source, the source name is given
+    /// to another file (by "another process").
+    ReplaceSource,
+    /// Right after the link, its name is given to another file.
+    ReplaceLinked,
+    /// Right after the link, its name is given to another hard link of
+    /// what the source (a symbolic link) points to.
+    ReplaceLinkedWithTarget,
+    /// Right after the link (or before a placeholder is checked again),
+    /// the destination's directory loses search permission: what was made
+    /// there cannot be inspected.
+    RevokeDestinationSearch,
+    /// Syncing `files` after the link, before the source name goes.
+    SyncLink,
+    /// Removing the source name after linking it.
+    UnlinkSource,
+    /// Before removing a link again, its name is given to another file.
+    ReplaceDuringRollback,
+    /// Removing a link again.
+    Rollback,
+    /// Between the link and removing the source, the source's directory
+    /// loses search permission: the source can be neither removed nor
+    /// inspected.
+    RevokeSourceSearch,
+    /// Before the rename over a placeholder, a file is put into it.
+    FillPlaceholder,
+    /// Before the rename over a placeholder, it is replaced by another
+    /// empty directory.
+    ReplacePlaceholder,
+    /// Removing a placeholder again.
+    RemovePlaceholder,
+    /// The rename over a placeholder fails (`EIO`).
+    PlaceholderRename,
+    /// Right before the move, another process takes the reserved name in
+    /// `files` with a regular file.
+    TakeNameFile,
+    /// … with a directory.
+    TakeNameDir,
+    /// … with a dangling symbolic link.
+    TakeNameLink,
     /// Removing a reservation after a failure.
     RemoveReservation,
     /// Syncing `files` and the source's directory after the move.

@@ -706,7 +706,7 @@ mod trashing {
         ] {
             let attempts = fails_cleanly(&[(stage, 0)]);
             assert_eq!(attempts.len(), 1, "{stage:?}");
-            assert!(attempts[0].leftover.is_none());
+            assert!(attempts[0].leftovers.is_empty());
             let expected = match stage {
                 Stage::Move => matches!(attempts[0].failure, AttemptFailure::Move(_)),
                 _ => matches!(attempts[0].failure, AttemptFailure::Metadata(_)),
@@ -726,7 +726,7 @@ mod trashing {
         let Err(TrashError::NoTrash { attempts, .. }) = fx.context.trash(&source) else {
             panic!()
         };
-        let leftover = attempts[0].leftover.as_ref().unwrap();
+        let leftover = attempts[0].leftovers.first().unwrap();
         assert_eq!(leftover.path, fx.trash().join("info/f.trashinfo"));
         assert!(leftover.path.exists());
         assert!(source.exists());
@@ -746,7 +746,7 @@ mod trashing {
         };
         let last = attempts.last().unwrap();
         assert!(matches!(last.failure, AttemptFailure::SourceGone));
-        let leftover = last.leftover.as_ref().unwrap();
+        let leftover = last.leftovers.first().unwrap();
         assert_eq!(leftover.path, fx.trash().join("info/f.trashinfo"));
         assert!(leftover.path.exists());
         // Without the cleanup failure, nothing is left.
@@ -756,7 +756,7 @@ mod trashing {
         let Err(TrashError::SourceMissing { attempts, .. }) = fx.context.trash(&source) else {
             panic!()
         };
-        assert!(attempts.last().unwrap().leftover.is_none());
+        assert!(attempts.last().unwrap().leftovers.is_empty());
         assert_eq!(names(&fx.trash().join("info")), Vec::<OsString>::new());
     }
 
@@ -2696,5 +2696,1032 @@ mod planning {
             })
         ));
         assert_eq!(snapshot(&fx.root), before);
+    }
+}
+
+mod fallbacks {
+    use super::*;
+
+    /// Refuses the native non-replacing rename the next `times` times on
+    /// this thread, as a file system without it would.
+    fn refuse_native(times: usize) {
+        for _ in 0..times {
+            fault::fail(Stage::NativeRefused, 0);
+        }
+    }
+
+    fn with(fx: &Fx, fallbacks: Fallbacks) -> Context {
+        fx.context.clone().with_policy(Policy {
+            fallbacks,
+            ..Policy::default()
+        })
+    }
+
+    fn info_names(fx: &Fx) -> Vec<OsString> {
+        names(&fx.trash().join("info"))
+    }
+
+    fn file_names(fx: &Fx) -> Vec<OsString> {
+        names(&fx.trash().join("files"))
+    }
+
+    #[test]
+    fn the_native_rename_is_preferred() {
+        let fx = Fx::new();
+        let trashed = fx.context.trash(fx.file("f", "f")).unwrap();
+        assert_eq!(trashed.method, MoveMethod::Rename);
+        assert!(trashed.method.is_atomic());
+    }
+
+    #[test]
+    fn a_file_is_linked_then_unlinked() {
+        let fx = Fx::new();
+        let source = fx.file("f", "data");
+        refuse_native(1);
+        let trashed = fx.context.trash(&source).unwrap();
+        assert_eq!(trashed.method, MoveMethod::Link);
+        assert!(!trashed.method.is_atomic());
+        assert!(matches!(trashed.durability, Durability::Synced));
+        assert!(!source.exists());
+        assert_eq!(
+            fs::read_to_string(fx.trash().join("files/f")).unwrap(),
+            "data"
+        );
+        assert_eq!(fs::metadata(fx.trash().join("files/f")).unwrap().nlink(), 1);
+        assert_eq!(info_names(&fx), ["f.trashinfo"]);
+    }
+
+    #[test]
+    fn a_symbolic_link_is_linked_as_itself() {
+        let fx = Fx::new();
+        let target = fx.file("target", "keep");
+        symlink(&target, fx.work.join("link")).unwrap();
+        refuse_native(1);
+        let trashed = fx.context.trash(fx.work.join("link")).unwrap();
+        assert_eq!(trashed.method, MoveMethod::Link);
+        assert_eq!(
+            fs::read_link(fx.trash().join("files/link")).unwrap(),
+            target
+        );
+        assert!(fs::symlink_metadata(fx.work.join("link")).is_err());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "keep");
+    }
+
+    #[test]
+    fn a_directory_needs_the_placeholder_opt_in() {
+        let fx = Fx::new();
+        fs::create_dir_all(fx.work.join("d/sub")).unwrap();
+        fs::write(fx.work.join("d/sub/x"), "x").unwrap();
+        refuse_native(1);
+        let Err(TrashError::Unsupported { unsupported, .. }) = fx.context.trash(fx.work.join("d"))
+        else {
+            panic!()
+        };
+        assert!(unsupported.cause.is_some());
+        assert_eq!(fs::read_to_string(fx.work.join("d/sub/x")).unwrap(), "x");
+        assert_eq!(info_names(&fx), Vec::<OsString>::new());
+        assert_eq!(file_names(&fx), Vec::<OsString>::new());
+        // Strict: not even files.
+        refuse_native(1);
+        assert!(matches!(
+            with(&fx, Fallbacks::Native).trash(fx.file("f", "f")),
+            Err(TrashError::Unsupported { .. })
+        ));
+        assert!(fx.work.join("f").exists());
+        // Opted in: over a placeholder.
+        refuse_native(1);
+        let trashed = with(&fx, Fallbacks::LinkAndPlaceholder)
+            .trash(fx.work.join("d"))
+            .unwrap();
+        assert_eq!(trashed.method, MoveMethod::Placeholder);
+        assert_eq!(
+            fs::read_to_string(fx.trash().join("files/d/sub/x")).unwrap(),
+            "x"
+        );
+        assert!(!fx.work.join("d").exists());
+    }
+
+    #[test]
+    fn names_taken_meanwhile_are_never_replaced() {
+        for (stage, directory) in [
+            (Stage::TakeNameFile, false),
+            (Stage::TakeNameDir, false),
+            (Stage::TakeNameLink, false),
+            (Stage::TakeNameFile, true),
+            (Stage::TakeNameDir, true),
+            (Stage::TakeNameLink, true),
+        ] {
+            let fx = Fx::new();
+            let source = if directory {
+                fs::create_dir(fx.work.join("p")).unwrap();
+                fs::write(fx.work.join("p/inner"), "inner").unwrap();
+                fx.work.join("p")
+            } else {
+                fx.file("p", "payload")
+            };
+            refuse_native(2);
+            fault::fail(stage, 0);
+            let trashed = with(&fx, Fallbacks::LinkAndPlaceholder)
+                .trash(&source)
+                .unwrap_or_else(|err| panic!("{stage:?} {directory}: {err}"));
+            assert_eq!(trashed.name, "p.2", "{stage:?} {directory}");
+            let taken = fx.trash().join("files/p");
+            let meta = fs::symlink_metadata(&taken).unwrap();
+            match stage {
+                Stage::TakeNameFile => assert_eq!(meta.len(), 0, "the intruding file is untouched"),
+                Stage::TakeNameDir => assert!(fs::read_dir(&taken).unwrap().next().is_none()),
+                _ => assert_eq!(fs::read_link(&taken).unwrap(), Path::new("/nonexistent")),
+            }
+            let moved = fx.trash().join("files/p.2");
+            if directory {
+                assert_eq!(fs::read_to_string(moved.join("inner")).unwrap(), "inner");
+            } else {
+                assert_eq!(fs::read_to_string(moved).unwrap(), "payload");
+            }
+            assert_eq!(info_names(&fx), ["p.2.trashinfo"], "{stage:?} {directory}");
+        }
+    }
+
+    #[test]
+    fn a_placeholder_filled_meanwhile_loses_nothing() {
+        let fx = Fx::new();
+        fs::create_dir(fx.work.join("d")).unwrap();
+        fs::write(fx.work.join("d/x"), "x").unwrap();
+        refuse_native(1);
+        fault::fail(Stage::FillPlaceholder, 0);
+        let Err(TrashError::NoTrash { attempts, .. }) =
+            with(&fx, Fallbacks::LinkAndPlaceholder).trash(fx.work.join("d"))
+        else {
+            panic!()
+        };
+        assert_eq!(
+            fs::read_to_string(fx.work.join("d/x")).unwrap(),
+            "x",
+            "the source is intact"
+        );
+        assert!(matches!(&attempts[0].failure,
+            AttemptFailure::Move(err) if err.kind() == std::io::ErrorKind::AlreadyExists));
+        let leftover = &attempts[0].leftovers[0];
+        assert_eq!(leftover.kind, LeftoverKind::Placeholder);
+        assert_eq!(leftover.path, fx.trash().join("files/d"));
+        assert!(
+            fx.trash().join("files/d/intruder").exists(),
+            "what was put there stays"
+        );
+        assert_eq!(
+            info_names(&fx),
+            Vec::<OsString>::new(),
+            "the reservation went"
+        );
+    }
+
+    #[test]
+    fn a_replaced_placeholder_is_left_to_its_owner() {
+        let fx = Fx::new();
+        fs::create_dir(fx.work.join("d")).unwrap();
+        fs::write(fx.work.join("d/x"), "x").unwrap();
+        refuse_native(2);
+        fault::fail(Stage::ReplacePlaceholder, 0);
+        let trashed = with(&fx, Fallbacks::LinkAndPlaceholder)
+            .trash(fx.work.join("d"))
+            .unwrap();
+        assert_eq!(trashed.name, "d.2");
+        assert!(
+            fs::read_dir(fx.trash().join("files/d"))
+                .unwrap()
+                .next()
+                .is_none()
+        );
+        assert_eq!(
+            fs::read_to_string(fx.trash().join("files/d.2/x")).unwrap(),
+            "x"
+        );
+    }
+
+    #[test]
+    fn placeholder_cleanup_and_its_failure() {
+        for cleanup_fails in [false, true] {
+            let fx = Fx::new();
+            fs::create_dir(fx.work.join("d")).unwrap();
+            refuse_native(1);
+            fault::fail(Stage::PlaceholderRename, 0);
+            if cleanup_fails {
+                fault::fail(Stage::RemovePlaceholder, 0);
+            }
+            let Err(TrashError::NoTrash { attempts, .. }) =
+                with(&fx, Fallbacks::LinkAndPlaceholder).trash(fx.work.join("d"))
+            else {
+                panic!()
+            };
+            assert!(fx.work.join("d").is_dir());
+            assert!(matches!(attempts[0].failure, AttemptFailure::Move(_)));
+            assert_eq!(info_names(&fx), Vec::<OsString>::new());
+            if cleanup_fails {
+                assert_eq!(attempts[0].leftovers.len(), 1);
+                assert!(fx.trash().join("files/d").is_dir(), "reported, left");
+            } else {
+                assert!(attempts[0].leftovers.is_empty());
+                assert_eq!(file_names(&fx), Vec::<OsString>::new());
+            }
+        }
+    }
+
+    #[test]
+    fn a_refused_link_is_unsupported() {
+        let fx = Fx::new();
+        let source = fx.file("f", "f");
+        refuse_native(1);
+        fault::fail(Stage::LinkRefused, 0);
+        let Err(TrashError::Unsupported { unsupported, .. }) = fx.context.trash(&source) else {
+            panic!()
+        };
+        assert_eq!(
+            unsupported.cause.unwrap().raw_os_error(),
+            Some(rustix::io::Errno::PERM.raw_os_error())
+        );
+        assert!(source.exists());
+        assert_eq!(info_names(&fx), Vec::<OsString>::new());
+    }
+
+    #[test]
+    fn a_failed_unlink_is_rolled_back() {
+        let fx = Fx::new();
+        let source = fx.file("f", "data");
+        refuse_native(1);
+        fault::fail(Stage::UnlinkSource, 0);
+        let Err(TrashError::NoTrash { attempts, .. }) = fx.context.trash(&source) else {
+            panic!()
+        };
+        assert!(matches!(attempts[0].failure, AttemptFailure::Move(_)));
+        assert_eq!(fs::read_to_string(&source).unwrap(), "data");
+        assert_eq!(fs::metadata(&source).unwrap().nlink(), 1, "the link went");
+        assert_eq!(file_names(&fx), Vec::<OsString>::new());
+        assert_eq!(info_names(&fx), Vec::<OsString>::new());
+    }
+
+    #[test]
+    fn a_failed_rollback_is_partial_and_final() {
+        // Two candidates: after a partial move, the second is not tried.
+        let fx = Fx::new();
+        let top = fx.root.join("vol");
+        fs::create_dir(&top).unwrap();
+        fs::create_dir(top.join(".Trash")).unwrap();
+        fs::set_permissions(top.join(".Trash"), fs::Permissions::from_mode(0o1777)).unwrap();
+        fs::write(top.join("f"), "data").unwrap();
+        fault::pretend_volume(&top);
+        refuse_native(1);
+        fault::fail(Stage::UnlinkSource, 0);
+        fault::fail(Stage::Rollback, 0);
+        let Err(TrashError::Partial(partial)) = fx.context.trash(top.join("f")) else {
+            panic!()
+        };
+        let (trash, name, state) = (partial.trash, partial.name, partial.state);
+        assert_eq!(state, PartialState::Duplicated);
+        assert_eq!(trash.kind(), TrashKind::Shared);
+        let linked = trash.path().join("files").join(&name);
+        assert_eq!(fs::read_to_string(top.join("f")).unwrap(), "data");
+        assert_eq!(
+            fs::metadata(&linked).unwrap().ino(),
+            fs::metadata(top.join("f")).unwrap().ino(),
+            "one file, two names"
+        );
+        assert!(
+            trash.path().join("info/f.trashinfo").exists(),
+            "the entry is complete"
+        );
+        assert!(
+            !top.join(format!(".Trash-{}", uid())).exists(),
+            "no second copy"
+        );
+    }
+
+    #[test]
+    fn a_name_replaced_during_rollback_is_kept() {
+        let fx = Fx::new();
+        let source = fx.file("f", "data");
+        refuse_native(1);
+        fault::fail(Stage::UnlinkSource, 0);
+        fault::fail(Stage::ReplaceDuringRollback, 0);
+        let Err(TrashError::Partial(partial)) = fx.context.trash(&source) else {
+            panic!()
+        };
+        let (rollback, state) = (partial.rollback, partial.state);
+        assert_eq!(
+            state,
+            PartialState::Unverified,
+            "the destination is not the payload"
+        );
+        assert_eq!(rollback.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(&source).unwrap(), "data");
+        assert_eq!(
+            fs::metadata(fx.trash().join("files/f")).unwrap().len(),
+            0,
+            "the file put there meanwhile is not removed"
+        );
+        assert_eq!(
+            info_names(&fx),
+            Vec::<OsString>::new(),
+            "no trash info file for what is not the payload"
+        );
+    }
+
+    #[test]
+    fn a_link_replaced_right_after_it_was_made_is_kept() {
+        let fx = Fx::new();
+        let source = fx.file("f", "data");
+        refuse_native(1);
+        fault::fail(Stage::ReplaceLinked, 0);
+        let Err(TrashError::Partial(partial)) = fx.context.trash(&source) else {
+            panic!()
+        };
+        let state = partial.state;
+        assert_eq!(state, PartialState::Unverified);
+        assert_eq!(
+            fs::read_to_string(&source).unwrap(),
+            "data",
+            "the source is untouched"
+        );
+        assert_eq!(
+            fs::metadata(fx.trash().join("files/f")).unwrap().len(),
+            0,
+            "the replacement is not removed"
+        );
+        assert_eq!(info_names(&fx), Vec::<OsString>::new());
+    }
+
+    #[test]
+    fn a_source_replaced_after_the_link_leaves_the_payload_trashed() {
+        // The source name now holds another file, which stays; the payload,
+        // whose only name is the link, stays trashed rather than be lost to
+        // a rollback.
+        let fx = Fx::new();
+        let source = fx.file("f", "data");
+        refuse_native(1);
+        fault::fail(Stage::ReplaceSource, 0);
+        let trashed = fx.context.trash(&source).unwrap();
+        assert_eq!(trashed.method, MoveMethod::Link);
+        assert_eq!(
+            fs::read_to_string(fx.trash().join("files/f")).unwrap(),
+            "data"
+        );
+        assert_eq!(
+            fs::metadata(&source).unwrap().len(),
+            0,
+            "the newcomer stays"
+        );
+        assert_eq!(info_names(&fx), ["f.trashinfo"]);
+    }
+
+    #[test]
+    fn the_link_is_synced_before_the_source_goes() {
+        let fx = Fx::new();
+        let source = fx.file("f", "data");
+        refuse_native(1);
+        fault::fail(Stage::SyncLink, 0);
+        let Err(TrashError::NoTrash { attempts, .. }) = fx.context.trash(&source) else {
+            panic!()
+        };
+        assert!(matches!(attempts[0].failure, AttemptFailure::Move(_)));
+        assert_eq!(fs::read_to_string(&source).unwrap(), "data");
+        assert_eq!(
+            fs::metadata(&source).unwrap().nlink(),
+            1,
+            "the link was undone"
+        );
+        assert_eq!(file_names(&fx), Vec::<OsString>::new());
+    }
+
+    #[test]
+    fn an_uninspectable_source_is_no_completed_move() {
+        // Both names still exist; the source's directory cannot be searched:
+        // neither removed nor taken as gone, and the trash entry kept.
+        unprivileged(|| {
+            let fx = Fx::new();
+            let source = fx.file("f", "data");
+            refuse_native(1);
+            fault::fail(Stage::RevokeSourceSearch, 0);
+            let result = fx.context.trash(&source);
+            fs::set_permissions(&fx.work, fs::Permissions::from_mode(0o755)).unwrap();
+            let Err(TrashError::Partial(partial)) = result else {
+                panic!("{result:?}")
+            };
+            assert_eq!(partial.state, PartialState::Unverified);
+            assert!(partial.metadata_kept);
+            assert_eq!(fs::read_to_string(&source).unwrap(), "data");
+            assert_eq!(
+                fs::read_to_string(fx.trash().join("files/f")).unwrap(),
+                "data"
+            );
+            assert_eq!(info_names(&fx), ["f.trashinfo"]);
+        });
+    }
+
+    #[test]
+    fn an_uninspectable_link_keeps_its_metadata() {
+        unprivileged(|| {
+            let fx = Fx::new();
+            let source = fx.file("f", "data");
+            refuse_native(1);
+            fault::fail(Stage::RevokeDestinationSearch, 0);
+            let result = fx.context.trash(&source);
+            fs::set_permissions(fx.trash().join("files"), fs::Permissions::from_mode(0o700))
+                .unwrap();
+            let Err(TrashError::Partial(partial)) = result else {
+                panic!("{result:?}")
+            };
+            assert_eq!(partial.state, PartialState::Unverified);
+            assert!(partial.metadata_kept, "the name may hold the payload");
+            assert_eq!(info_names(&fx), ["f.trashinfo"]);
+            assert_eq!(fs::read_to_string(&source).unwrap(), "data");
+            assert_eq!(
+                fs::read_to_string(fx.trash().join("files/f")).unwrap(),
+                "data"
+            );
+        });
+    }
+
+    #[test]
+    fn a_target_link_in_place_of_the_symlink_is_kept() {
+        // Another process's hard link to the symbolic link's target, where
+        // the link was made: not known to be ours, not removed.
+        let fx = Fx::new();
+        let target = fx.file("target", "keep");
+        symlink(&target, fx.work.join("link")).unwrap();
+        refuse_native(1);
+        fault::fail(Stage::ReplaceLinkedWithTarget, 0);
+        let Err(TrashError::Partial(partial)) = fx.context.trash(fx.work.join("link")) else {
+            panic!()
+        };
+        assert_eq!(partial.state, PartialState::Unverified);
+        assert_eq!(
+            fs::metadata(&target).unwrap().nlink(),
+            2,
+            "the other link stays"
+        );
+        assert_eq!(
+            fs::metadata(fx.trash().join("files/link")).unwrap().ino(),
+            fs::metadata(&target).unwrap().ino()
+        );
+        assert_eq!(fs::read_link(fx.work.join("link")).unwrap(), target);
+        assert!(
+            !partial.metadata_kept,
+            "the name is confirmed not the payload"
+        );
+        assert_eq!(info_names(&fx), Vec::<OsString>::new());
+    }
+
+    #[test]
+    fn restore_never_takes_an_uninspectable_trash_for_done() {
+        unprivileged(|| {
+            let fx = Fx::new();
+            let _ = fx.context.trash(fx.file("f", "data")).unwrap();
+            let trash = fx.open_home();
+            let entry = entries(&trash).remove(0);
+            refuse_native(1);
+            fault::fail(Stage::RevokeSourceSearch, 0);
+            let result = trash.restore(&entry, &RestoreOptions::default());
+            fs::set_permissions(fx.trash().join("files"), fs::Permissions::from_mode(0o700))
+                .unwrap();
+            let err = result.unwrap_err();
+            assert!(
+                matches!(
+                    err.failure,
+                    RestoreFailure::Partial {
+                        state: PartialState::Unverified,
+                        ..
+                    }
+                ),
+                "{err}"
+            );
+            assert!(
+                fx.trash().join("info/f.trashinfo").exists(),
+                "the metadata stays"
+            );
+            assert!(fx.trash().join("files/f").exists());
+            assert!(fx.work.join("f").exists());
+        });
+    }
+
+    #[test]
+    fn an_uninspectable_placeholder_is_reported() {
+        unprivileged(|| {
+            let fx = Fx::new();
+            fs::create_dir(fx.work.join("d")).unwrap();
+            fs::write(fx.work.join("d/x"), "x").unwrap();
+            refuse_native(1);
+            fault::fail(Stage::RevokeDestinationSearch, 0);
+            let result = with(&fx, Fallbacks::LinkAndPlaceholder).trash(fx.work.join("d"));
+            fs::set_permissions(fx.trash().join("files"), fs::Permissions::from_mode(0o700))
+                .unwrap();
+            let Err(TrashError::NoTrash { attempts, .. }) = result else {
+                panic!("{result:?}")
+            };
+            let placeholder = attempts[0]
+                .leftovers
+                .iter()
+                .find(|leftover| leftover.kind == LeftoverKind::Placeholder)
+                .expect("the placeholder left is reported");
+            assert_eq!(placeholder.path, fx.trash().join("files/d"));
+            assert!(
+                fs::read_dir(&placeholder.path).unwrap().next().is_none(),
+                "still empty"
+            );
+            assert_eq!(fs::read_to_string(fx.work.join("d/x")).unwrap(), "x");
+        });
+    }
+
+    #[test]
+    fn other_failures_are_not_fallback_attempts() {
+        unprivileged(|| {
+            let fx = Fx::new();
+            let source = fx.file("ro/f", "data");
+            fs::set_permissions(fx.work.join("ro"), fs::Permissions::from_mode(0o555)).unwrap();
+            let result = fx.context.trash(&source);
+            fs::set_permissions(fx.work.join("ro"), fs::Permissions::from_mode(0o755)).unwrap();
+            let Err(TrashError::NoTrash { attempts, .. }) = result else {
+                panic!("{result:?}")
+            };
+            assert!(
+                matches!(&attempts[0].failure, AttemptFailure::Move(err) if err.kind() == std::io::ErrorKind::PermissionDenied)
+            );
+            assert_eq!(file_names(&fx), Vec::<OsString>::new(), "no link was tried");
+            assert_eq!(fs::metadata(&source).unwrap().nlink(), 1);
+        });
+    }
+
+    #[test]
+    fn durability_after_a_link_is_reported() {
+        let fx = Fx::new();
+        refuse_native(1);
+        fault::fail(Stage::SyncAfterMove, 0);
+        let trashed = fx.context.trash(fx.file("f", "f")).unwrap();
+        assert_eq!(trashed.method, MoveMethod::Link);
+        assert!(matches!(trashed.durability, Durability::NotSynced(_)));
+    }
+
+    #[test]
+    fn restoring_through_the_fallbacks() {
+        let fx = Fx::new();
+        let _ = fx.context.trash(fx.file("f", "data")).unwrap();
+        let trash = fx.open_home();
+        let entry = entries(&trash).remove(0);
+        // A conflict is never replaced, by the link either.
+        fs::write(fx.work.join("f"), "new").unwrap();
+        refuse_native(1);
+        let err = trash
+            .restore(&entry, &RestoreOptions::default())
+            .unwrap_err();
+        assert!(matches!(err.failure, RestoreFailure::Conflict(_)));
+        assert_eq!(fs::read_to_string(fx.work.join("f")).unwrap(), "new");
+        fs::remove_file(fx.work.join("f")).unwrap();
+        // Partial: both names, the entry kept.
+        refuse_native(1);
+        fault::fail(Stage::UnlinkSource, 0);
+        fault::fail(Stage::Rollback, 0);
+        let err = trash
+            .restore(&entry, &RestoreOptions::default())
+            .unwrap_err();
+        assert!(
+            matches!(
+                err.failure,
+                RestoreFailure::Partial {
+                    state: PartialState::Duplicated,
+                    ..
+                }
+            ),
+            "{err}"
+        );
+        assert!(fx.work.join("f").exists() && fx.trash().join("files/f").exists());
+        assert!(fx.trash().join("info/f.trashinfo").exists());
+        fs::remove_file(fx.work.join("f")).unwrap();
+        // Through.
+        refuse_native(1);
+        let restored = trash.restore(&entry, &RestoreOptions::default()).unwrap();
+        assert_eq!(restored.method, MoveMethod::Link);
+        assert_eq!(fs::read_to_string(fx.work.join("f")).unwrap(), "data");
+        assert_eq!(file_names(&fx), Vec::<OsString>::new());
+        assert_eq!(info_names(&fx), Vec::<OsString>::new());
+    }
+
+    #[test]
+    fn restoring_a_directory_needs_the_opt_in_too() {
+        let fx = Fx::new();
+        fs::create_dir(fx.work.join("d")).unwrap();
+        fs::write(fx.work.join("d/x"), "x").unwrap();
+        let _ = fx.context.trash(fx.work.join("d")).unwrap();
+        let trash = fx.open_home();
+        let entry = entries(&trash).remove(0);
+        refuse_native(1);
+        let err = trash
+            .restore(&entry, &RestoreOptions::default())
+            .unwrap_err();
+        assert!(matches!(err.failure, RestoreFailure::Unsupported(_)));
+        let context = with(&fx, Fallbacks::LinkAndPlaceholder);
+        let trash = context.open(&context.home_trash()).unwrap();
+        let entry = entries(&trash).remove(0);
+        refuse_native(1);
+        let restored = trash.restore(&entry, &RestoreOptions::default()).unwrap();
+        assert_eq!(restored.method, MoveMethod::Placeholder);
+        assert_eq!(fs::read_to_string(fx.work.join("d/x")).unwrap(), "x");
+    }
+}
+
+mod exclusions {
+    use super::*;
+
+    fn check(exclusions: &Exclusions, path: &str) -> Option<PathBuf> {
+        match exclusions.check(Path::new(path)) {
+            Ok(()) => None,
+            Err(Excluded {
+                reason: ExclusionReason::Rule { rule, .. },
+                ..
+            }) => Some(rule.path),
+            Err(other) => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn rules_match_whole_components() {
+        let rules = Exclusions::new()
+            .anchored(Path::new("/"))
+            .mount("/mnt/a", "a")
+            .anchored(Path::new("/"));
+        assert_eq!(check(&rules, "/mnt/a"), Some("/mnt/a".into()));
+        assert_eq!(check(&rules, "/mnt/a/b/c"), Some("/mnt/a".into()));
+        assert_eq!(check(&rules, "/mnt/ab"), None);
+        assert_eq!(check(&rules, "/mnt"), None);
+        // Repeated separators and `.` mean nothing; `..` is followed as
+        // lookup follows it, and what it passes through counts.
+        assert_eq!(check(&rules, "//mnt///a/./x"), Some("/mnt/a".into()));
+        assert_eq!(check(&rules, "/mnt/a/../b"), Some("/mnt/a".into()));
+        assert_eq!(check(&rules, "/x/../mnt/a/y"), Some("/mnt/a".into()));
+        assert_eq!(check(&rules, "/mnt/b/../ab"), None);
+        let strict = rules.clone().refuse_parent_components(true);
+        assert!(matches!(
+            strict.check(Path::new("/mnt/b/../c")),
+            Err(Excluded {
+                reason: ExclusionReason::ParentComponent,
+                ..
+            })
+        ));
+        assert_eq!(check(&strict, "/mnt/b/c"), None);
+    }
+
+    #[test]
+    fn nested_mounts_and_overlapping_rules() {
+        let points = ["/", "/mnt/nfs", "/mnt/nfs/local", "/mnt/nfs/deep"].map(PathBuf::from);
+        let rules = Exclusions::new()
+            .mount("/mnt/nfs", "nfs")
+            .mount("/mnt/nfs/deep", "deep")
+            .with_mount_points(points)
+            .anchored(Path::new("/"));
+        assert_eq!(check(&rules, "/mnt/nfs/x"), Some("/mnt/nfs".into()));
+        // A volume mounted inside the excluded one is its own, and reaching
+        // it only passes through the excluded one's top directories.
+        assert_eq!(check(&rules, "/mnt/nfs/local/x"), None);
+        assert_eq!(check(&rules, "/mnt/nfs/local"), None);
+        // Coming back into the excluded volume by `..` counts, even on the
+        // way to the nested one again.
+        assert_eq!(
+            check(&rules, "/mnt/nfs/local/../local/x"),
+            Some("/mnt/nfs".into())
+        );
+        assert_eq!(
+            check(&rules, "/mnt/../mnt/nfs/local/x"),
+            None,
+            "`..` above it only"
+        );
+        // Leaving the nested volume by `..` lands in the excluded one.
+        assert_eq!(
+            check(&rules, "/mnt/nfs/local/../x"),
+            Some("/mnt/nfs".into())
+        );
+        assert_eq!(
+            check(&rules, "/mnt/nfs/local/../../y"),
+            Some("/mnt/nfs".into())
+        );
+        // The deepest covering rule is reported.
+        assert_eq!(
+            check(&rules, "/mnt/nfs/deep/z"),
+            Some("/mnt/nfs/deep".into())
+        );
+        // A subtree rule covers nested volumes too.
+        let subtree = Exclusions::new()
+            .subtree("/mnt/nfs", "all")
+            .with_mount_points(["/mnt/nfs/local".into()])
+            .anchored(Path::new("/"));
+        assert_eq!(check(&subtree, "/mnt/nfs/local/x"), Some("/mnt/nfs".into()));
+        // Without known mount points, a mount rule reaches everywhere below.
+        let unbounded = Exclusions::new()
+            .mount("/mnt/nfs", "nfs")
+            .anchored(Path::new("/"));
+        assert_eq!(
+            check(&unbounded, "/mnt/nfs/local/x"),
+            Some("/mnt/nfs".into())
+        );
+    }
+
+    #[test]
+    fn exclusions_from_a_mount_list() {
+        let mount = |id, point: &str, fs_type: &str| Mount {
+            id,
+            parent: 1,
+            mount_point: point.into(),
+            fs_type: fs_type.into(),
+            source: "src".into(),
+        };
+        let mounts = [
+            mount(1, "/", "ext4"),
+            mount(2, "/net", "nfs4"),
+            mount(3, "/net/cache", "tmpfs"),
+        ];
+        let rules = Exclusions::from_mounts(&mounts, |mount| mount.fs_type.starts_with("nfs"));
+        assert_eq!(rules.rules().len(), 1);
+        assert_eq!(rules.rules()[0].label, "nfs4");
+        assert_eq!(check(&rules, "/net/x"), Some("/net".into()));
+        assert_eq!(check(&rules, "/net/cache/x"), None);
+        assert_eq!(check(&rules, "/home/x"), None);
+    }
+
+    fn excluding(fx: &Fx, cwd: &Path, exclusions: Exclusions) -> Context {
+        Context::new(&fx.home, uid(), cwd, LocalZone::utc())
+            .unwrap()
+            .with_policy(Policy {
+                exclusions,
+                ..Policy::default()
+            })
+    }
+
+    #[test]
+    fn an_excluded_source_is_never_touched() {
+        let fx = Fx::new();
+        let net = fx.root.join("net");
+        fs::create_dir(&net).unwrap();
+        fs::write(net.join("f"), "f").unwrap();
+        let context = excluding(&fx, &fx.work, Exclusions::new().subtree(&net, "nfs"));
+        // Existing, missing, relative, through `..`; and a relative path
+        // from an excluded working directory.
+        let inside = excluding(&fx, &net, Exclusions::new().subtree(&net, "nfs"));
+        let cases: [(&Context, PathBuf); 5] = [
+            (&context, net.join("f")),
+            (&context, net.join("missing/deeper")),
+            (&context, PathBuf::from("../net/f")),
+            (&context, fx.work.join("../net/./f")),
+            (&inside, PathBuf::from("f")),
+        ];
+        for (context, path) in cases {
+            let _ = sys::take_probes();
+            let trashed = context.trash(&path);
+            let planned = context.plan(&path);
+            let into = context.trash_into(&context.home_trash(), &path);
+            assert_eq!(
+                sys::take_probes(),
+                Vec::new(),
+                "{}: nothing was touched",
+                path.display()
+            );
+            for result in [trashed.err(), planned.err(), into.err()] {
+                assert!(
+                    matches!(result, Some(TrashError::Excluded(_))),
+                    "{}: {result:?}",
+                    path.display()
+                );
+            }
+        }
+        assert!(net.join("f").exists());
+        assert!(!fx.home.exists());
+    }
+
+    #[test]
+    fn an_alias_is_caught_once_resolved() {
+        // A symbolic link into an excluded place: the path does not say
+        // so; resolving it does (it was touched to resolve it).
+        let fx = Fx::new();
+        let net = fx.root.join("net");
+        fs::create_dir(&net).unwrap();
+        fs::write(net.join("f"), "f").unwrap();
+        symlink(&net, fx.work.join("alias")).unwrap();
+        let context = excluding(&fx, &fx.work, Exclusions::new().subtree(&net, "nfs"));
+        let _ = sys::take_probes();
+        assert!(matches!(
+            context.trash(fx.work.join("alias/f")),
+            Err(TrashError::Excluded(_))
+        ));
+        assert!(
+            !sys::take_probes().is_empty(),
+            "documented: aliases are reached"
+        );
+        assert!(net.join("f").exists());
+    }
+
+    /// Paths a probe log names below `place`.
+    fn probed_below(place: &Path) -> Vec<PathBuf> {
+        sys::take_probes()
+            .into_iter()
+            .flatten()
+            .filter(|path| path.starts_with(place))
+            .collect()
+    }
+
+    #[test]
+    fn excluded_trash_directories_are_not_probed() {
+        // The data home excluded: the home trash is passed over unlooked at,
+        // and the volume's trash takes the file.
+        let fx = Fx::new();
+        let top = fx.root.join("vol");
+        fs::create_dir(&top).unwrap();
+        fs::write(top.join("doc"), "d").unwrap();
+        let context = excluding(&fx, &fx.work, Exclusions::new().subtree(&fx.home, "home"));
+        fault::pretend_volume(&top);
+        let _ = sys::take_probes();
+        let plan = context.plan(top.join("doc")).unwrap();
+        assert!(matches!(
+            plan.skipped[0].failure,
+            AttemptFailure::Excluded(_)
+        ));
+        let trashed = context.trash(top.join("doc")).unwrap();
+        assert_eq!(trashed.trash.kind(), TrashKind::Private);
+        assert_eq!(probed_below(&fx.home), Vec::<PathBuf>::new());
+        assert!(!fx.home.exists());
+        // A volume trash excluded: passed over, not created.
+        let fx = Fx::new();
+        let top = fx.root.join("vol");
+        fs::create_dir(&top).unwrap();
+        fs::write(top.join("doc"), "d").unwrap();
+        let private = top.join(format!(".Trash-{}", uid()));
+        let context = excluding(
+            &fx,
+            &fx.work,
+            Exclusions::new().subtree(&private, "private"),
+        );
+        fault::pretend_volume(&top);
+        let _ = sys::take_probes();
+        let Err(TrashError::NoTrash { attempts, .. }) = context.trash(top.join("doc")) else {
+            panic!()
+        };
+        assert!(
+            attempts
+                .iter()
+                .any(|attempt| matches!(attempt.failure, AttemptFailure::Excluded(_)))
+        );
+        assert_eq!(probed_below(&private), Vec::<PathBuf>::new());
+        assert!(!private.exists());
+        assert!(top.join("doc").exists());
+        // An explicit trash directory excluded: refused, not created.
+        let explicit = context.trash_into(&context.private_trash(&top), top.join("doc"));
+        assert!(matches!(explicit, Err(TrashError::NoTrash { .. })));
+        assert!(!private.exists());
+    }
+
+    #[test]
+    fn an_excluded_files_or_info_excludes_its_trash() {
+        for child in ["files", "info"] {
+            let fx = Fx::new();
+            let _ = fx.context.trash(fx.file("seed", "s")).unwrap();
+            let top = fx.root.join("vol");
+            fs::create_dir(&top).unwrap();
+            fs::write(top.join("doc"), "d").unwrap();
+            let context = excluding(
+                &fx,
+                &fx.work,
+                Exclusions::new().subtree(fx.trash().join(child), child),
+            );
+            fault::pretend_volume(&top);
+            let plan = context.plan(top.join("doc")).unwrap();
+            assert!(
+                matches!(plan.skipped[0].failure, AttemptFailure::Excluded(_)),
+                "{child}"
+            );
+            let _ = sys::take_probes();
+            let trashed = context.trash(top.join("doc")).unwrap();
+            assert_eq!(trashed.trash.kind(), TrashKind::Private, "{child}");
+            assert_eq!(probed_below(&fx.trash().join(child)), Vec::<PathBuf>::new());
+            assert_eq!(names(&fx.trash().join("files")), ["seed"]);
+            fault::clear();
+            let _ = sys::take_probes();
+            // Named explicitly: refused, not probed.
+            let explicit = context.trash_into(&context.home_trash(), fx.file("g", "g"));
+            assert!(matches!(explicit, Err(TrashError::NoTrash { .. })));
+            assert_eq!(probed_below(&fx.trash().join(child)), Vec::<PathBuf>::new());
+        }
+    }
+
+    #[test]
+    fn an_excluded_trash_is_still_protected_lexically() {
+        let fx = Fx::new();
+        let _ = fx.context.trash(fx.file("seed", "s")).unwrap();
+        let context = excluding(
+            &fx,
+            &fx.work,
+            Exclusions::new().subtree(fx.trash().join("info"), "info"),
+        );
+        for (path, problem) in [
+            (fx.trash().join("files/seed"), SourceProblem::InTrash),
+            (fx.trash().join("files"), SourceProblem::InTrash),
+            (fx.home.clone(), SourceProblem::HoldsTrash),
+        ] {
+            let result = context.trash(&path);
+            assert!(
+                matches!(&result, Err(TrashError::InvalidSource { problem: found, .. }) if *found == problem),
+                "{}: {result:?}",
+                path.display()
+            );
+        }
+        assert!(fx.trash().join("files/seed").exists());
+        assert_eq!(names(&fx.trash().join("info")), ["seed.trashinfo"]);
+    }
+
+    #[test]
+    fn a_trash_under_a_symbolic_link_is_protected_with_a_child_excluded() {
+        // `$XDG_DATA_HOME` a link to the real directory; `info` excluded
+        // under the link's name: the base itself is not excluded, so it is
+        // resolved, and the source's real path is matched against it.
+        let fx = Fx::new();
+        let real = fx.root.join("realdata");
+        fs::create_dir(&real).unwrap();
+        symlink(&real, fx.root.join("alias")).unwrap();
+        let alias = Context::new(fx.root.join("alias"), uid(), &fx.work, LocalZone::utc()).unwrap();
+        let _ = alias.trash(fx.file("seed", "s")).unwrap();
+        let context = alias.clone().with_policy(Policy {
+            exclusions: Exclusions::new().subtree(fx.root.join("alias/Trash/info"), "info"),
+            ..Policy::default()
+        });
+        let top = fx.root.join("vol");
+        fs::create_dir(&top).unwrap();
+        // Should the check fail, trashing stays inside the fixture.
+        fault::pretend_volume(&top);
+        for result in [
+            context.trash(real.join("Trash/files/seed")),
+            context.trash_into(&context.private_trash(&top), real.join("Trash/files/seed")),
+        ] {
+            assert!(
+                matches!(
+                    result,
+                    Err(TrashError::InvalidSource {
+                        problem: SourceProblem::InTrash,
+                        ..
+                    })
+                ),
+                "{result:?}"
+            );
+        }
+        assert!(real.join("Trash/files/seed").exists());
+        assert!(real.join("Trash/info/seed.trashinfo").exists());
+    }
+
+    #[test]
+    fn an_excluded_trash_root_with_nested_children_is_excluded() {
+        // The trash directory a mount of its own, excluded; its `files` and
+        // `info` known mount points of their own (not excluded). The trash
+        // directory itself is opened and inspected, so it counts.
+        let fx = Fx::new();
+        let _ = fx.context.trash(fx.file("seed", "s")).unwrap();
+        let trash = fx.trash();
+        let context = excluding(
+            &fx,
+            &fx.work,
+            Exclusions::new().mount(&trash, "trash").with_mount_points([
+                trash.clone(),
+                trash.join("files"),
+                trash.join("info"),
+            ]),
+        );
+        let top = fx.root.join("vol");
+        fs::create_dir(&top).unwrap();
+        fs::write(top.join("doc"), "d").unwrap();
+        fault::pretend_volume(&top);
+        let plan = context.plan(top.join("doc")).unwrap();
+        assert!(matches!(
+            plan.skipped[0].failure,
+            AttemptFailure::Excluded(_)
+        ));
+        let _ = sys::take_probes();
+        let trashed = context.trash(top.join("doc")).unwrap();
+        assert_eq!(trashed.trash.kind(), TrashKind::Private);
+        assert_eq!(probed_below(&trash), Vec::<PathBuf>::new());
+        fault::clear();
+        let _ = sys::take_probes();
+        let explicit = context.trash_into(&context.home_trash(), fx.file("g", "g"));
+        assert!(matches!(explicit, Err(TrashError::NoTrash { .. })));
+        assert_eq!(probed_below(&trash), Vec::<PathBuf>::new());
+        assert_eq!(names(&trash.join("files")), ["seed"]);
+    }
+
+    #[test]
+    fn other_places_and_listing_are_unaffected() {
+        let fx = Fx::new();
+        let net = fx.root.join("net");
+        fs::create_dir(&net).unwrap();
+        let context = excluding(&fx, &fx.work, Exclusions::new().mount(&net, "nfs"));
+        let trashed = context.trash(fx.file("f", "f")).unwrap();
+        assert_eq!(trashed.trash.kind(), TrashKind::Home);
+        // A per-volume trash in the excluded place is still listed.
+        fs::write(net.join("g"), "g").unwrap();
+        let _ = fx
+            .context
+            .trash_into(&fx.context.private_trash(&net), net.join("g"))
+            .unwrap();
+        let discovery = context.discover([&net]);
+        assert_eq!(discovery.trashes.len(), 2);
     }
 }

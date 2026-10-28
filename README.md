@@ -20,7 +20,7 @@ Pure Rust, no `unsafe` code.
 | [`xdg-kit-thumbnails`](https://docs.rs/xdg-kit-thumbnails) | The Thumbnail Managing Standard: `.thumbnailer` discovery and commands, the thumbnail cache with its keys, freshness and failure markers, and the shared per-directory repositories. |
 | [`xdg-kit-icon-theme`](https://docs.rs/xdg-kit-icon-theme) | The Icon Theme spec: `index.theme` inheritance, the exact lookup algorithm over an in-memory index (built from validated GTK caches or directory scans), and the Icon Naming spec's fallback chains. |
 | [`xdg-kit-menu`](https://docs.rs/xdg-kit-menu) | The Desktop Menu spec (version 1.1): `.menu` files resolved into the application menu tree — `XDG_MENU_PREFIX` and user overrides, merges, moves, deletions, `<Include>`/`<Exclude>` rules with `<OnlyUnallocated>`, legacy hierarchies, localized `.directory` captions, and layouts with separators and inlining — every step bounded, with each entry's desktop file and path kept for launching. |
-| [`xdg-kit-trash`](https://docs.rs/xdg-kit-trash) | The Trash spec (version 1.0): trashing into the home trash or a volume's `.Trash/$uid` or `.Trash-$uid` by rename only — never copied, never overwritten, metadata created exclusively first — listing every payload and orphan with byte-exact original paths, restoring without replacing, erasing without following links or crossing mounts, and the `directorysizes` cache. |
+| [`xdg-kit-trash`](https://docs.rs/xdg-kit-trash) | The Trash spec (version 1.0): trashing into the home trash or a volume's `.Trash/$uid` or `.Trash-$uid` by non-replacing rename, else a hard link (or, opted in, a rename over a placeholder) — never copied, never overwritten, metadata created exclusively first — with a planning query that creates nothing, caller-chosen volume exclusions checked before touching them, listing every payload and orphan with byte-exact original paths, restoring without replacing, erasing without following links or crossing mounts, and the `directorysizes` cache. |
 | [`xdg-kit-autostart`](https://docs.rs/xdg-kit-autostart) | The Desktop Application Autostart spec: the entries a session starts after login, with precedence and `Hidden` overrides, structured reasons for every entry that does not start, launch plans, and user overrides that enable, disable or reset an entry without losing anything in the file. |
 
 ## Installing
@@ -300,9 +300,12 @@ systems fall back to portable calls or fixed values: `fstat` instead of
 `statx`, `O_SEARCH` or nothing instead of `O_PATH`, and a link limit of 40. The `user.mime_type` extended attribute is
 read only on Linux, Android, Hurd and Apple's systems.
 These fallbacks have not been built or tested on any system but Linux.
-Trashing and restoring need a rename that never replaces its target
-(Linux's `renameat2`, Apple's `renameatx_np`); elsewhere `xdg-kit-trash`
-refuses them as unsupported rather than check first and replace after.
+Trashing and restoring use a rename that never replaces its target
+(Linux's `renameat2`, Apple's `renameatx_np`); where there is none, or a
+file system refuses it, `xdg-kit-trash` falls back to a hard link (never
+replacing, not atomic) and, only if the caller opts in, a rename over a
+placeholder directory for directories — never to checking first and
+replacing after.
 
 `xdg-kit-autostart`, `xdg-kit-basedir`, `xdg-kit-bookmarks`,
 `xdg-kit-desktop-entry`, `xdg-kit-icon-theme`, `xdg-kit-menu`,

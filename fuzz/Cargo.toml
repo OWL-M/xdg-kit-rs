@@ -193,3 +193,10 @@ path = "fuzz_targets/mountinfo.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "trash_exclusions"
+path = "fuzz_targets/trash_exclusions.rs"
+test = false
+doc = false
+bench = false

@@ -9,6 +9,47 @@ use std::path::Path;
 
 use rustix::fs::{AtFlags, FileType, Mode, OFlags, Stat};
 
+#[cfg(test)]
+thread_local! {
+    /// What this thread's calls here touched: a path for path-based calls,
+    /// `None` for calls on an open directory. Tests read it to show that a
+    /// refused path reached nothing.
+    #[allow(
+        clippy::missing_const_for_thread_local,
+        reason = "the initializer is const already; the lint still fires for Android targets"
+    )]
+    static PROBES: std::cell::RefCell<Vec<Option<std::path::PathBuf>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Notes a call touching the file system (tests only).
+#[inline]
+fn probe(path: Option<&Path>) {
+    #[cfg(test)]
+    PROBES.with(|probes| probes.borrow_mut().push(path.map(Path::to_path_buf)));
+    #[cfg(not(test))]
+    let _ = path;
+}
+
+/// The calls noted on this thread since the last take (tests only).
+#[cfg(test)]
+pub(crate) fn take_probes() -> Vec<Option<std::path::PathBuf>> {
+    PROBES.with(|probes| std::mem::take(&mut *probes.borrow_mut()))
+}
+
+/// Creates `dir` and its missing ancestors (mode 0700, less the umask),
+/// syncing each parent a directory was made in.
+pub(crate) fn create_dir_all(dir: &Path) -> io::Result<xdg_kit_basedir::Durability> {
+    probe(Some(dir));
+    xdg_kit_basedir::create_dir_all_synced(dir, 0o700)
+}
+
+/// `realpath`: `path` with every symbolic link resolved.
+pub(crate) fn canonicalize(path: &Path) -> io::Result<std::path::PathBuf> {
+    probe(Some(path));
+    std::fs::canonicalize(path)
+}
+
 /// What kind of file a name is, without following a symbolic link.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FileKind {
@@ -90,6 +131,7 @@ impl Meta {
 /// paths given by the caller (a base directory, a mount's top directory, a
 /// destination's parent) mean what path lookup makes of them.
 pub(crate) fn open_dir(path: &Path) -> io::Result<OwnedFd> {
+    probe(Some(path));
     Ok(rustix::fs::open(
         path,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
@@ -99,6 +141,7 @@ pub(crate) fn open_dir(path: &Path) -> io::Result<OwnedFd> {
 
 /// Opens the directory `name` in `dir`, refusing a symbolic link.
 pub(crate) fn open_dir_at(dir: BorrowedFd<'_>, name: &OsStr) -> io::Result<OwnedFd> {
+    probe(None);
     Ok(rustix::fs::openat(
         dir,
         name,
@@ -109,6 +152,7 @@ pub(crate) fn open_dir_at(dir: BorrowedFd<'_>, name: &OsStr) -> io::Result<Owned
 
 /// `stat` of `name` in `dir`, not following a symbolic link.
 pub(crate) fn stat_at(dir: BorrowedFd<'_>, name: &OsStr) -> io::Result<Meta> {
+    probe(None);
     Ok(Meta::of(&rustix::fs::statat(
         dir,
         name,
@@ -127,6 +171,7 @@ pub(crate) fn lookup_at(dir: BorrowedFd<'_>, name: &OsStr) -> io::Result<Option<
 
 /// `stat` of an open file.
 pub(crate) fn fstat(fd: impl AsFd) -> io::Result<Meta> {
+    probe(None);
     Ok(Meta::of(&rustix::fs::fstat(fd)?))
 }
 
@@ -173,6 +218,7 @@ impl Place {
     /// looked at with `stat`: this needs search permission on the way
     /// there, not read permission on the directory itself.
     pub(crate) fn of_path(path: &Path) -> io::Result<Self> {
+        probe(Some(path));
         Ok(Self {
             dev: Meta::of(&rustix::fs::stat(path)?).ident.dev,
             mount: mount_id(Err(path)),
@@ -203,7 +249,9 @@ pub(crate) enum Sameness {
     Different,
 }
 
-/// Whether this system has a rename that refuses to replace its target.
+/// Whether this system has a native rename that refuses to replace its
+/// target. Where it has not, or a file system refuses it, moves use the
+/// policy's [`Fallbacks`](crate::Fallbacks).
 pub const NO_REPLACE_RENAME: bool = cfg!(any(
     target_os = "linux",
     target_os = "android",
@@ -212,13 +260,16 @@ pub const NO_REPLACE_RENAME: bool = cfg!(any(
 
 /// Why a non-replacing rename did not happen. The source is untouched in
 /// every case.
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android", target_vendor = "apple")),
+    allow(
+        dead_code,
+        reason = "without a native rename, only `Unsupported` is reported"
+    )
+)]
 #[derive(Debug)]
 pub(crate) enum RenameError {
     /// The target name exists.
-    #[cfg_attr(
-        not(any(target_os = "linux", target_os = "android", target_vendor = "apple")),
-        allow(dead_code, reason = "only a non-replacing rename reports it")
-    )]
     Exists,
     /// Source and target are on different mounts.
     CrossDevice,
@@ -238,6 +289,7 @@ pub(crate) fn rename_no_replace(
     to_dir: BorrowedFd<'_>,
     to: &OsStr,
 ) -> Result<(), RenameError> {
+    probe(None);
     #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
     {
         use rustix::io::Errno;
@@ -307,6 +359,7 @@ pub(crate) fn create_exclusive(
     name: &OsStr,
     mode: u32,
 ) -> io::Result<OwnedFd> {
+    probe(None);
     Ok(rustix::fs::openat(
         dir,
         name,
@@ -329,6 +382,7 @@ const EFFECTIVE_IDS: AtFlags = AtFlags::empty();
 /// read-only mounts included). Advisory: only an actual creation decides.
 pub(crate) fn may_create_in(dir: BorrowedFd<'_>) -> io::Result<()> {
     use rustix::fs::Access;
+    probe(None);
     Ok(rustix::fs::accessat(
         dir,
         ".",
@@ -342,6 +396,7 @@ pub(crate) fn may_create_in(dir: BorrowedFd<'_>) -> io::Result<()> {
 /// permission on the directory.
 pub(crate) fn may_create_at(path: &Path) -> io::Result<()> {
     use rustix::fs::Access;
+    probe(Some(path));
     Ok(rustix::fs::accessat(
         rustix::fs::CWD,
         path,
@@ -353,6 +408,7 @@ pub(crate) fn may_create_at(path: &Path) -> io::Result<()> {
 /// `stat` of the file at `path`, symbolic links followed: `None` when
 /// nothing has that path.
 pub(crate) fn lookup_path(path: &Path) -> io::Result<Option<Meta>> {
+    probe(Some(path));
     match rustix::fs::stat(path) {
         Ok(stat) => Ok(Some(Meta::of(&stat))),
         Err(rustix::io::Errno::NOENT) => Ok(None),
@@ -363,6 +419,7 @@ pub(crate) fn lookup_path(path: &Path) -> io::Result<Option<Meta>> {
 /// `lstat` of the file at `path`: the final component is not followed (a
 /// symbolic link is itself). `None` when nothing has that path.
 pub(crate) fn lookup_path_nofollow(path: &Path) -> io::Result<Option<Meta>> {
+    probe(Some(path));
     match rustix::fs::lstat(path) {
         Ok(stat) => Ok(Some(Meta::of(&stat))),
         Err(rustix::io::Errno::NOENT) => Ok(None),
@@ -372,6 +429,7 @@ pub(crate) fn lookup_path_nofollow(path: &Path) -> io::Result<Option<Meta>> {
 
 /// Creates the directory `name` in `dir`.
 pub(crate) fn mkdir_at(dir: BorrowedFd<'_>, name: &OsStr, mode: u32) -> io::Result<()> {
+    probe(None);
     Ok(rustix::fs::mkdirat(dir, name, mode_bits(mode))?)
 }
 
@@ -407,6 +465,7 @@ pub(crate) fn read_bounded(
     name: &OsStr,
     max: u64,
 ) -> Result<(Vec<u8>, Meta), ReadError> {
+    probe(None);
     // Non-blocking: opening a FIFO must not wait for a writer.
     let fd = match rustix::fs::openat(
         dir,
@@ -481,6 +540,7 @@ pub(crate) fn remove_if_same(
 /// The longest file name a directory takes, in bytes: `None` when the
 /// system does not say.
 pub(crate) fn name_max(fd: BorrowedFd<'_>) -> Option<usize> {
+    probe(None);
     let found = rustix::fs::fstatvfs(fd).ok()?;
     usize::try_from(found.f_namemax).ok().filter(|&max| max > 0)
 }

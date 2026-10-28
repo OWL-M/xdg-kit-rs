@@ -18,8 +18,8 @@ use std::process::{Command, ExitCode};
 #[cfg(target_os = "linux")]
 use xdg_kit_trash::{
     AttemptFailure, CacheWrite, CandidateState, Context, EraseFailure, EraseOptions,
-    EraseProblemKind, LocalZone, Origin, RestoreFailure, RestoreOptions, SizeOptions,
-    SizeProblemKind, SourceProblem, Trash, TrashError, TrashKind,
+    EraseProblemKind, Exclusions, LocalZone, Origin, Policy, RestoreFailure, RestoreOptions,
+    SizeOptions, SizeProblemKind, SourceProblem, Trash, TrashError, TrashKind,
 };
 
 const GATE: &str = "XDG_KIT_TRASH_MOUNT_TESTS";
@@ -115,7 +115,7 @@ impl Fx {
 
 #[cfg(target_os = "linux")]
 fn run() {
-    let tests: [(&str, fn()); 10] = [
+    let tests: [(&str, fn()); 12] = [
         ("selection by mount", selection_by_mount),
         ("a bind mount is another mount", bind_mount),
         ("restoring across mounts", restore_across_mounts),
@@ -135,6 +135,8 @@ fn run() {
             files_named_like_own_roots,
         ),
         ("plans across mounts create nothing", plan_across_mounts),
+        ("excluded volumes, nested volumes", excluded_volumes),
+        ("another mount is not a fallback", cross_device_is_final),
     ];
     for (name, test) in tests {
         println!("mount test: {name}");
@@ -487,5 +489,74 @@ fn plan_across_mounts() {
         .collect();
     assert_eq!(kinds, [TrashKind::Home]);
     assert!(plan.skipped.is_empty());
+    unmount(&vol);
+}
+
+#[cfg(target_os = "linux")]
+fn excluded_volumes() {
+    // A volume excluded from a real mount list, with a volume nested
+    // inside it that is not.
+    let fx = Fx::new();
+    let vol = fx.root.join("vol");
+    tmpfs(&vol);
+    let inner = vol.join("inner");
+    tmpfs(&inner);
+    fs::write(vol.join("f"), "f").unwrap();
+    fs::write(inner.join("g"), "g").unwrap();
+    let mounts = xdg_kit_trash::mounts(&xdg_kit_trash::Limits::default()).unwrap();
+    let exclusions = Exclusions::from_mounts(&mounts, |mount| mount.mount_point == vol);
+    let mut policy = Policy::default();
+    policy.exclusions = exclusions;
+    let context = fx.context.clone().with_policy(policy);
+    for result in [
+        context.trash(vol.join("f")).err(),
+        context.plan(vol.join("f")).err(),
+    ] {
+        assert!(
+            matches!(result, Some(TrashError::Excluded(_))),
+            "{result:?}"
+        );
+    }
+    assert!(vol.join("f").exists());
+    assert!(
+        !vol.join(".Trash-0").exists(),
+        "nothing made on the excluded volume"
+    );
+    // The nested volume is its own: trashed into its own trash.
+    let trashed = context.trash(inner.join("g")).unwrap();
+    assert_eq!(trashed.trash.base(), inner);
+    assert!(inner.join(".Trash-0/files/g").exists());
+    // A file of the home trash's mount is unaffected.
+    fs::write(fx.root.join("local"), "l").unwrap();
+    assert_eq!(
+        context.trash(fx.root.join("local")).unwrap().trash.kind(),
+        TrashKind::Home
+    );
+    unmount(&inner);
+    unmount(&vol);
+}
+
+#[cfg(target_os = "linux")]
+fn cross_device_is_final() {
+    // The home trash named explicitly for a file on another mount: the
+    // rename says another mount, and no fallback is tried (a link cannot
+    // cross mounts either).
+    let fx = Fx::new();
+    let vol = fx.root.join("vol");
+    tmpfs(&vol);
+    fs::write(vol.join("f"), "f").unwrap();
+    let Err(TrashError::NoTrash { attempts, .. }) = fx
+        .context
+        .trash_into(&fx.context.home_trash(), vol.join("f"))
+    else {
+        panic!()
+    };
+    assert!(
+        matches!(attempts[0].failure, AttemptFailure::CrossDevice),
+        "{attempts:?}"
+    );
+    assert!(vol.join("f").exists());
+    let files: Vec<_> = fs::read_dir(fx.home.join("Trash/files")).unwrap().collect();
+    assert!(files.is_empty());
     unmount(&vol);
 }

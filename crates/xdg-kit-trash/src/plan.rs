@@ -71,6 +71,14 @@ impl Context {
     ///
     /// The answer is advisory ([`TrashPlan`]). The spec's rules on creating
     /// trash directories without delay apply to trashing, not to this.
+    /// Exclusions ([`Policy::exclusions`](crate::Policy::exclusions)) apply
+    /// as in trashing: an excluded source is refused from its path alone,
+    /// and excluded trash directories are passed over unprobed.
+    ///
+    /// How the payload would be moved is not predicted: whether the native
+    /// non-replacing rename, or a fallback ([`Policy::fallbacks`](crate::Policy::fallbacks)),
+    /// works on a file system is known only by trying it, and trying moves
+    /// the file.
     ///
     /// # Errors
     ///
