@@ -324,3 +324,8 @@ const _: fn() = || {
     shareable::<TrashDir>();
     shareable::<Limits>();
 };
+
+/// The examples of the crate's README, run as doctests.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+pub struct ReadmeDoctests;

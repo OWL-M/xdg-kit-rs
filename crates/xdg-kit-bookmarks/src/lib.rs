@@ -74,3 +74,8 @@ const _: fn() = || {
     shareable::<Limits>();
     shareable::<Opened>();
 };
+
+/// The examples of the crate's README, run as doctests.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+pub struct ReadmeDoctests;

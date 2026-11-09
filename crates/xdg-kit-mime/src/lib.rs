@@ -43,3 +43,8 @@ pub use limits::{Limits, MAX_RULE_DEPTH};
 pub use mime_type::{InvalidMimeType, MimeType};
 pub use tree::TreeOptions;
 pub use xdg_kit_locale::Locales;
+
+/// The examples of the crate's README, run as doctests.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+pub struct ReadmeDoctests;
