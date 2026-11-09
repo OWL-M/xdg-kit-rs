@@ -395,7 +395,15 @@ pub(crate) mod tests {
 
     pub(crate) fn base(dirs: &[&Path]) -> BaseDirs {
         let home = dirs[0].to_owned();
-        let rest = std::env::join_paths(&dirs[1..]).unwrap();
+        // An empty or unset XDG_DATA_DIRS means /usr/local/share:/usr/share,
+        // whose thumbnailers would join the test's: name a missing
+        // directory instead when there are no others.
+        let none = [home.join("no-data-dirs")];
+        let rest = if dirs.len() > 1 {
+            std::env::join_paths(&dirs[1..]).unwrap()
+        } else {
+            std::env::join_paths(&none).unwrap()
+        };
         BaseDirs::from_vars(move |name| match name {
             "HOME" => Some("/home/u".into()),
             "XDG_DATA_HOME" => Some(home.clone().into_os_string()),
@@ -618,15 +626,7 @@ mod linearity {
         let dir = tempfile::tempdir().unwrap();
         let folder = dir.path().join("thumbnailers");
         fs::create_dir_all(&folder).unwrap();
-        let base = {
-            let home = dir.path().to_owned();
-            BaseDirs::from_vars(move |name| match name {
-                "HOME" => Some("/home/u".into()),
-                "XDG_DATA_HOME" => Some(home.clone().into_os_string()),
-                _ => None,
-            })
-            .unwrap()
-        };
+        let base = tests::base(&[dir.path()]);
         let grow = |n: usize| {
             let mut bytes = 0;
             for at in 0..n {
@@ -657,15 +657,7 @@ mod linearity {
         let dir = tempfile::tempdir().unwrap();
         let folder = dir.path().join("thumbnailers");
         fs::create_dir_all(&folder).unwrap();
-        let base = {
-            let home = dir.path().to_owned();
-            BaseDirs::from_vars(move |name| match name {
-                "HOME" => Some("/home/u".into()),
-                "XDG_DATA_HOME" => Some(home.clone().into_os_string()),
-                _ => None,
-            })
-            .unwrap()
-        };
+        let base = tests::base(&[dir.path()]);
         let database = MimeDatabase::from_dirs(Vec::<PathBuf>::new());
         work::assert_linear(
             400,
@@ -875,13 +867,7 @@ mod review_regressions {
         let dir = tempfile::tempdir().unwrap();
         let folder = dir.path().join("thumbnailers");
         fs::create_dir_all(&folder).unwrap();
-        let data_home = dir.path().to_owned();
-        let base = BaseDirs::from_vars(move |name| match name {
-            "HOME" => Some("/home/u".into()),
-            "XDG_DATA_HOME" => Some(data_home.clone().into_os_string()),
-            _ => None,
-        })
-        .unwrap();
+        let base = tests::base(&[dir.path()]);
         let database = MimeDatabase::from_dirs(Vec::<PathBuf>::new());
         crate::work::assert_linear(
             400,
