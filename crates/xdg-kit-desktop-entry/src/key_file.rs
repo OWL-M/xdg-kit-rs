@@ -272,8 +272,12 @@ impl Counts {
 
 /// A step per level of a set of `len` items walked: the steps of finding,
 /// adding or removing one.
+#[allow(
+    clippy::manual_bit_width,
+    reason = "Relax's std has no `usize::bit_width`"
+)]
 fn depth(len: usize) -> usize {
-    usize::try_from(len.bit_width()).unwrap_or(usize::MAX)
+    usize::try_from(usize::BITS - len.leading_zeros()).unwrap_or(usize::MAX)
 }
 
 /// Borrowed parts of an index key: a number (the group number for a group's
@@ -394,11 +398,17 @@ impl<T: Text> hashed::Kind for Key<T> {
         view
     }
 
-    fn same(a: Parts<'_>, b: Parts<'_>) -> bool {
+    fn same<'a, 'b>(a: Parts<'a>, b: Parts<'b>) -> bool
+    where
+        Self: 'a + 'b,
+    {
         a == b
     }
 
-    fn bytes(view: Parts<'_>) -> usize {
+    fn bytes<'a>(view: Parts<'a>) -> usize
+    where
+        Self: 'a,
+    {
         view.bytes()
     }
 

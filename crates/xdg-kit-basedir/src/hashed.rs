@@ -61,10 +61,19 @@ pub trait Kind {
         Self: 'l;
 
     /// Whether two views are of the same text.
-    fn same(a: Self::View<'_>, b: Self::View<'_>) -> bool;
+    ///
+    /// Its lifetimes are named and bound, as `view`'s are, rather than
+    /// elided: a type checker that does not infer `Self: 'a` from the
+    /// argument types (Relax's) then accepts the impls of generic kinds.
+    fn same<'a, 'b>(a: Self::View<'a>, b: Self::View<'b>) -> bool
+    where
+        Self: 'a + 'b;
 
     /// The measure of hashing, copying or comparing a view: its bytes.
-    fn bytes(view: Self::View<'_>) -> usize;
+    /// Its lifetime is named and bound for the reason `same`'s are.
+    fn bytes<'a>(view: Self::View<'a>) -> usize
+    where
+        Self: 'a;
 
     /// Counts the steps `steps` works out on the kind's counter, calling
     /// it only where steps are counted ([`Count::count`]).
@@ -122,11 +131,17 @@ impl<C: Count> Kind for Str<C> {
         view
     }
 
-    fn same(a: &str, b: &str) -> bool {
+    fn same<'a, 'b>(a: &'a str, b: &'b str) -> bool
+    where
+        Self: 'a + 'b,
+    {
         a == b
     }
 
-    fn bytes(view: &str) -> usize {
+    fn bytes<'a>(view: &'a str) -> usize
+    where
+        Self: 'a,
+    {
         view.len()
     }
 
@@ -170,11 +185,17 @@ impl<C: Count> Kind for PathKey<C> {
         view
     }
 
-    fn same(a: &Path, b: &Path) -> bool {
+    fn same<'a, 'b>(a: &'a Path, b: &'b Path) -> bool
+    where
+        Self: 'a + 'b,
+    {
         a == b
     }
 
-    fn bytes(view: &Path) -> usize {
+    fn bytes<'a>(view: &'a Path) -> usize
+    where
+        Self: 'a,
+    {
         view.as_os_str().len()
     }
 
@@ -218,11 +239,17 @@ impl<'r, T: ?Sized + Hash + Eq + Measure, C: Count> Kind for Ref<'r, T, C> {
         view
     }
 
-    fn same(a: &T, b: &T) -> bool {
+    fn same<'a, 'b>(a: &'a T, b: &'b T) -> bool
+    where
+        Self: 'a + 'b,
+    {
         a == b
     }
 
-    fn bytes(view: &T) -> usize {
+    fn bytes<'a>(view: &'a T) -> usize
+    where
+        Self: 'a,
+    {
         view.bytes()
     }
 
@@ -255,11 +282,17 @@ impl<K: Kind> Kind for Numbered<K> {
         (view.0, K::shorten(view.1))
     }
 
-    fn same(a: (usize, K::View<'_>), b: (usize, K::View<'_>)) -> bool {
+    fn same<'a, 'b>(a: (usize, K::View<'a>), b: (usize, K::View<'b>)) -> bool
+    where
+        Self: 'a + 'b,
+    {
         a.0 == b.0 && K::same(a.1, b.1)
     }
 
-    fn bytes(view: (usize, K::View<'_>)) -> usize {
+    fn bytes<'a>(view: (usize, K::View<'a>)) -> usize
+    where
+        Self: 'a,
+    {
         K::bytes(view.1)
     }
 
@@ -301,11 +334,17 @@ impl<A: Kind, B: Kind> Kind for Pair<A, B> {
         (A::shorten(view.0), B::shorten(view.1))
     }
 
-    fn same(a: (A::View<'_>, B::View<'_>), b: (A::View<'_>, B::View<'_>)) -> bool {
+    fn same<'a, 'b>(a: (A::View<'a>, B::View<'a>), b: (A::View<'b>, B::View<'b>)) -> bool
+    where
+        Self: 'a + 'b,
+    {
         A::same(a.0, b.0) && B::same(a.1, b.1)
     }
 
-    fn bytes(view: (A::View<'_>, B::View<'_>)) -> usize {
+    fn bytes<'a>(view: (A::View<'a>, B::View<'a>)) -> usize
+    where
+        Self: 'a,
+    {
         A::bytes(view.0) + B::bytes(view.1)
     }
 

@@ -153,11 +153,17 @@ pub(crate) mod work {
             view
         }
 
-        fn same(a: &crate::TypePattern, b: &crate::TypePattern) -> bool {
+        fn same<'a, 'b>(a: &'a crate::TypePattern, b: &'b crate::TypePattern) -> bool
+        where
+            Self: 'a + 'b,
+        {
             a == b
         }
 
-        fn bytes(view: &crate::TypePattern) -> usize {
+        fn bytes<'a>(view: &'a crate::TypePattern) -> usize
+        where
+            Self: 'a,
+        {
             view.text_len()
         }
 
